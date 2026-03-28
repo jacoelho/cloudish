@@ -45,7 +45,6 @@ pub enum SecretsManagerError {
 
 impl SecretsManagerError {
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn to_aws_error(&self) -> AwsError {
         match self {
             Self::InternalServiceError { message } => AwsError::custom(

@@ -1,5 +1,3 @@
-#[cfg(test)]
-use aws::{AwsError, AwsErrorFamily};
 use storage::StorageError;
 use thiserror::Error;
 
@@ -45,87 +43,6 @@ pub enum DynamoDbError {
 }
 
 impl DynamoDbError {
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn to_aws_error(&self) -> AwsError {
-        match self {
-            Self::ConditionalCheckFailed => AwsError::custom(
-                AwsErrorFamily::Validation,
-                "ConditionalCheckFailedException",
-                "The conditional request failed",
-                400,
-                true,
-            )
-            .expect("ConditionalCheckFailedException must build"),
-            Self::InvalidShardIterator => AwsError::custom(
-                AwsErrorFamily::Validation,
-                "ValidationException",
-                "Invalid shard iterator",
-                400,
-                true,
-            )
-            .expect("ValidationException must build"),
-            Self::Storage { .. } => AwsError::custom(
-                AwsErrorFamily::Internal,
-                "InternalFailure",
-                "Cloudish failed to persist DynamoDB state.",
-                500,
-                false,
-            )
-            .expect("InternalFailure must build"),
-            Self::ResourceNotFound { resource } => AwsError::custom(
-                AwsErrorFamily::NotFound,
-                "ResourceNotFoundException",
-                format!("Requested resource not found: {resource}"),
-                400,
-                true,
-            )
-            .expect("ResourceNotFoundException must build"),
-            Self::TableNotFound { table_name } => AwsError::custom(
-                AwsErrorFamily::NotFound,
-                "ResourceNotFoundException",
-                format!(
-                    "Requested resource not found: Table: {table_name} not found"
-                ),
-                400,
-                true,
-            )
-            .expect("ResourceNotFoundException must build"),
-            Self::TableAlreadyExists { table_name } => AwsError::custom(
-                AwsErrorFamily::Conflict,
-                "ResourceInUseException",
-                format!("Table already exists: {table_name}"),
-                400,
-                true,
-            )
-            .expect("ResourceInUseException must build"),
-            Self::TtlTransitionInProgress { message } => AwsError::custom(
-                AwsErrorFamily::Validation,
-                "ValidationException",
-                message.clone(),
-                400,
-                true,
-            )
-            .expect("ValidationException must build"),
-            Self::TransactionCanceled { message, .. } => AwsError::custom(
-                AwsErrorFamily::Validation,
-                "TransactionCanceledException",
-                message.clone(),
-                400,
-                true,
-            )
-            .expect("TransactionCanceledException must build"),
-            Self::Validation { message } => AwsError::custom(
-                AwsErrorFamily::Validation,
-                "ValidationException",
-                message.clone(),
-                400,
-                true,
-            )
-            .expect("ValidationException must build"),
-        }
-    }
-
     pub fn cancellation_reasons(&self) -> Option<&[CancellationReason]> {
         match self {
             Self::TransactionCanceled { cancellation_reasons, .. } => {

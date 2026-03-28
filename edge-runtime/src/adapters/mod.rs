@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 #[cfg(feature = "elasticache")]
 mod elasticache;
 mod fakes;

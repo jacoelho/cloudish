@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 #![cfg_attr(
     test,
     allow(

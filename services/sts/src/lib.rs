@@ -382,7 +382,6 @@ pub enum StsError {
 
 impl StsError {
     #[cfg(test)]
-    #[allow(dead_code)]
     fn to_aws_error(&self) -> AwsError {
         match self {
             Self::AccessDenied { message } => AwsError::custom(

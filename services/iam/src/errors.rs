@@ -21,7 +21,6 @@ pub enum IamError {
 
 impl IamError {
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn to_aws_error(&self) -> AwsError {
         match self {
             Self::DeleteConflict { message } => AwsError::custom(

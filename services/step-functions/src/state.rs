@@ -1525,20 +1525,19 @@ pub(crate) enum PathLookup<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct RawStateMachineDefinition {
-    #[allow(dead_code)]
-    comment: Option<String>,
+    #[serde(rename = "Comment")]
+    _comment: Option<String>,
     start_at: String,
     states: BTreeMap<String, Value>,
-    #[allow(dead_code)]
-    version: Option<String>,
+    #[serde(rename = "Version")]
+    _version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct RawPassState {
-    #[allow(dead_code)]
     #[serde(rename = "Type")]
-    state_type: String,
+    _state_type: String,
     end: Option<bool>,
     input_path: Option<NullablePath>,
     next: Option<String>,
@@ -1551,9 +1550,8 @@ struct RawPassState {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct RawTaskState {
-    #[allow(dead_code)]
     #[serde(rename = "Type")]
-    state_type: String,
+    _state_type: String,
     end: Option<bool>,
     input_path: Option<NullablePath>,
     next: Option<String>,
@@ -1566,9 +1564,8 @@ struct RawTaskState {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct RawChoiceState {
-    #[allow(dead_code)]
     #[serde(rename = "Type")]
-    state_type: String,
+    _state_type: String,
     choices: Vec<Value>,
     default: Option<String>,
     input_path: Option<NullablePath>,
@@ -1578,9 +1575,8 @@ struct RawChoiceState {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct RawWaitState {
-    #[allow(dead_code)]
     #[serde(rename = "Type")]
-    state_type: String,
+    _state_type: String,
     end: Option<bool>,
     input_path: Option<NullablePath>,
     next: Option<String>,
@@ -1592,9 +1588,8 @@ struct RawWaitState {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct RawSucceedState {
-    #[allow(dead_code)]
     #[serde(rename = "Type")]
-    state_type: String,
+    _state_type: String,
     input_path: Option<NullablePath>,
     output_path: Option<NullablePath>,
 }
@@ -1602,9 +1597,8 @@ struct RawSucceedState {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct RawFailState {
-    #[allow(dead_code)]
     #[serde(rename = "Type")]
-    state_type: String,
+    _state_type: String,
     cause: Option<String>,
     error: Option<String>,
 }
@@ -1612,9 +1606,8 @@ struct RawFailState {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct RawParallelState {
-    #[allow(dead_code)]
     #[serde(rename = "Type")]
-    state_type: String,
+    _state_type: String,
     branches: Vec<Value>,
     end: Option<bool>,
     input_path: Option<NullablePath>,
@@ -1627,9 +1620,8 @@ struct RawParallelState {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct RawMapState {
-    #[allow(dead_code)]
     #[serde(rename = "Type")]
-    state_type: String,
+    _state_type: String,
     end: Option<bool>,
     input_path: Option<NullablePath>,
     items_path: Option<String>,

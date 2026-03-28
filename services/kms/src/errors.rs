@@ -33,7 +33,6 @@ pub enum KmsError {
 
 impl KmsError {
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn to_aws_error(&self) -> AwsError {
         match self {
             Self::AlreadyExistsException { message } => AwsError::custom(
