@@ -323,8 +323,8 @@ fn dependency_contracts() -> BTreeMap<&'static str, PackageContract> {
         (
             "tests",
             PackageContract {
-                normal: &[],
-                dev: &["app", "auth", "aws", "storage", "test-support"],
+                normal: &["app", "auth", "aws", "storage", "test-support"],
+                dev: &[],
             },
         ),
     ])
