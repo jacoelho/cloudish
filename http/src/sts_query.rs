@@ -150,6 +150,7 @@ pub(crate) fn handle(
             )
         }
         "DecodeAuthorizationMessage" => {
+            require_authenticated_caller(action, caller.as_ref())?;
             let decoded = decode_authorization_message(
                 params.required("EncodedMessage")?,
             )?;
@@ -556,12 +557,13 @@ mod tests {
     #[test]
     fn sts_query_decode_authorization_message_decodes_base64_payloads() {
         let (_, sts) = sts();
+        let (caller_identity, verified_request) = root_verified_request();
 
         let response = handle(
             &sts,
             b"Action=DecodeAuthorizationMessage&EncodedMessage=eyJhbGxvd2VkIjpmYWxzZX0%3D",
-            &context("DecodeAuthorizationMessage", None),
-            None,
+            &context("DecodeAuthorizationMessage", Some(caller_identity)),
+            Some(&verified_request),
         )
         .expect("decode authorization message should succeed");
 
@@ -584,6 +586,10 @@ mod tests {
             (
                 "GetFederationToken",
                 "Action=GetFederationToken&Name=federated-user",
+            ),
+            (
+                "DecodeAuthorizationMessage",
+                "Action=DecodeAuthorizationMessage&EncodedMessage=eyJhbGxvd2VkIjpmYWxzZX0%3D",
             ),
         ] {
             let error =

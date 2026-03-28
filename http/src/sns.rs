@@ -1038,11 +1038,22 @@ mod tests {
     }
 
     fn query_request(path: &str, body: &str) -> Vec<u8> {
+        let body = query_body(body);
         format!(
             "POST {path} HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .into_bytes()
+    }
+
+    fn query_body(body: &str) -> String {
+        if body.contains("Version=") {
+            body.to_owned()
+        } else if body.is_empty() {
+            "Version=2010-03-31".to_owned()
+        } else {
+            format!("{body}&Version=2010-03-31")
+        }
     }
 
     fn json_request(target: &str, body: &str) -> Vec<u8> {

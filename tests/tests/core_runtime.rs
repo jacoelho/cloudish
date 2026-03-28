@@ -148,6 +148,7 @@ async fn health_and_status_endpoints_return_internal_json() {
 async fn unknown_json_and_query_requests_return_protocol_shaped_errors() {
     let runtime = shared_runtime().await;
     let address = runtime.address();
+    let query_body = "Action=UnknownAction&Version=2011-06-15";
 
     let json_response = tokio::task::spawn_blocking(move || {
         send_http_request(
@@ -161,7 +162,10 @@ async fn unknown_json_and_query_requests_return_protocol_shaped_errors() {
     let query_response = tokio::task::spawn_blocking(move || {
         send_http_request(
             address,
-            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 20\r\n\r\nAction=UnknownAction",
+            &format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{query_body}",
+                query_body.len()
+            ),
         )
     })
     .await
@@ -194,6 +198,85 @@ async fn unknown_json_and_query_requests_return_protocol_shaped_errors() {
         query_body
             .contains("<Message>Unknown action UnknownAction.</Message>")
     );
+}
+
+#[tokio::test]
+async fn query_get_requests_route_to_sts_and_missing_version_fails_before_mutation()
+ {
+    let runtime = shared_runtime().await;
+    let address = runtime.address();
+
+    let get_response = tokio::task::spawn_blocking(move || {
+        send_http_request(
+            address,
+            "GET /?Action=GetCallerIdentity&Version=2011-06-15 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+    })
+    .await
+    .expect("GET query request task should complete")
+    .expect("GET query request should succeed");
+    let missing_version_body = "Action=CreateQueue&QueueName=demo";
+    let missing_version_response = tokio::task::spawn_blocking(move || {
+        send_http_request(
+            address,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{missing_version_body}",
+                missing_version_body.len()
+            ),
+        )
+    })
+    .await
+    .expect("missing-version request task should complete")
+    .expect("missing-version request should succeed");
+    let list_queues_body = "Action=ListQueues&Version=2012-11-05";
+    let list_queues_response = tokio::task::spawn_blocking(move || {
+        send_http_request(
+            address,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{list_queues_body}",
+                list_queues_body.len()
+            ),
+        )
+    })
+    .await
+    .expect("list queues request task should complete")
+    .expect("list queues request should succeed");
+
+    let (get_status, get_headers, get_body) =
+        split_response(get_response.as_bytes());
+    let get_body =
+        std::str::from_utf8(get_body).expect("GET query body should be UTF-8");
+    let (
+        missing_version_status,
+        missing_version_headers,
+        missing_version_body,
+    ) = split_response(missing_version_response.as_bytes());
+    let missing_version_body = std::str::from_utf8(missing_version_body)
+        .expect("missing-version body should be UTF-8");
+    let (list_status, list_headers, list_body) =
+        split_response(list_queues_response.as_bytes());
+    let list_body = std::str::from_utf8(list_body)
+        .expect("list queues body should be UTF-8");
+
+    assert_eq!(get_status, "HTTP/1.1 403 Forbidden");
+    assert_eq!(header_value(&get_headers, "content-type"), Some("text/xml"));
+    assert!(get_body.contains("<Code>MissingAuthenticationToken</Code>"));
+    assert!(!get_body.contains("<ListAllMyBucketsResult"));
+
+    assert_eq!(missing_version_status, "HTTP/1.1 400 Bad Request");
+    assert_eq!(
+        header_value(&missing_version_headers, "content-type"),
+        Some("text/xml")
+    );
+    assert!(missing_version_body.contains("<Code>MissingParameter</Code>"));
+    assert!(missing_version_body.contains(
+        "<Message>The request must contain the parameter Version.</Message>"
+    ));
+
+    assert_eq!(list_status, "HTTP/1.1 200 OK");
+    assert_eq!(header_value(&list_headers, "content-type"), Some("text/xml"));
+    assert!(list_body.contains("<ListQueuesResult"));
+    assert!(!list_body.contains("demo"));
 }
 
 #[tokio::test]

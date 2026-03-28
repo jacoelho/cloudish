@@ -1,9 +1,16 @@
+use crate::request::HttpRequest;
 use aws::{AwsError, AwsErrorFamily};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Default)]
 pub(crate) struct QueryParameters {
     values: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ParsedQueryRequest<'a> {
+    raw_parameters: &'a [u8],
+    parameters: QueryParameters,
 }
 
 impl QueryParameters {
@@ -35,6 +42,33 @@ impl QueryParameters {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.values.iter().map(|(name, value)| (name.as_str(), value.as_str()))
     }
+}
+
+impl<'a> ParsedQueryRequest<'a> {
+    pub(crate) fn raw_parameters(&self) -> &'a [u8] {
+        self.raw_parameters
+    }
+
+    pub(crate) fn parameters(&self) -> &QueryParameters {
+        &self.parameters
+    }
+}
+
+pub(crate) fn is_query_request(request: &HttpRequest<'_>) -> bool {
+    query_parameter_source(request).is_some()
+}
+
+pub(crate) fn parse_request<'a>(
+    request: &'a HttpRequest<'_>,
+) -> Result<Option<ParsedQueryRequest<'a>>, AwsError> {
+    let Some(raw_parameters) = query_parameter_source(request) else {
+        return Ok(None);
+    };
+
+    Ok(Some(ParsedQueryRequest {
+        raw_parameters,
+        parameters: QueryParameters::parse(raw_parameters)?,
+    }))
 }
 
 #[cfg(test)]
@@ -70,6 +104,46 @@ pub(crate) fn missing_parameter_error(name: &str) -> AwsError {
         400,
         true,
     )
+}
+
+fn query_parameter_source<'a>(
+    request: &'a HttpRequest<'_>,
+) -> Option<&'a [u8]> {
+    if request.method() == "POST"
+        && content_type_is_form_urlencoded(
+            request.header("content-type").unwrap_or_default(),
+        )
+        && !request.body().is_empty()
+    {
+        return Some(request.body());
+    }
+
+    if let Some(query_string) = request.query_string()
+        && looks_like_query_parameters(query_string.as_bytes())
+    {
+        return Some(query_string.as_bytes());
+    }
+
+    if request.method() == "POST"
+        && looks_like_query_parameters(request.body())
+    {
+        return Some(request.body());
+    }
+
+    None
+}
+
+fn content_type_is_form_urlencoded(content_type: &str) -> bool {
+    content_type.split(';').next().is_some_and(|media_type| {
+        media_type
+            .trim()
+            .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+    })
+}
+
+fn looks_like_query_parameters(parameters: &[u8]) -> bool {
+    parameters.windows(7).any(|window| window == b"Action=")
+        || parameters.windows(8).any(|window| window == b"Version=")
 }
 
 fn percent_decode(value: &str) -> Result<String, AwsError> {
@@ -117,9 +191,10 @@ fn hex_value(byte: u8) -> Result<u8, AwsError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        QueryParameters, malformed_query_error, missing_action_error,
-        parse_action,
+        QueryParameters, is_query_request, malformed_query_error,
+        missing_action_error, parse_action, parse_request,
     };
+    use crate::request::EdgeRequest;
 
     #[test]
     fn query_parameters_decode_urlencoded_pairs() {
@@ -160,5 +235,65 @@ mod tests {
 
         assert_eq!(error, malformed_query_error());
         assert_eq!(missing_action_error().code(), "MissingAction");
+    }
+
+    #[test]
+    fn query_request_parser_uses_uri_parameters_for_get_requests() {
+        let request = EdgeRequest::new(
+            "GET",
+            "/?Action=GetCallerIdentity&Version=2011-06-15",
+            Vec::new(),
+            Vec::new(),
+        );
+        let parsed = parse_request(&request)
+            .expect("GET query parameters should parse")
+            .expect("GET request should be recognized as Query");
+
+        assert!(is_query_request(&request));
+        assert_eq!(parsed.parameters().action(), Some("GetCallerIdentity"));
+        assert_eq!(
+            parsed
+                .parameters()
+                .required("Version")
+                .expect("Version should exist"),
+            "2011-06-15"
+        );
+        assert_eq!(
+            parsed.raw_parameters(),
+            b"Action=GetCallerIdentity&Version=2011-06-15"
+        );
+    }
+
+    #[test]
+    fn query_request_parser_prefers_form_body_over_uri_for_post_requests() {
+        let request = EdgeRequest::new(
+            "POST",
+            "/?Action=GetCallerIdentity&Version=2011-06-15",
+            vec![(
+                "Content-Type".to_owned(),
+                "application/x-www-form-urlencoded".to_owned(),
+            )],
+            b"Action=CreateQueue&QueueName=demo".to_vec(),
+        );
+        let parsed = parse_request(&request)
+            .expect("POST query parameters should parse")
+            .expect("POST request should be recognized as Query");
+
+        assert_eq!(parsed.parameters().action(), Some("CreateQueue"));
+        assert_eq!(parsed.parameters().optional("QueueName"), Some("demo"));
+        assert_eq!(
+            parsed.raw_parameters(),
+            b"Action=CreateQueue&QueueName=demo"
+        );
+    }
+
+    #[test]
+    fn query_request_parser_reports_malformed_uri_payloads() {
+        let request =
+            EdgeRequest::new("GET", "/?Action=%zz", Vec::new(), Vec::new());
+        let error = parse_request(&request)
+            .expect_err("malformed URI query should fail");
+
+        assert_eq!(error, malformed_query_error());
     }
 }

@@ -20,7 +20,10 @@ use crate::kinesis;
 use crate::kms;
 #[cfg(feature = "lambda")]
 use crate::lambda;
-use crate::query::missing_action_error;
+use crate::query::{
+    is_query_request, missing_action_error,
+    parse_request as parse_query_request,
+};
 #[cfg(feature = "rds")]
 use crate::rds;
 use crate::request::{EdgeRequest, HttpRequest};
@@ -457,21 +460,33 @@ impl EdgeRouter {
         request: &HttpRequest<'_>,
         verified_request: Option<&VerifiedRequest>,
     ) -> EdgeResponse {
-        let params = match crate::query::QueryParameters::parse(request.body())
-        {
-            Ok(params) => params,
+        let parsed_query = match parse_query_request(request) {
+            Ok(Some(parsed_query)) => parsed_query,
+            Ok(None) => {
+                return EdgeResponse::aws(
+                    ProtocolFamily::Query,
+                    &missing_action_error(),
+                );
+            }
             Err(error) => {
                 return EdgeResponse::aws(ProtocolFamily::Query, &error);
             }
         };
-        let Some(action) = params.action().map(str::to_owned) else {
+        let params = parsed_query.parameters();
+        let Some(action) = params.action() else {
             return EdgeResponse::aws(
                 ProtocolFamily::Query,
                 &missing_action_error(),
             );
         };
+        let action = action.to_owned();
+        let version = match params.required("Version") {
+            Ok(version) => version,
+            Err(error) => {
+                return EdgeResponse::aws(ProtocolFamily::Query, &error);
+            }
+        };
         let scope = verified_request.map(VerifiedRequest::scope);
-        let version = params.optional("Version");
 
         let service = match scope {
             Some(scope) => {
@@ -484,7 +499,7 @@ impl EdgeRouter {
                 }
 
                 if let Some(expected_service) =
-                    service_from_query_action(&action, version)
+                    service_from_query_action(&action, Some(version))
                     && expected_service != scope.service()
                 {
                     let error = signature_scope_mismatch_error(format!(
@@ -497,7 +512,7 @@ impl EdgeRouter {
 
                 scope.service()
             }
-            None => match service_from_query_action(&action, version) {
+            None => match service_from_query_action(&action, Some(version)) {
                 Some(service) => service,
                 None => {
                     let error = invalid_query_action_error(&action, None);
@@ -519,11 +534,13 @@ impl EdgeRouter {
             ProtocolFamily::Query,
             &action,
         );
+        let mut normalized_request = request.clone();
+        normalized_request.set_body(parsed_query.raw_parameters().to_vec());
 
         if service == ServiceName::Iam {
             return match iam_query::handle(
                 self.runtime.iam(),
-                request.body(),
+                normalized_request.body(),
                 &context,
             ) {
                 Ok(body) => {
@@ -536,7 +553,7 @@ impl EdgeRouter {
         if service == ServiceName::Sts {
             return match sts_query::handle(
                 self.runtime.sts(),
-                request.body(),
+                normalized_request.body(),
                 &context,
                 verified_request,
             ) {
@@ -551,7 +568,7 @@ impl EdgeRouter {
         if service == ServiceName::Sqs {
             return match sqs::handle_query(
                 self.runtime.sqs(),
-                request,
+                &normalized_request,
                 &context,
             ) {
                 Ok(body) => {
@@ -565,7 +582,7 @@ impl EdgeRouter {
         if service == ServiceName::Sns {
             return match sns::handle_query(
                 self.runtime.sns(),
-                request,
+                &normalized_request,
                 &context,
             ) {
                 Ok(body) => {
@@ -579,7 +596,7 @@ impl EdgeRouter {
         if service == ServiceName::CloudFormation {
             return match cloudformation::handle_query(
                 self.runtime.cloudformation(),
-                request.body(),
+                normalized_request.body(),
                 &context,
             ) {
                 Ok(body) => {
@@ -593,7 +610,7 @@ impl EdgeRouter {
         if service == ServiceName::CloudWatch {
             return match cloudwatch::handle_metrics_query(
                 self.runtime.cloudwatch(),
-                request,
+                &normalized_request,
                 &context,
             ) {
                 Ok(body) => {
@@ -607,7 +624,7 @@ impl EdgeRouter {
         if service == ServiceName::Rds {
             return match rds::handle_query(
                 self.runtime.rds(),
-                request,
+                &normalized_request,
                 &context,
             ) {
                 Ok(body) => {
@@ -621,7 +638,7 @@ impl EdgeRouter {
         if service == ServiceName::ElastiCache {
             return match elasticache::handle_query(
                 self.runtime.elasticache(),
-                request,
+                &normalized_request,
                 &context,
             ) {
                 Ok(body) => {
@@ -1353,9 +1370,7 @@ fn detect_protocol(request: &HttpRequest<'_>) -> Option<ProtocolFamily> {
         }
     }
 
-    if request.method() == "POST"
-        && request.body().windows(7).any(|window| window == b"Action=")
-    {
+    if is_query_request(request) {
         return Some(ProtocolFamily::Query);
     }
 
@@ -2957,6 +2972,7 @@ mod tests {
 
         let query_body = concat!(
             "Action=GetMetricData",
+            "&Version=2010-08-01",
             "&StartTime=1970-01-01T00:00:00Z",
             "&EndTime=1970-01-01T00:03:00Z",
             "&ScanBy=TimestampAscending",
@@ -4377,8 +4393,13 @@ mod tests {
 
     #[test]
     fn runtime_query_unknown_action_returns_xml_error() {
+        let body = "Action=UnknownAction&Version=2011-06-15";
         let response = router().handle_bytes(
-            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 20\r\n\r\nAction=UnknownAction",
+            format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
         );
         let response_bytes = response.to_http_bytes();
         let (status, headers, body) = split_response(&response_bytes);
@@ -4391,6 +4412,75 @@ mod tests {
         assert!(
             body.contains("<Message>Unknown action UnknownAction.</Message>")
         );
+    }
+
+    #[test]
+    fn runtime_query_get_requests_route_to_sts() {
+        let response = router().handle_bytes(
+            b"GET /?Action=GetCallerIdentity&Version=2011-06-15 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+        let body =
+            std::str::from_utf8(body).expect("query body should be UTF-8");
+
+        assert_eq!(status, "HTTP/1.1 403 Forbidden");
+        assert_eq!(header_value(&headers, "content-type"), Some("text/xml"));
+        assert!(body.contains("<Code>MissingAuthenticationToken</Code>"));
+        assert!(!body.contains("<ListAllMyBucketsResult"));
+    }
+
+    #[cfg(feature = "sqs")]
+    #[test]
+    fn runtime_query_requests_require_version_before_mutating_state() {
+        let router = router();
+        let create_body = "Action=CreateQueue&QueueName=demo";
+        let create_response = router.handle_bytes(
+            format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{create_body}",
+                create_body.len()
+            )
+            .as_bytes(),
+        );
+        let create_response_bytes = create_response.to_http_bytes();
+        let (create_status, create_headers, create_body) =
+            split_response(&create_response_bytes);
+        let create_body = std::str::from_utf8(create_body)
+            .expect("query body should be UTF-8");
+
+        assert_eq!(create_status, "HTTP/1.1 400 Bad Request");
+        assert_eq!(
+            header_value(&create_headers, "content-type"),
+            Some("text/xml")
+        );
+        assert!(create_body.contains("<Code>MissingParameter</Code>"));
+        assert!(
+            create_body.contains(
+                "<Message>The request must contain the parameter Version.</Message>"
+            )
+        );
+
+        let list_body = "Action=ListQueues&Version=2012-11-05";
+        let list_response = router.handle_bytes(
+            format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{list_body}",
+                list_body.len()
+            )
+            .as_bytes(),
+        );
+        let list_response_bytes = list_response.to_http_bytes();
+        let (list_status, list_headers, list_body) =
+            split_response(&list_response_bytes);
+        let list_body = std::str::from_utf8(list_body)
+            .expect("query body should be UTF-8");
+
+        assert_eq!(list_status, "HTTP/1.1 200 OK");
+        assert_eq!(
+            header_value(&list_headers, "content-type"),
+            Some("text/xml")
+        );
+        assert!(list_body.contains("<ListQueuesResult"));
+        assert!(!list_body.contains("demo"));
     }
 
     #[test]
@@ -4503,7 +4593,7 @@ mod tests {
     #[test]
     fn runtime_signed_query_scope_mismatch_returns_signature_error() {
         let request = HttpRequest::parse(
-            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 32\r\n\r\nAction=CreateUser&UserName=alice",
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 51\r\n\r\nAction=CreateUser&UserName=alice&Version=2010-05-08",
         )
         .expect("request should parse");
         let verified_request = VerifiedRequest::new(

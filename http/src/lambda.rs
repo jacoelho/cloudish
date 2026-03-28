@@ -1404,6 +1404,11 @@ mod tests {
     }
 
     fn form_request(body: &str) -> Vec<u8> {
+        let body = if body.contains("Version=") {
+            body.to_owned()
+        } else {
+            format!("{body}&Version=2012-11-05")
+        };
         format!(
             "POST / HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()

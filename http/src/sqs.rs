@@ -1404,11 +1404,22 @@ mod tests {
     }
 
     fn query_request(path: &str, body: &str) -> Vec<u8> {
+        let body = query_body(body);
         format!(
             "POST {path} HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .into_bytes()
+    }
+
+    fn query_body(body: &str) -> String {
+        if body.contains("Version=") {
+            body.to_owned()
+        } else if body.is_empty() {
+            "Version=2012-11-05".to_owned()
+        } else {
+            format!("{body}&Version=2012-11-05")
+        }
     }
 
     fn json_request(target: &str, body: &str) -> Vec<u8> {
@@ -1446,21 +1457,26 @@ mod tests {
     fn sqs_standard_query_queue_path_lifecycle_round_trips() {
         let router = router();
 
-        let create = router.handle_bytes(
-            b"POST / HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 35\r\n\r\nAction=CreateQueue&QueueName=orders",
-        );
-        let send = router.handle_bytes(
-            b"POST /000000000000/orders HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 38\r\n\r\nAction=SendMessage&MessageBody=payload",
-        );
-        let receive = router.handle_bytes(
-            b"POST /000000000000/orders HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 62\r\n\r\nAction=ReceiveMessage&VisibilityTimeout=0&WaitTimeSeconds=0",
-        );
-        let delete = router.handle_bytes(
-            b"POST /000000000000/orders HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 65\r\n\r\nAction=DeleteMessage&ReceiptHandle=AQEB00000000000000000001",
-        );
-        let get_attributes = router.handle_bytes(
-            b"POST /000000000000/orders HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 58\r\n\r\nAction=GetQueueAttributes&AttributeName.1=QueueArn",
-        );
+        let create = router.handle_bytes(&query_request(
+            "/",
+            "Action=CreateQueue&QueueName=orders",
+        ));
+        let send = router.handle_bytes(&query_request(
+            "/000000000000/orders",
+            "Action=SendMessage&MessageBody=payload",
+        ));
+        let receive = router.handle_bytes(&query_request(
+            "/000000000000/orders",
+            "Action=ReceiveMessage&VisibilityTimeout=0&WaitTimeSeconds=0",
+        ));
+        let delete = router.handle_bytes(&query_request(
+            "/000000000000/orders",
+            "Action=DeleteMessage&ReceiptHandle=AQEB00000000000000000001",
+        ));
+        let get_attributes = router.handle_bytes(&query_request(
+            "/000000000000/orders",
+            "Action=GetQueueAttributes&AttributeName.1=QueueArn",
+        ));
 
         let create_bytes = create.to_http_bytes();
         let send_bytes = send.to_http_bytes();
@@ -1504,13 +1520,15 @@ mod tests {
     fn sqs_standard_query_invalid_receipt_handle_returns_sqs_error() {
         let router = router();
 
-        let create = router.handle_bytes(
-            b"POST / HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 35\r\n\r\nAction=CreateQueue&QueueName=orders",
-        );
+        let create = router.handle_bytes(&query_request(
+            "/",
+            "Action=CreateQueue&QueueName=orders",
+        ));
         let _ = create.to_http_bytes();
-        let delete = router.handle_bytes(
-            b"POST /000000000000/orders HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 50\r\n\r\nAction=DeleteMessage&ReceiptHandle=garbage",
-        );
+        let delete = router.handle_bytes(&query_request(
+            "/000000000000/orders",
+            "Action=DeleteMessage&ReceiptHandle=garbage",
+        ));
         let delete_bytes = delete.to_http_bytes();
         let (status, _, body) = split_response(&delete_bytes);
 

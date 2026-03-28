@@ -322,13 +322,15 @@ async fn unsigned_caller_bound_actions_require_authentication() {
         "Action=GetCallerIdentity",
         "Action=GetSessionToken",
         "Action=GetFederationToken&Name=federated-demo",
+        "Action=DecodeAuthorizationMessage&EncodedMessage=eyJyZWFzb24iOiJkZW5pZWQifQ%3D%3D",
     ] {
         let response = tokio::task::spawn_blocking(move || {
             send_http_request(
                 address,
                 &format!(
-                    "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                    "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}&Version=2011-06-15",
                     body.len()
+                        + "&Version=2011-06-15".len()
                 ),
             )
         })
@@ -347,6 +349,29 @@ async fn unsigned_caller_bound_actions_require_authentication() {
             "<Message>The request must contain either a valid (registered) AWS access key ID or X.509 certificate.</Message>"
         ));
     }
+}
+
+#[tokio::test]
+async fn get_style_sts_query_requests_route_to_sts() {
+    let runtime = shared_runtime().await;
+    let address = runtime.address();
+
+    let response = tokio::task::spawn_blocking(move || {
+        send_http_request(
+            address,
+            "GET /?Action=GetCallerIdentity&Version=2011-06-15 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+    })
+    .await
+    .expect("GET STS request task should complete")
+    .expect("GET STS request should return a response");
+
+    let (status, headers, response_body) = split_response(&response);
+
+    assert_eq!(status, "HTTP/1.1 403 Forbidden");
+    assert_eq!(header_value(&headers, "content-type"), Some("text/xml"));
+    assert!(response_body.contains("<Code>MissingAuthenticationToken</Code>"));
+    assert!(!response_body.contains("<ListAllMyBucketsResult"));
 }
 
 #[tokio::test]
