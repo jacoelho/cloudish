@@ -10,23 +10,6 @@ Build the full workspace with all services enabled:
 cargo build --workspace --all-features
 ```
 
-Build a container image for the `app` binary:
-
-```sh
-docker build -f build/Dockerfile -t cloudish .
-```
-
-Build a multi-arch image with Buildx:
-
-```sh
-docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  -f build/Dockerfile \
-  -t cloudish \
-  --push \
-  .
-```
-
 ## Run
 
 Cloudish uses Cloudish-specific variables for server startup:
@@ -68,15 +51,6 @@ curl http://127.0.0.1:4570/__cloudish/health
 
 `CLOUDISH_EDGE_HOST` expects an IP address such as `127.0.0.1`, `0.0.0.0`, or
 `::1`.
-
-Run the container image with the baked server defaults:
-
-```sh
-docker run --rm -p 4566:4566 -v cloudish-state:/var/lib/cloudish cloudish
-```
-
-Omit the `-v` flag if you want disposable state instead of a persisted data
-directory.
 
 ## Use With AWS CLI
 
@@ -128,3 +102,31 @@ Run one acceptance story:
 ```sh
 cargo test -p tests --test s3_core
 ```
+
+## Docker
+
+Build a container image for the `app` binary:
+
+```sh
+docker build -f build/Dockerfile -t cloudish .
+```
+
+Build a multi-arch image with Buildx:
+
+```sh
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f build/Dockerfile \
+  -t cloudish \
+  --push \
+  .
+```
+
+Run the container image with the baked server defaults:
+
+```sh
+docker run --rm -p 4566:4566 -v cloudish-state:/var/lib/cloudish cloudish
+```
+
+Omit the `-v` flag if you want disposable state instead of a persisted data
+directory.
