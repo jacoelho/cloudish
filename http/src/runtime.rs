@@ -1963,7 +1963,8 @@ mod tests {
     use crate::test_runtime;
     use auth::VerifiedRequest;
     use aws::{
-        Arn, CallerIdentity, CredentialScope, ProtocolFamily, ServiceName,
+        Arn, AwsPrincipalType, CallerCredentialKind, CallerIdentity,
+        CredentialScope, ProtocolFamily, ServiceName, StableAwsPrincipal,
     };
     use aws_smithy_eventstream::frame::read_message_from;
     use base64::Engine as _;
@@ -4331,6 +4332,13 @@ mod tests {
         .expect("request should parse");
         let verified_request = VerifiedRequest::new(
             "000000000000".parse().expect("account should parse"),
+            CallerCredentialKind::LongTerm(StableAwsPrincipal::new(
+                "arn:aws:iam::000000000000:root"
+                    .parse::<Arn>()
+                    .expect("root ARN should parse"),
+                AwsPrincipalType::Account,
+                None,
+            )),
             CallerIdentity::try_new(
                 "arn:aws:iam::000000000000:root"
                     .parse::<Arn>()
@@ -4598,6 +4606,13 @@ mod tests {
         .expect("request should parse");
         let verified_request = VerifiedRequest::new(
             "000000000000".parse().expect("account should parse"),
+            CallerCredentialKind::LongTerm(StableAwsPrincipal::new(
+                "arn:aws:iam::000000000000:root"
+                    .parse::<Arn>()
+                    .expect("root ARN should parse"),
+                AwsPrincipalType::Account,
+                None,
+            )),
             CallerIdentity::try_new(
                 "arn:aws:iam::000000000000:root"
                     .parse::<Arn>()

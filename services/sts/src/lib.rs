@@ -15,10 +15,11 @@ use crate::credentials::{
     SessionIssueInput, StsWorld, find_session_credential, issue_session,
 };
 use crate::federation::{
-    default_web_identity_provider, extract_saml_role_session_name,
-    federated_user_identity,
+    federated_user_identity, normalize_saml, normalize_web_identity,
 };
-use crate::trust_policy::{TrustAction, TrustPrincipal, trust_policy_allows};
+use crate::trust_policy::{
+    TrustAction, TrustEvaluationInput, trust_policy_allows,
+};
 use crate::validation::{
     ASSUME_ROLE_DURATION, FEDERATION_TOKEN_DURATION, SESSION_TOKEN_DURATION,
     normalize_duration, parse_role_arn, session_state_for_assume_role,
@@ -27,7 +28,9 @@ use crate::validation::{
 };
 #[cfg(test)]
 use aws::{AwsError, AwsErrorFamily};
-use aws::{SessionCredentialLookup, SessionCredentialRecord};
+use aws::{
+    SessionCredentialLookup, SessionCredentialRecord, TemporaryCredentialKind,
+};
 use iam::{IamScope, IamService};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -96,8 +99,7 @@ impl StsService {
             .map_err(|_| access_denied(caller, &input.role_arn))?;
         if !trust_policy_allows(
             &role,
-            TrustAction::Role,
-            TrustPrincipal::Aws(caller),
+            TrustEvaluationInput::aws(caller, TrustAction::Role),
         ) {
             return Err(access_denied(caller, &input.role_arn));
         }
@@ -123,6 +125,10 @@ impl StsService {
             &*self.time_source,
             SessionIssueInput {
                 account_id: role_ref.account_id,
+                credential_kind: TemporaryCredentialKind::AssumedRole {
+                    role_arn: input.role_arn.clone(),
+                    role_session_name: input.role_session_name.clone(),
+                },
                 duration_seconds,
                 principal_arn: assumed_role.user.arn.clone(),
                 principal_id: assumed_role.principal_id.clone(),
@@ -160,7 +166,8 @@ impl StsService {
         }
 
         let role_ref = parse_role_arn(&input.role_arn)?;
-        let provider = default_web_identity_provider(input.provider_id);
+        let web_identity =
+            normalize_web_identity(&input, &role_ref.account_id)?;
         let role_scope =
             IamScope::new(role_ref.account_id.clone(), scope.region().clone());
         let role = self
@@ -171,14 +178,13 @@ impl StsService {
             })?;
         if !trust_policy_allows(
             &role,
-            TrustAction::WebIdentity,
-            TrustPrincipal::WebIdentity {
-                provider: &provider,
-                account_id: &role_ref.account_id,
-            },
+            TrustEvaluationInput::web_identity(
+                web_identity.trusted_federated_principals(),
+                web_identity.condition_values(),
+            ),
         ) {
             return Err(access_denied_for(
-                &provider,
+                web_identity.provider_output(),
                 "sts:AssumeRoleWithWebIdentity",
                 &input.role_arn,
             ));
@@ -198,6 +204,12 @@ impl StsService {
             &*self.time_source,
             SessionIssueInput {
                 account_id: role_ref.account_id,
+                credential_kind:
+                    TemporaryCredentialKind::AssumedRoleWithWebIdentity {
+                        provider: web_identity.provider_output().to_owned(),
+                        role_arn: input.role_arn.clone(),
+                        role_session_name: input.role_session_name.clone(),
+                    },
                 duration_seconds,
                 principal_arn: assumed_role.user.arn.clone(),
                 principal_id: assumed_role.principal_id.clone(),
@@ -208,11 +220,11 @@ impl StsService {
 
         Ok(AssumeRoleWithWebIdentityOutput {
             assumed_role_user: assumed_role.user,
-            audience: "sts.amazonaws.com".to_owned(),
+            audience: web_identity.audience().to_owned(),
             credentials,
             packed_policy_size: 0,
-            provider,
-            subject_from_web_identity_token: "web-identity-subject".to_owned(),
+            provider: web_identity.provider_output().to_owned(),
+            subject_from_web_identity_token: web_identity.subject().to_owned(),
         })
     }
 
@@ -230,10 +242,8 @@ impl StsService {
     ) -> Result<AssumeRoleWithSamlOutput, StsError> {
         let role_ref = parse_role_arn(&input.role_arn)?;
         validate_saml_principal_arn(&input.principal_arn)?;
-        let session_name =
-            extract_saml_role_session_name(&input.saml_assertion)
-                .unwrap_or_else(|| "saml-session".to_owned());
-        validate_session_name(&session_name)?;
+        let saml = normalize_saml(&input)?;
+        validate_session_name(saml.role_session_name())?;
 
         let role_scope =
             IamScope::new(role_ref.account_id.clone(), scope.region().clone());
@@ -245,8 +255,10 @@ impl StsService {
             })?;
         if !trust_policy_allows(
             &role,
-            TrustAction::Saml,
-            TrustPrincipal::Saml { principal_arn: &input.principal_arn },
+            TrustEvaluationInput::saml(
+                saml.principal_arn(),
+                saml.condition_values(),
+            ),
         ) {
             return Err(access_denied_for(
                 &input.principal_arn,
@@ -262,13 +274,19 @@ impl StsService {
             &role_ref.account_id,
             &role.role_name,
             &role.role_id,
-            &session_name,
+            saml.role_session_name(),
         )?;
         let credentials = issue_session(
             &self.state,
             &*self.time_source,
             SessionIssueInput {
                 account_id: role_ref.account_id,
+                credential_kind:
+                    TemporaryCredentialKind::AssumedRoleWithSaml {
+                        principal_arn: input.principal_arn.clone(),
+                        role_arn: input.role_arn.clone(),
+                        role_session_name: saml.role_session_name().to_owned(),
+                    },
                 duration_seconds,
                 principal_arn: assumed_role.user.arn.clone(),
                 principal_id: assumed_role.principal_id.clone(),
@@ -279,13 +297,13 @@ impl StsService {
 
         Ok(AssumeRoleWithSamlOutput {
             assumed_role_user: assumed_role.user,
-            audience: "urn:amazon:webservices".to_owned(),
+            audience: saml.audience().to_owned(),
             credentials,
-            issuer: "https://saml.example.com".to_owned(),
-            name_qualifier: "saml-qualifier".to_owned(),
+            issuer: saml.issuer().to_owned(),
+            name_qualifier: saml.name_qualifier().to_owned(),
             packed_policy_size: 0,
-            subject: "saml-subject".to_owned(),
-            subject_type: "persistent".to_owned(),
+            subject: saml.subject().to_owned(),
+            subject_type: saml.subject_type().to_owned(),
         })
     }
 
@@ -314,6 +332,11 @@ impl StsService {
         caller: &StsCaller,
         input: GetSessionTokenInput,
     ) -> Result<SessionCredentials, StsError> {
+        if !caller.uses_long_term_credentials() {
+            return Err(temporary_credentials_not_supported(
+                "sts:GetSessionToken",
+            ));
+        }
         let duration_seconds = normalize_duration(
             input.duration_seconds,
             SESSION_TOKEN_DURATION,
@@ -324,6 +347,9 @@ impl StsService {
             &*self.time_source,
             SessionIssueInput {
                 account_id: caller.account_id().clone(),
+                credential_kind: TemporaryCredentialKind::SessionToken {
+                    source_principal: caller.canonical_trust_principal(),
+                },
                 duration_seconds,
                 principal_arn: caller.arn().clone(),
                 principal_id: caller.principal_id().to_owned(),
@@ -345,6 +371,11 @@ impl StsService {
         caller: &StsCaller,
         input: GetFederationTokenInput,
     ) -> Result<GetFederationTokenOutput, StsError> {
+        if !caller.uses_long_term_credentials() {
+            return Err(temporary_credentials_not_supported(
+                "sts:GetFederationToken",
+            ));
+        }
         validate_federation_name(&input.name)?;
         let duration_seconds = normalize_duration(
             input.duration_seconds,
@@ -357,6 +388,10 @@ impl StsService {
             &*self.time_source,
             SessionIssueInput {
                 account_id: caller.account_id().clone(),
+                credential_kind: TemporaryCredentialKind::FederationToken {
+                    federated_user_arn: federated_user.user.arn.clone(),
+                    federated_user_name: input.name.clone(),
+                },
                 duration_seconds,
                 principal_arn: federated_user.user.arn.clone(),
                 principal_id: federated_user.principal_id.clone(),
@@ -370,6 +405,12 @@ impl StsService {
             federated_user: federated_user.user,
             packed_policy_size: 0,
         })
+    }
+}
+
+fn temporary_credentials_not_supported(action: &str) -> StsError {
+    StsError::AccessDenied {
+        message: format!("Cannot call {action} with session credentials."),
     }
 }
 

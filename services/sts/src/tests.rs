@@ -3,7 +3,14 @@ use crate::{
     GetFederationTokenInput, GetSessionTokenInput, StsCaller, StsError,
     StsService,
 };
-use aws::{CallerIdentity, SessionCredentialLookup};
+use aws::{
+    Arn, AwsPrincipalType, CallerCredentialKind, CallerIdentity,
+    SessionCredentialLookup, StableAwsPrincipal, TemporaryCredentialKind,
+};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use iam::{CreateRoleInput, IamScope, IamService, IamTag};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -30,20 +37,21 @@ fn aws_trust_policy(account_id: &str) -> String {
 
 fn federated_trust_policy(
     account_id: &str,
-    provider: &str,
+    provider_arn: &str,
+    provider_key: &str,
     saml_principal_arn: &str,
 ) -> String {
     format!(
         concat!(
             r#"{{"Version":"2012-10-17","Statement":["#,
             r#"{{"Effect":"Allow","Principal":{{"AWS":"{account_id}"}},"Action":["sts:AssumeRole","sts:TagSession"]}},"#,
-            r#"{{"Effect":"Allow","Principal":{{"Federated":["{provider}","arn:aws:iam::{account_id}:oidc-provider/{provider}"]}},"#,
-            r#""Action":"sts:AssumeRoleWithWebIdentity"}},"#,
-            r#"{{"Effect":"Allow","Principal":{{"Federated":"{saml_principal_arn}"}},"Action":"sts:AssumeRoleWithSAML"}}"#,
+            r#"{{"Effect":"Allow","Principal":{{"Federated":"{provider_arn}"}},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{{"StringEquals":{{"{provider_key}:aud":"sts.amazonaws.com"}},"StringLike":{{"{provider_key}:sub":"repo:cloudish:*"}}}}}},"#,
+            r#"{{"Effect":"Allow","Principal":{{"Federated":"{saml_principal_arn}"}},"Action":"sts:AssumeRoleWithSAML","Condition":{{"StringEquals":{{"SAML:aud":"urn:amazon:webservices"}}}}}}"#,
             r#"]}}"#
         ),
         account_id = account_id,
-        provider = provider,
+        provider_arn = provider_arn,
+        provider_key = provider_key,
         saml_principal_arn = saml_principal_arn,
     )
 }
@@ -68,6 +76,16 @@ fn create_role(
     .expect("role should create");
 }
 
+fn root_credential_kind(account_id: &aws::AccountId) -> CallerCredentialKind {
+    CallerCredentialKind::LongTerm(StableAwsPrincipal::new(
+        format!("arn:aws:iam::{account_id}:root")
+            .parse::<Arn>()
+            .expect("root ARN should parse"),
+        AwsPrincipalType::Account,
+        None,
+    ))
+}
+
 fn root_caller(account_id: &str) -> StsCaller {
     let account_id: aws::AccountId =
         account_id.parse().expect("account id should parse");
@@ -79,7 +97,57 @@ fn root_caller(account_id: &str) -> StsCaller {
     )
     .expect("root caller identity should build");
 
-    StsCaller::new(account_id, identity, Vec::new(), BTreeSet::new())
+    StsCaller::new(
+        account_id.clone(),
+        root_credential_kind(&account_id),
+        identity,
+        Vec::new(),
+        BTreeSet::new(),
+    )
+}
+
+fn assumed_role_caller(
+    account_id: &str,
+    role_name: &str,
+    role_session_name: &str,
+) -> StsCaller {
+    let account_id: aws::AccountId =
+        account_id.parse().expect("account id should parse");
+    StsCaller::new(
+        account_id.clone(),
+        CallerCredentialKind::Temporary(TemporaryCredentialKind::AssumedRole {
+            role_arn: format!("arn:aws:iam::{account_id}:role/{role_name}")
+                .parse::<Arn>()
+                .expect("role ARN should parse"),
+            role_session_name: role_session_name.to_owned(),
+        }),
+        CallerIdentity::try_new(
+            format!(
+                "arn:aws:sts::{account_id}:assumed-role/{role_name}/{role_session_name}"
+            )
+            .parse::<Arn>()
+            .expect("assumed role ARN should parse"),
+            format!("AROA{account_id}:{role_session_name}"),
+        )
+        .expect("assumed role identity should build"),
+        Vec::new(),
+        BTreeSet::new(),
+    )
+}
+
+fn github_jwt(subject: &str) -> String {
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(format!(
+        r#"{{"iss":"https://token.actions.githubusercontent.com","sub":"{subject}","aud":["sts.amazonaws.com"],"amr":["authenticated"]}}"#
+    ));
+
+    format!("{header}.{payload}.signature")
+}
+
+fn saml_assertion(session_name: &str) -> String {
+    STANDARD.encode(format!(
+        r#"<Assertion><Issuer>https://saml.example.com</Issuer><Audience>urn:amazon:webservices</Audience><Subject><NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent" NameQualifier="saml-qualifier">saml-subject</NameID></Subject><Attribute Name="https://aws.amazon.com/SAML/Attributes/RoleSessionName"><AttributeValue>{session_name}</AttributeValue></Attribute></Assertion>"#
+    ))
 }
 
 #[test]
@@ -139,18 +207,7 @@ fn sts_assume_role_issues_temporary_credentials_and_lookup_records() {
 fn sts_get_caller_identity_reflects_the_current_principal() {
     let iam = IamService::new();
     let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
-    let caller = StsCaller::new(
-        "123456789012".parse().expect("account id should parse"),
-        CallerIdentity::try_new(
-            "arn:aws:sts::123456789012:assumed-role/demo/session"
-                .parse()
-                .expect("ARN should parse"),
-            "AROA1234567890EXAMPLE:session",
-        )
-        .expect("caller identity should build"),
-        Vec::new(),
-        BTreeSet::new(),
-    );
+    let caller = assumed_role_caller("123456789012", "demo", "session");
 
     let identity = sts.get_caller_identity(&scope("123456789012"), &caller);
 
@@ -159,7 +216,7 @@ fn sts_get_caller_identity_reflects_the_current_principal() {
         identity.arn.to_string(),
         "arn:aws:sts::123456789012:assumed-role/demo/session"
     );
-    assert_eq!(identity.user_id, "AROA1234567890EXAMPLE:session");
+    assert_eq!(identity.user_id, "AROA123456789012:session");
 }
 
 #[test]
@@ -257,6 +314,14 @@ fn sts_assume_role_chaining_rejects_transitive_tag_overrides() {
     let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
     let caller = StsCaller::new(
         "000000000000".parse().expect("account should parse"),
+        CallerCredentialKind::Temporary(
+            TemporaryCredentialKind::AssumedRole {
+                role_arn: "arn:aws:iam::000000000000:role/source"
+                    .parse::<Arn>()
+                    .expect("role ARN should parse"),
+                role_session_name: "session".to_owned(),
+            },
+        ),
         CallerIdentity::try_new(
             "arn:aws:sts::000000000000:assumed-role/source/session"
                 .parse()
@@ -302,7 +367,8 @@ fn sts_supports_web_identity_saml_session_and_federation_flows() {
         "demo",
         federated_trust_policy(
             "000000000000",
-            "accounts.google.com",
+            "arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com",
+            "token.actions.githubusercontent.com",
             "arn:aws:iam::000000000000:saml-provider/Test",
         ),
     );
@@ -318,11 +384,13 @@ fn sts_supports_web_identity_saml_session_and_federation_flows() {
                     .parse()
                     .expect("role ARN should parse"),
                 role_session_name: "web-session".to_owned(),
-                web_identity_token: "token".to_owned(),
+                web_identity_token: github_jwt(
+                    "repo:cloudish:ref:refs/heads/main",
+                ),
             },
         )
         .expect("web identity assume role should succeed");
-    assert_eq!(web.provider, "accounts.google.com");
+    assert_eq!(web.provider, "https://token.actions.githubusercontent.com");
     assert_eq!(web.audience, "sts.amazonaws.com");
 
     let saml = sts
@@ -336,7 +404,7 @@ fn sts_supports_web_identity_saml_session_and_federation_flows() {
                 role_arn: "arn:aws:iam::000000000000:role/demo"
                     .parse()
                     .expect("role ARN should parse"),
-                saml_assertion: "PHNhbWxwOlJlc3BvbnNlPjxBdHRyaWJ1dGUgTmFtZT0iaHR0cHM6Ly9hd3MuYW1hem9uLmNvbS9TQU1ML0F0dHJpYnV0ZXMvUm9sZVNlc3Npb25OYW1lIj48QXR0cmlidXRlVmFsdWU+ZmVkLXVzZXI8L0F0dHJpYnV0ZVZhbHVlPjwvQXR0cmlidXRlPjwvc2FtbHA6UmVzcG9uc2U+".to_owned(),
+                saml_assertion: saml_assertion("fed-user"),
             },
         )
         .expect("SAML assume role should succeed");
@@ -405,14 +473,14 @@ fn sts_assume_role_with_web_identity_enforces_trust_policy() {
         &iam,
         "000000000000",
         "web-wrong-provider",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"login.example.com"},"Action":"sts:AssumeRoleWithWebIdentity"}]}"#
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::000000000000:oidc-provider/login.example.com"},"Action":"sts:AssumeRoleWithWebIdentity"}]}"#
             .to_owned(),
     );
     create_role(
         &iam,
         "000000000000",
         "web-denied",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"Federated":"accounts.google.com"},"Action":"sts:AssumeRoleWithWebIdentity"}]}"#
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"Federated":"arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringLike":{"token.actions.githubusercontent.com:sub":"repo:cloudish:*"}}}]}"#
             .to_owned(),
     );
     let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
@@ -427,7 +495,9 @@ fn sts_assume_role_with_web_identity_enforces_trust_policy() {
                     .parse()
                     .expect("role ARN should parse"),
                 role_session_name: "web-session".to_owned(),
-                web_identity_token: "token".to_owned(),
+                web_identity_token: github_jwt(
+                    "repo:cloudish:ref:refs/heads/main",
+                ),
             },
         )
         .expect_err("mismatched web identity provider should fail");
@@ -443,7 +513,9 @@ fn sts_assume_role_with_web_identity_enforces_trust_policy() {
                     .parse()
                     .expect("role ARN should parse"),
                 role_session_name: "web-session".to_owned(),
-                web_identity_token: "token".to_owned(),
+                web_identity_token: github_jwt(
+                    "repo:cloudish:ref:refs/heads/main",
+                ),
             },
         )
         .expect_err("explicitly denied web identity provider should fail");
@@ -468,10 +540,9 @@ fn sts_assume_role_with_saml_enforces_trust_policy() {
             .to_owned(),
     );
     let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
-    let principal_arn: aws::Arn =
-        "arn:aws:iam::000000000000:saml-provider/Test"
-            .parse()
-            .expect("principal ARN should parse");
+    let principal_arn: Arn = "arn:aws:iam::000000000000:saml-provider/Test"
+        .parse()
+        .expect("principal ARN should parse");
 
     let wrong_principal = sts
         .assume_role_with_saml(
@@ -479,10 +550,11 @@ fn sts_assume_role_with_saml_enforces_trust_policy() {
             AssumeRoleWithSamlInput {
                 duration_seconds: Some(900),
                 principal_arn: principal_arn.clone(),
-                role_arn: "arn:aws:iam::000000000000:role/saml-wrong-principal"
-                    .parse()
-                    .expect("role ARN should parse"),
-                saml_assertion: "PHNhbWxwOlJlc3BvbnNlPjxBdHRyaWJ1dGUgTmFtZT0iaHR0cHM6Ly9hd3MuYW1hem9uLmNvbS9TQU1ML0F0dHJpYnV0ZXMvUm9sZVNlc3Npb25OYW1lIj48QXR0cmlidXRlVmFsdWU+ZmVkLXVzZXI8L0F0dHJpYnV0ZVZhbHVlPjwvQXR0cmlidXRlPjwvc2FtbHA6UmVzcG9uc2U+".to_owned(),
+                role_arn:
+                    "arn:aws:iam::000000000000:role/saml-wrong-principal"
+                        .parse()
+                        .expect("role ARN should parse"),
+                saml_assertion: saml_assertion("fed-user"),
             },
         )
         .expect_err("mismatched SAML principal should fail");
@@ -497,9 +569,71 @@ fn sts_assume_role_with_saml_enforces_trust_policy() {
                 role_arn: "arn:aws:iam::000000000000:role/saml-denied"
                     .parse()
                     .expect("role ARN should parse"),
-                saml_assertion: "PHNhbWxwOlJlc3BvbnNlPjxBdHRyaWJ1dGUgTmFtZT0iaHR0cHM6Ly9hd3MuYW1hem9uLmNvbS9TQU1ML0F0dHJpYnV0ZXMvUm9sZVNlc3Npb25OYW1lIj48QXR0cmlidXRlVmFsdWU+ZmVkLXVzZXI8L0F0dHJpYnV0ZVZhbHVlPjwvQXR0cmlidXRlPjwvc2FtbHA6UmVzcG9uc2U+".to_owned(),
+                saml_assertion: saml_assertion("fed-user"),
             },
         )
         .expect_err("explicitly denied SAML principal should fail");
     assert!(matches!(denied, StsError::AccessDenied { .. }));
+}
+
+#[test]
+fn sts_allows_role_chaining_when_the_trust_policy_targets_the_role_arn() {
+    let iam = IamService::new();
+    create_role(
+        &iam,
+        "000000000000",
+        "destination",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:role/source"},"Action":"sts:AssumeRole"}]}"#
+            .to_owned(),
+    );
+    let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
+
+    let assumed = sts
+        .assume_role(
+            &scope("000000000000"),
+            &assumed_role_caller("000000000000", "source", "build"),
+            AssumeRoleInput {
+                duration_seconds: Some(900),
+                role_arn: "arn:aws:iam::000000000000:role/destination"
+                    .parse()
+                    .expect("role ARN should parse"),
+                role_session_name: "next-hop".to_owned(),
+                tags: Vec::new(),
+                transitive_tag_keys: Vec::new(),
+            },
+        )
+        .expect("role chaining should succeed");
+
+    assert_eq!(
+        assumed.assumed_role_user.arn.to_string(),
+        "arn:aws:sts::000000000000:assumed-role/destination/next-hop"
+    );
+}
+
+#[test]
+fn sts_rejects_session_and_federation_tokens_for_temporary_credentials() {
+    let iam = IamService::new();
+    let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
+    let caller = assumed_role_caller("000000000000", "source", "build");
+
+    let session_error = sts
+        .get_session_token(
+            &scope("000000000000"),
+            &caller,
+            GetSessionTokenInput { duration_seconds: Some(900) },
+        )
+        .expect_err("temporary credentials should not mint session tokens");
+    assert!(matches!(session_error, StsError::AccessDenied { .. }));
+
+    let federation_error = sts
+        .get_federation_token(
+            &scope("000000000000"),
+            &caller,
+            GetFederationTokenInput {
+                duration_seconds: Some(900),
+                name: "federated-user".to_owned(),
+            },
+        )
+        .expect_err("temporary credentials should not mint federation tokens");
+    assert!(matches!(federation_error, StsError::AccessDenied { .. }));
 }

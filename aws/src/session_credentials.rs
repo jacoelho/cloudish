@@ -1,10 +1,11 @@
-use crate::{AccountId, Arn, IamResourceTag};
+use crate::{AccountId, Arn, IamResourceTag, TemporaryCredentialKind};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCredentialRecord {
     pub access_key_id: String,
     pub account_id: AccountId,
+    pub credential_kind: TemporaryCredentialKind,
     pub expires_at_epoch_seconds: u64,
     pub principal_arn: Arn,
     pub principal_id: String,
@@ -24,7 +25,10 @@ pub trait SessionCredentialLookup {
 #[cfg(test)]
 mod tests {
     use super::{SessionCredentialLookup, SessionCredentialRecord};
-    use crate::{AccountId, Arn, IamResourceTag};
+    use crate::{
+        AccountId, Arn, AwsPrincipalType, IamResourceTag, StableAwsPrincipal,
+        TemporaryCredentialKind,
+    };
     use std::collections::BTreeSet;
 
     #[derive(Debug)]
@@ -48,6 +52,15 @@ mod tests {
             account_id: "123456789012"
                 .parse::<AccountId>()
                 .expect("account id should parse"),
+            credential_kind: TemporaryCredentialKind::SessionToken {
+                source_principal: StableAwsPrincipal::new(
+                    "arn:aws:iam::123456789012:user/alice"
+                        .parse::<Arn>()
+                        .expect("user ARN should parse"),
+                    AwsPrincipalType::User,
+                    Some("alice".to_owned()),
+                ),
+            },
             expires_at_epoch_seconds: 1_700_000_000,
             principal_arn:
                 "arn:aws:sts::123456789012:assumed-role/demo/session"
@@ -78,6 +91,18 @@ mod tests {
             "arn:aws:sts::123456789012:assumed-role/demo/session"
         );
         assert_eq!(record.principal_id, "AROA1234567890EXAMPLE:session");
+        assert_eq!(
+            record.credential_kind,
+            TemporaryCredentialKind::SessionToken {
+                source_principal: StableAwsPrincipal::new(
+                    "arn:aws:iam::123456789012:user/alice"
+                        .parse::<Arn>()
+                        .expect("user ARN should parse"),
+                    AwsPrincipalType::User,
+                    Some("alice".to_owned()),
+                ),
+            }
+        );
         assert_eq!(record.session_tags.len(), 1);
         assert!(record.transitive_tag_keys.contains("team"));
     }

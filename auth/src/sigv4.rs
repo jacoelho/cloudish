@@ -5,9 +5,10 @@ use crate::aws_chunked::{
     STREAMING_UNSIGNED_PAYLOAD_TRAILER,
 };
 use aws::{
-    AccountId, Arn, AwsError, AwsErrorFamily, CallerIdentity, CredentialScope,
-    IamAccessKeyLookup, IamAccessKeyStatus, IamResourceTag, Partition,
-    RuntimeDefaults, ServiceName, SessionCredentialLookup,
+    AccountId, Arn, AwsError, AwsErrorFamily, AwsPrincipalType,
+    CallerCredentialKind, CallerIdentity, CredentialScope, IamAccessKeyLookup,
+    IamAccessKeyStatus, IamResourceTag, Partition, RuntimeDefaults,
+    ServiceName, SessionCredentialLookup, StableAwsPrincipal,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
@@ -104,6 +105,7 @@ impl SessionAttributes {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedRequest {
     account_id: AccountId,
+    credential_kind: CallerCredentialKind,
     caller_identity: CallerIdentity,
     scope: CredentialScope,
     session: Option<SessionAttributes>,
@@ -112,11 +114,12 @@ pub struct VerifiedRequest {
 impl VerifiedRequest {
     pub fn new(
         account_id: AccountId,
+        credential_kind: CallerCredentialKind,
         caller_identity: CallerIdentity,
         scope: CredentialScope,
         session: Option<SessionAttributes>,
     ) -> Self {
-        Self { account_id, caller_identity, scope, session }
+        Self { account_id, credential_kind, caller_identity, scope, session }
     }
 
     pub fn account_id(&self) -> &AccountId {
@@ -125,6 +128,10 @@ impl VerifiedRequest {
 
     pub fn caller_identity(&self) -> &CallerIdentity {
         &self.caller_identity
+    }
+
+    pub fn credential_kind(&self) -> &CallerCredentialKind {
+        &self.credential_kind
     }
 
     pub fn scope(&self) -> &CredentialScope {
@@ -286,6 +293,7 @@ impl Authenticator {
         Ok(Some(VerifiedSignature::new(
             VerifiedRequest {
                 account_id: material.account_id,
+                credential_kind: material.credential_kind,
                 caller_identity: material.caller_identity,
                 scope: authorization.credential.scope,
                 session: material.session,
@@ -357,6 +365,7 @@ impl Authenticator {
         Ok(Some(VerifiedSignature::new(
             VerifiedRequest {
                 account_id: material.account_id,
+                credential_kind: material.credential_kind,
                 caller_identity: material.caller_identity,
                 scope: authorization.credential.scope,
                 session: material.session,
@@ -386,6 +395,13 @@ impl Authenticator {
             let account_id = self.defaults.default_account_id().clone();
             return Ok(CredentialMaterial {
                 account_id: account_id.clone(),
+                credential_kind: CallerCredentialKind::LongTerm(
+                    StableAwsPrincipal::new(
+                        root_arn(&account_id),
+                        AwsPrincipalType::Account,
+                        None,
+                    ),
+                ),
                 caller_identity: caller_identity(
                     root_arn(&account_id),
                     account_id.as_str().to_owned(),
@@ -419,6 +435,9 @@ impl Authenticator {
 
             return Ok(CredentialMaterial {
                 account_id: session.account_id,
+                credential_kind: CallerCredentialKind::Temporary(
+                    session.credential_kind,
+                ),
                 caller_identity: caller_identity(
                     session.principal_arn,
                     session.principal_id,
@@ -448,6 +467,13 @@ impl Authenticator {
         match access_key.status {
             IamAccessKeyStatus::Active => Ok(CredentialMaterial {
                 account_id: access_key.account_id,
+                credential_kind: CallerCredentialKind::LongTerm(
+                    StableAwsPrincipal::new(
+                        access_key.user_arn.clone(),
+                        AwsPrincipalType::User,
+                        Some(access_key.user_name.clone()),
+                    ),
+                ),
                 caller_identity: caller_identity(
                     access_key.user_arn,
                     access_key.user_id,
@@ -490,6 +516,7 @@ pub fn decode_authorization_message(
 #[derive(Debug, Clone)]
 struct CredentialMaterial {
     account_id: AccountId,
+    credential_kind: CallerCredentialKind,
     caller_identity: CallerIdentity,
     secret_access_key: String,
     session: Option<SessionAttributes>,
@@ -1269,9 +1296,10 @@ mod tests {
         build_signature, canonical_query, decode_authorization_message,
     };
     use aws::{
-        AccountId, Arn, IamAccessKeyLookup, IamAccessKeyRecord,
-        IamAccessKeyStatus, IamResourceTag, RuntimeDefaults,
-        SessionCredentialLookup, SessionCredentialRecord,
+        AccountId, Arn, AwsPrincipalType, CallerCredentialKind,
+        IamAccessKeyLookup, IamAccessKeyRecord, IamAccessKeyStatus,
+        IamResourceTag, RuntimeDefaults, SessionCredentialLookup,
+        SessionCredentialRecord, StableAwsPrincipal, TemporaryCredentialKind,
     };
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -1558,6 +1586,12 @@ mod tests {
                 account_id: "123456789012"
                     .parse::<AccountId>()
                     .expect("account id should parse"),
+                credential_kind: TemporaryCredentialKind::AssumedRole {
+                    role_arn: "arn:aws:iam::123456789012:role/demo"
+                        .parse::<Arn>()
+                        .expect("role ARN should parse"),
+                    role_session_name: "session".to_owned(),
+                },
                 expires_at_epoch_seconds: 1_742_909_200,
                 principal_arn:
                     "arn:aws:sts::123456789012:assumed-role/demo/session"
@@ -1583,6 +1617,17 @@ mod tests {
         assert_eq!(
             verified.caller_identity().arn().to_string(),
             "arn:aws:sts::123456789012:assumed-role/demo/session"
+        );
+        assert_eq!(
+            verified.credential_kind(),
+            &CallerCredentialKind::Temporary(
+                TemporaryCredentialKind::AssumedRole {
+                    role_arn: "arn:aws:iam::123456789012:role/demo"
+                        .parse::<Arn>()
+                        .expect("role ARN should parse"),
+                    role_session_name: "session".to_owned(),
+                }
+            )
         );
         assert_eq!(
             verified
@@ -1628,6 +1673,15 @@ mod tests {
                 account_id: "123456789012"
                     .parse::<AccountId>()
                     .expect("account id should parse"),
+                credential_kind: TemporaryCredentialKind::SessionToken {
+                    source_principal: StableAwsPrincipal::new(
+                        "arn:aws:iam::123456789012:user/alice"
+                            .parse::<Arn>()
+                            .expect("user ARN should parse"),
+                        AwsPrincipalType::User,
+                        Some("alice".to_owned()),
+                    ),
+                },
                 expires_at_epoch_seconds: 1_742_905_599,
                 principal_arn:
                     "arn:aws:sts::123456789012:assumed-role/demo/session"

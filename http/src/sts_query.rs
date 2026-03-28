@@ -227,6 +227,7 @@ fn require_authenticated_caller<'a>(
 fn verified_caller(verified_request: &VerifiedRequest) -> StsCaller {
     StsCaller::new(
         verified_request.account_id().clone(),
+        verified_request.credential_kind().clone(),
         verified_request.caller_identity().clone(),
         verified_request
             .session()
@@ -399,8 +400,9 @@ mod tests {
     use super::handle;
     use auth::{SessionAttributes, VerifiedRequest};
     use aws::{
-        Arn, CallerIdentity, CredentialScope, IamResourceTag, ProtocolFamily,
-        RequestContext, ServiceName,
+        Arn, AwsPrincipalType, CallerCredentialKind, CallerIdentity,
+        CredentialScope, IamResourceTag, ProtocolFamily, RequestContext,
+        ServiceName, StableAwsPrincipal, TemporaryCredentialKind,
     };
     use services::{CreateRoleInput, IamScope, IamService, StsService};
     use std::collections::BTreeSet;
@@ -458,6 +460,13 @@ mod tests {
         .expect("caller identity should build");
         let verified_request = VerifiedRequest::new(
             "000000000000".parse().expect("account should parse"),
+            CallerCredentialKind::LongTerm(StableAwsPrincipal::new(
+                "arn:aws:iam::000000000000:root"
+                    .parse::<Arn>()
+                    .expect("root ARN should parse"),
+                AwsPrincipalType::Account,
+                None,
+            )),
             caller_identity.clone(),
             CredentialScope::new(
                 "eu-west-2".parse().expect("region should parse"),
@@ -500,6 +509,14 @@ mod tests {
         .expect("caller identity should build");
         let verified_request = VerifiedRequest::new(
             "123456789012".parse().expect("account should parse"),
+            CallerCredentialKind::Temporary(
+                TemporaryCredentialKind::AssumedRole {
+                    role_arn: "arn:aws:iam::123456789012:role/demo"
+                        .parse::<Arn>()
+                        .expect("role ARN should parse"),
+                    role_session_name: "session".to_owned(),
+                },
+            ),
             caller_identity.clone(),
             CredentialScope::new(
                 "eu-west-2".parse().expect("region should parse"),

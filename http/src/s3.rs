@@ -2140,8 +2140,9 @@ mod tests {
         VerifiedSignature,
     };
     use aws::{
-        AccountId, Arn, ArnResource, CallerIdentity, CredentialScope,
-        Partition, ServiceName,
+        AccountId, Arn, ArnResource, AwsPrincipalType, CallerCredentialKind,
+        CallerIdentity, CredentialScope, Partition, ServiceName,
+        StableAwsPrincipal,
     };
 
     #[test]
@@ -2245,6 +2246,21 @@ mod tests {
         .expect("caller identity should build");
         let verified_request = VerifiedRequest::new(
             account_id,
+            CallerCredentialKind::LongTerm(StableAwsPrincipal::new(
+                Arn::trusted_new(
+                    Partition::aws(),
+                    ServiceName::Iam,
+                    None,
+                    Some(
+                        "000000000000"
+                            .parse()
+                            .expect("account id should parse"),
+                    ),
+                    ArnResource::Generic("root".to_owned()),
+                ),
+                AwsPrincipalType::Account,
+                None,
+            )),
             caller_identity,
             CredentialScope::new(
                 "eu-west-2".parse().expect("region should parse"),

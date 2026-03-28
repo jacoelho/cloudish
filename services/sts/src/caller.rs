@@ -1,4 +1,6 @@
-use aws::{AccountId, Arn, CallerIdentity};
+use aws::{
+    AccountId, Arn, CallerCredentialKind, CallerIdentity, StableAwsPrincipal,
+};
 use iam::IamTag;
 use std::collections::BTreeSet;
 
@@ -12,6 +14,7 @@ pub struct CallerIdentityOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StsCaller {
     account_id: AccountId,
+    credential_kind: CallerCredentialKind,
     identity: CallerIdentity,
     session_tags: Vec<IamTag>,
     transitive_tag_keys: BTreeSet<String>,
@@ -20,11 +23,18 @@ pub struct StsCaller {
 impl StsCaller {
     pub fn new(
         account_id: AccountId,
+        credential_kind: CallerCredentialKind,
         identity: CallerIdentity,
         session_tags: Vec<IamTag>,
         transitive_tag_keys: BTreeSet<String>,
     ) -> Self {
-        Self { account_id, identity, session_tags, transitive_tag_keys }
+        Self {
+            account_id,
+            credential_kind,
+            identity,
+            session_tags,
+            transitive_tag_keys,
+        }
     }
 
     pub fn account_id(&self) -> &AccountId {
@@ -41,6 +51,22 @@ impl StsCaller {
 
     pub fn identity(&self) -> &CallerIdentity {
         &self.identity
+    }
+
+    pub fn credential_kind(&self) -> &CallerCredentialKind {
+        &self.credential_kind
+    }
+
+    pub fn uses_long_term_credentials(&self) -> bool {
+        self.credential_kind.uses_long_term_credentials()
+    }
+
+    pub fn canonical_trust_principal(&self) -> StableAwsPrincipal {
+        self.credential_kind.canonical_trust_principal()
+    }
+
+    pub fn role_session_name(&self) -> Option<&str> {
+        self.credential_kind.role_session_name()
     }
 
     pub(crate) fn session_tags(&self) -> &[IamTag] {

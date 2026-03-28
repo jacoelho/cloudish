@@ -1,5 +1,8 @@
 use crate::StsError;
-use aws::{AccountId, Arn, IamResourceTag, SessionCredentialRecord};
+use aws::{
+    AccountId, Arn, IamResourceTag, SessionCredentialRecord,
+    TemporaryCredentialKind,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,6 +37,7 @@ pub(crate) struct StsWorld {
 
 pub(crate) struct SessionIssueInput {
     pub(crate) account_id: AccountId,
+    pub(crate) credential_kind: TemporaryCredentialKind,
     pub(crate) duration_seconds: u32,
     pub(crate) principal_arn: Arn,
     pub(crate) principal_id: String,
@@ -45,6 +49,7 @@ pub(crate) struct SessionIssueInput {
 struct StoredSessionCredential {
     access_key_id: String,
     account_id: AccountId,
+    credential_kind: TemporaryCredentialKind,
     expires_at_epoch_seconds: u64,
     principal_arn: Arn,
     principal_id: String,
@@ -64,6 +69,7 @@ pub(crate) fn find_session_credential(
     Some(SessionCredentialRecord {
         access_key_id: record.access_key_id.clone(),
         account_id: record.account_id.clone(),
+        credential_kind: record.credential_kind.clone(),
         expires_at_epoch_seconds: record.expires_at_epoch_seconds,
         principal_arn: record.principal_arn.clone(),
         principal_id: record.principal_id.clone(),
@@ -94,6 +100,7 @@ pub(crate) fn issue_session(
         StoredSessionCredential {
             access_key_id: access_key_id.clone(),
             account_id: input.account_id,
+            credential_kind: input.credential_kind,
             expires_at_epoch_seconds,
             principal_arn: input.principal_arn,
             principal_id: input.principal_id,

@@ -14,6 +14,7 @@
 
 mod account_id;
 mod arn;
+mod caller_credentials;
 mod credential_scope;
 mod error;
 mod execute_api_source_arn;
@@ -32,6 +33,10 @@ pub use account_id::{AccountId, AccountIdError};
 pub use arn::{
     Arn, ArnError, ArnResource, Partition, PartitionError, S3ArnResource,
     S3ArnResourceError, SqsArnResource, SqsArnResourceError,
+};
+pub use caller_credentials::{
+    AwsPrincipalType, CallerCredentialKind, StableAwsPrincipal,
+    TemporaryCredentialKind,
 };
 pub use credential_scope::CredentialScope;
 pub use error::{AwsError, AwsErrorBuildError, AwsErrorFamily};

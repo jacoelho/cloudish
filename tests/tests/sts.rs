@@ -15,6 +15,10 @@ use aws_sdk_iam::Client as IamClient;
 use aws_sdk_sts::Client as StsClient;
 use aws_sdk_sts::error::ProvideErrorMetadata;
 use aws_sdk_sts::types::Tag;
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
 use test_support::send_http_request;
@@ -37,9 +41,8 @@ fn federated_role_policy(account_id: &str) -> String {
         concat!(
             r#"{{"Version":"2012-10-17","Statement":["#,
             r#"{{"Effect":"Allow","Principal":{{"AWS":"{account_id}"}},"Action":["sts:AssumeRole","sts:TagSession"]}},"#,
-            r#"{{"Effect":"Allow","Principal":{{"Federated":["accounts.google.com","arn:aws:iam::{account_id}:oidc-provider/accounts.google.com"]}},"#,
-            r#""Action":"sts:AssumeRoleWithWebIdentity"}},"#,
-            r#"{{"Effect":"Allow","Principal":{{"Federated":"arn:aws:iam::{account_id}:saml-provider/example"}},"Action":"sts:AssumeRoleWithSAML"}}"#,
+            r#"{{"Effect":"Allow","Principal":{{"Federated":"arn:aws:iam::{account_id}:oidc-provider/token.actions.githubusercontent.com"}},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{{"StringEquals":{{"token.actions.githubusercontent.com:aud":"sts.amazonaws.com"}},"StringLike":{{"token.actions.githubusercontent.com:sub":"repo:cloudish:*"}}}}}},"#,
+            r#"{{"Effect":"Allow","Principal":{{"Federated":"arn:aws:iam::{account_id}:saml-provider/example"}},"Action":"sts:AssumeRoleWithSAML","Condition":{{"StringEquals":{{"SAML:aud":"urn:amazon:webservices"}}}}}}"#,
             r#"]}}"#
         ),
         account_id = account_id,
@@ -47,11 +50,18 @@ fn federated_role_policy(account_id: &str) -> String {
 }
 
 fn saml_assertion(session_name: &str) -> String {
-    assert_eq!(
-        session_name, "saml-session",
-        "only the seeded SAML assertion is used in smoke tests",
-    );
-    "PEFzc2VydGlvbj48QXR0cmlidXRlIE5hbWU9Imh0dHBzOi8vYXdzLmFtYXpvbi5jb20vU0FNTC9BdHRyaWJ1dGVzL1JvbGVTZXNzaW9uTmFtZSI+PEF0dHJpYnV0ZVZhbHVlPnNhbWwtc2Vzc2lvbjwvQXR0cmlidXRlVmFsdWU+PC9BdHRyaWJ1dGU+PC9Bc3NlcnRpb24+".to_owned()
+    STANDARD.encode(format!(
+        r#"<Assertion><Issuer>https://saml.example.com</Issuer><Audience>urn:amazon:webservices</Audience><Subject><NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent" NameQualifier="saml-qualifier">saml-subject</NameID></Subject><Attribute Name="https://aws.amazon.com/SAML/Attributes/RoleSessionName"><AttributeValue>{session_name}</AttributeValue></Attribute></Assertion>"#
+    ))
+}
+
+fn github_jwt(subject: &str) -> String {
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(format!(
+        r#"{{"iss":"https://token.actions.githubusercontent.com","sub":"{subject}","aud":["sts.amazonaws.com"],"amr":["authenticated"]}}"#
+    ));
+
+    format!("{header}.{payload}.signature")
 }
 
 fn session_target(
@@ -184,6 +194,108 @@ async fn assume_role_credentials_sign_downstream_iam_requests() {
 }
 
 #[tokio::test]
+async fn chained_assume_role_matches_trusted_role_arns() {
+    let runtime = shared_runtime().await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let iam = IamClient::new(&config);
+    let sts = StsClient::new(&config);
+
+    iam.create_role()
+        .role_name("source")
+        .assume_role_policy_document(assume_role_policy("000000000000"))
+        .send()
+        .await
+        .expect("source role should be created");
+    iam.create_role()
+        .role_name("destination")
+        .assume_role_policy_document(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:role/source"},"Action":"sts:AssumeRole"}]}"#,
+        )
+        .send()
+        .await
+        .expect("destination role should be created");
+
+    let source = sts
+        .assume_role()
+        .role_arn("arn:aws:iam::000000000000:role/source")
+        .role_session_name("build")
+        .send()
+        .await
+        .expect("source assume role should succeed");
+    let source_credentials =
+        source.credentials().expect("source credentials should be returned");
+
+    let delegated_config =
+        session_target(&target, source_credentials).load().await;
+    let delegated_sts = StsClient::new(&delegated_config);
+    let destination = delegated_sts
+        .assume_role()
+        .role_arn("arn:aws:iam::000000000000:role/destination")
+        .role_session_name("deploy")
+        .send()
+        .await
+        .expect("destination assume role should succeed");
+
+    assert_eq!(
+        destination.assumed_role_user().map(|user| user.arn()),
+        Some("arn:aws:sts::000000000000:assumed-role/destination/deploy")
+    );
+}
+
+#[tokio::test]
+async fn temporary_credentials_cannot_mint_more_session_credentials() {
+    let runtime = shared_runtime().await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let iam = IamClient::new(&config);
+    let sts = StsClient::new(&config);
+
+    iam.create_role()
+        .role_name("source")
+        .assume_role_policy_document(assume_role_policy("000000000000"))
+        .send()
+        .await
+        .expect("source role should be created");
+    let source = sts
+        .assume_role()
+        .role_arn("arn:aws:iam::000000000000:role/source")
+        .role_session_name("build")
+        .send()
+        .await
+        .expect("source assume role should succeed");
+    let source_credentials =
+        source.credentials().expect("source credentials should be returned");
+
+    let delegated_config =
+        session_target(&target, source_credentials).load().await;
+    let delegated_sts = StsClient::new(&delegated_config);
+
+    let session_error = delegated_sts
+        .get_session_token()
+        .duration_seconds(900)
+        .send()
+        .await
+        .expect_err("temporary credentials must not mint session tokens");
+    assert_eq!(session_error.code(), Some("AccessDenied"));
+
+    let federation_error = delegated_sts
+        .get_federation_token()
+        .name("nested-federation")
+        .duration_seconds(900)
+        .send()
+        .await
+        .expect_err("temporary credentials must not mint federation tokens");
+    assert_eq!(federation_error.code(), Some("AccessDenied"));
+}
+
+#[tokio::test]
 async fn root_caller_identity_and_invalid_session_names_match_sts_rules() {
     let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
@@ -272,12 +384,14 @@ async fn extended_query_paths_round_trip() {
         .assume_role_with_web_identity()
         .role_arn("arn:aws:iam::000000000000:role/external")
         .role_session_name("web-session")
-        .provider_id("accounts.google.com")
-        .web_identity_token("opaque-token")
+        .web_identity_token(github_jwt("repo:cloudish:ref:refs/heads/main"))
         .send()
         .await
         .expect("assume role with web identity should succeed");
-    assert_eq!(web_identity.provider(), Some("accounts.google.com"));
+    assert_eq!(
+        web_identity.provider(),
+        Some("https://token.actions.githubusercontent.com")
+    );
     assert_eq!(web_identity.audience(), Some("sts.amazonaws.com"));
     assert_eq!(
         web_identity.assumed_role_user().map(|user| user.arn()),
@@ -388,7 +502,7 @@ async fn federated_trust_mismatches_fail_with_access_denied() {
     iam.create_role()
         .role_name("web-denied")
         .assume_role_policy_document(
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"Federated":"accounts.google.com"},"Action":"sts:AssumeRoleWithWebIdentity"}]}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"Federated":"arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringLike":{"token.actions.githubusercontent.com:sub":"repo:cloudish:*"}}}]}"#,
         )
         .send()
         .await
@@ -407,8 +521,7 @@ async fn federated_trust_mismatches_fail_with_access_denied() {
         .assume_role_with_web_identity()
         .role_arn("arn:aws:iam::000000000000:role/web-denied")
         .role_session_name("web-session")
-        .provider_id("accounts.google.com")
-        .web_identity_token("opaque-token")
+        .web_identity_token(github_jwt("repo:cloudish:ref:refs/heads/main"))
         .send()
         .await
         .expect_err("denied web identity trust should fail");
