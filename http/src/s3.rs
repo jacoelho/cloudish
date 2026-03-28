@@ -1,6 +1,6 @@
 pub(crate) use crate::aws_error_shape::AwsErrorShape;
 use crate::query::QueryParameters;
-use crate::request::HttpRequest;
+use crate::request::{EdgeRequest, HttpRequest};
 use crate::runtime::EdgeResponse;
 use crate::s3_xml::{
     parse_bucket_notification_configuration, parse_bucket_versioning,
@@ -9,6 +9,7 @@ use crate::s3_xml::{
     parse_select_object_content_request, parse_tagging,
 };
 use crate::xml::XmlBuilder;
+use auth::{AwsChunkedMode, VerifiedPayload, VerifiedSignature};
 use aws::{AwsError, AwsErrorFamily};
 use aws_smithy_eventstream::frame::write_message_to;
 use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
@@ -41,6 +42,117 @@ pub(crate) fn is_rest_xml_request(request: &HttpRequest<'_>) -> bool {
     matches!(request.method(), "DELETE" | "GET" | "HEAD" | "POST" | "PUT")
         && request.header("host").is_some()
         && !path.starts_with("/__")
+}
+
+pub(crate) fn normalize_request(
+    request: &mut EdgeRequest,
+    verified_signature: Option<&VerifiedSignature>,
+) -> Result<(), AwsError> {
+    let uses_aws_chunked = request
+        .header_values("content-encoding")
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|token| token.eq_ignore_ascii_case("aws-chunked"));
+    let signing_context = verified_signature.and_then(|verified_signature| {
+        match verified_signature.payload() {
+            VerifiedPayload::AwsChunked(context) => Some(context),
+            VerifiedPayload::SignedBody | VerifiedPayload::UnsignedPayload => {
+                None
+            }
+        }
+    });
+
+    if !uses_aws_chunked && signing_context.is_none() {
+        return Ok(());
+    }
+
+    let Some(signing_context) = signing_context else {
+        return Err(invalid_request_error(
+            "aws-chunked S3 requests must use streaming SigV4 payload signing.",
+        ));
+    };
+    let decoded_content_length = request
+        .header("x-amz-decoded-content-length")
+        .ok_or_else(|| {
+            invalid_request_error(
+                "aws-chunked S3 requests must include X-Amz-Decoded-Content-Length.",
+            )
+        })?
+        .parse::<usize>()
+        .map_err(|_| {
+            invalid_request_error(
+                "X-Amz-Decoded-Content-Length must be a decimal byte count.",
+            )
+        })?;
+    let trailer_names = request
+        .header("x-amz-trailer")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    match signing_context.mode() {
+        AwsChunkedMode::Payload if !trailer_names.is_empty() => {
+            return Err(invalid_request_error(
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD requests must not include X-Amz-Trailer.",
+            ));
+        }
+        AwsChunkedMode::PayloadTrailer if trailer_names.is_empty() => {
+            return Err(invalid_request_error(
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER requests must include X-Amz-Trailer.",
+            ));
+        }
+        AwsChunkedMode::Payload | AwsChunkedMode::PayloadTrailer => {}
+    }
+
+    let decoded = signing_context.decode(
+        request.body(),
+        decoded_content_length,
+        &trailer_names,
+    )?;
+    request.set_body(decoded.decoded_body().to_vec());
+    request.remove_header("x-amz-decoded-content-length");
+    request.remove_header("x-amz-trailer");
+    normalize_content_encoding(request);
+    for (name, value) in decoded.trailer_headers() {
+        request.append_header(name.clone(), value.clone());
+    }
+
+    Ok(())
+}
+
+fn normalize_content_encoding(request: &mut EdgeRequest) {
+    let remaining = request
+        .header_values("content-encoding")
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|token| {
+            !token.is_empty() && !token.eq_ignore_ascii_case("aws-chunked")
+        })
+        .collect::<Vec<_>>();
+
+    if remaining.is_empty() {
+        request.remove_header("content-encoding");
+    } else {
+        request.set_header("Content-Encoding", remaining.join(","));
+    }
+}
+
+fn invalid_request_error(message: impl Into<String>) -> AwsError {
+    AwsError::trusted_custom(
+        AwsErrorFamily::Validation,
+        "InvalidRequest",
+        message,
+        400,
+        true,
+    )
 }
 
 pub(crate) fn handle(
@@ -2018,4 +2130,192 @@ fn percent_decode_tag_component(value: &str) -> Result<String, AwsError> {
     }
 
     String::from_utf8(decoded).map_err(|_| malformed_xml_error())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AwsChunkedMode, EdgeRequest, normalize_request};
+    use auth::{
+        AwsChunkedSigningContext, VerifiedPayload, VerifiedRequest,
+        VerifiedSignature,
+    };
+    use aws::{
+        AccountId, Arn, ArnResource, CallerIdentity, CredentialScope,
+        Partition, ServiceName,
+    };
+
+    #[test]
+    fn normalize_request_decodes_streaming_payload_and_strips_aws_chunked() {
+        let mut request = EdgeRequest::new(
+            "PUT",
+            "/bucket/object.txt",
+            vec![
+                ("Host".to_owned(), "localhost".to_owned()),
+                ("Content-Encoding".to_owned(), "aws-chunked,gzip".to_owned()),
+                (
+                    "X-Amz-Decoded-Content-Length".to_owned(),
+                    "66560".to_owned(),
+                ),
+            ],
+            payload_example_body(),
+        );
+        let verified_signature = streaming_verified_signature(
+            AwsChunkedMode::Payload,
+            "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
+        );
+
+        normalize_request(&mut request, Some(&verified_signature))
+            .expect("streaming payload should decode");
+
+        assert_eq!(request.body(), vec![b'a'; 66_560].as_slice());
+        assert_eq!(request.header("content-encoding"), Some("gzip"));
+        assert!(request.header("x-amz-decoded-content-length").is_none());
+    }
+
+    #[test]
+    fn normalize_request_merges_verified_trailing_headers() {
+        let mut request = EdgeRequest::new(
+            "PUT",
+            "/bucket/object.txt",
+            vec![
+                ("Host".to_owned(), "localhost".to_owned()),
+                ("Content-Encoding".to_owned(), "aws-chunked".to_owned()),
+                (
+                    "X-Amz-Decoded-Content-Length".to_owned(),
+                    "66560".to_owned(),
+                ),
+                (
+                    "X-Amz-Trailer".to_owned(),
+                    "x-amz-checksum-crc32c".to_owned(),
+                ),
+            ],
+            trailer_example_body(),
+        );
+        let verified_signature = streaming_verified_signature(
+            AwsChunkedMode::PayloadTrailer,
+            "106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e",
+        );
+
+        normalize_request(&mut request, Some(&verified_signature))
+            .expect("streaming trailing headers should decode");
+
+        assert_eq!(request.body(), vec![b'a'; 66_560].as_slice());
+        assert!(request.header("content-encoding").is_none());
+        assert_eq!(request.header("x-amz-checksum-crc32c"), Some("sOO8/Q=="));
+    }
+
+    #[test]
+    fn normalize_request_rejects_unsigned_aws_chunked_payloads() {
+        let mut request = EdgeRequest::new(
+            "PUT",
+            "/bucket/object.txt",
+            vec![
+                ("Host".to_owned(), "localhost".to_owned()),
+                ("Content-Encoding".to_owned(), "aws-chunked".to_owned()),
+                (
+                    "X-Amz-Decoded-Content-Length".to_owned(),
+                    "66560".to_owned(),
+                ),
+            ],
+            payload_example_body(),
+        );
+
+        let error = normalize_request(&mut request, None)
+            .expect_err("unsigned aws-chunked payloads must fail");
+
+        assert_eq!(error.code(), "InvalidRequest");
+    }
+
+    fn streaming_verified_signature(
+        mode: AwsChunkedMode,
+        seed_signature: &str,
+    ) -> VerifiedSignature {
+        let account_id: AccountId =
+            "000000000000".parse().expect("account id should parse");
+        let caller_identity = CallerIdentity::try_new(
+            Arn::trusted_new(
+                Partition::aws(),
+                ServiceName::Iam,
+                None,
+                Some(account_id.clone()),
+                ArnResource::Generic("root".to_owned()),
+            ),
+            account_id.as_str(),
+        )
+        .expect("caller identity should build");
+        let verified_request = VerifiedRequest::new(
+            account_id,
+            caller_identity,
+            CredentialScope::new(
+                "eu-west-2".parse().expect("region should parse"),
+                ServiceName::S3,
+            ),
+            None,
+        );
+
+        VerifiedSignature::new(
+            verified_request,
+            VerifiedPayload::AwsChunked(AwsChunkedSigningContext::new(
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "20130524",
+                "us-east-1",
+                "s3",
+                "20130524T000000Z",
+                seed_signature,
+                mode,
+            )),
+        )
+    }
+
+    fn payload_example_body() -> Vec<u8> {
+        [
+            format!(
+                "10000;chunk-signature={}\r\n",
+                "ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648"
+            )
+            .into_bytes(),
+            vec![b'a'; 65_536],
+            b"\r\n".to_vec(),
+            format!(
+                "400;chunk-signature={}\r\n",
+                "0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497"
+            )
+            .into_bytes(),
+            vec![b'a'; 1_024],
+            b"\r\n".to_vec(),
+            format!(
+                "0;chunk-signature={}\r\n\r\n",
+                "b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9"
+            )
+            .into_bytes(),
+        ]
+        .concat()
+    }
+
+    fn trailer_example_body() -> Vec<u8> {
+        [
+            format!(
+                "10000;chunk-signature={}\r\n",
+                "b474d8862b1487a5145d686f57f013e54db672cee1c953b3010fb58501ef5aa2"
+            )
+            .into_bytes(),
+            vec![b'a'; 65_536],
+            b"\r\n".to_vec(),
+            format!(
+                "400;chunk-signature={}\r\n",
+                "1c1344b170168f8e65b41376b44b20fe354e373826ccbbe2c1d40a8cae51e5c7"
+            )
+            .into_bytes(),
+            vec![b'a'; 1_024],
+            b"\r\n".to_vec(),
+            format!(
+                "0;chunk-signature={}\r\n\r\n",
+                "2ca2aba2005185cf7159c6277faf83795951dd77a3a99e6e65d5c9f85863f992"
+            )
+            .into_bytes(),
+            b"x-amz-checksum-crc32c:sOO8/Q==\r\nx-amz-trailer-signature:d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435\r\n\r\n"
+                .to_vec(),
+        ]
+        .concat()
+    }
 }

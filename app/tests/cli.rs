@@ -10,7 +10,9 @@
 )]
 use app::{EDGE_HOST_ENV, EDGE_PORT_ENV};
 use aws::{DEFAULT_ACCOUNT_ENV, DEFAULT_REGION_ENV, STATE_DIRECTORY_ENV};
+use std::io::Write;
 use std::net::SocketAddr;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,18 +41,19 @@ CLOUDISH_DEFAULT_ACCOUNT, CLOUDISH_DEFAULT_REGION, CLOUDISH_STATE_DIR"
 fn app_binary_serves_the_health_endpoint() {
     let state_directory = temporary_directory("app-binary").join("state");
     let state_directory = state_directory.to_string_lossy().into_owned();
+    let port = available_port();
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
     let mut child = Command::new(env!("CARGO_BIN_EXE_app"))
         .env(DEFAULT_ACCOUNT_ENV, "000000000000")
         .env(DEFAULT_REGION_ENV, "eu-west-2")
         .env(STATE_DIRECTORY_ENV, &state_directory)
+        .env(EDGE_PORT_ENV, port.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("app binary should start");
 
-    let response = wait_for_health_response(
-        "127.0.0.1:4566".parse().expect("health address should parse"),
-    );
+    let response = wait_for_health_response(address);
 
     let child_signal =
         Command::new("kill").arg("-INT").arg(child.id().to_string()).status();
@@ -106,6 +109,53 @@ fn app_binary_serves_the_health_endpoint_on_a_custom_edge_address() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn app_binary_serves_other_clients_while_one_connection_is_stalled() {
+    let state_directory =
+        temporary_directory("app-binary-stalled-client").join("state");
+    let state_directory = state_directory.to_string_lossy().into_owned();
+    let port = available_port();
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_app"))
+        .env(DEFAULT_ACCOUNT_ENV, "000000000000")
+        .env(DEFAULT_REGION_ENV, "eu-west-2")
+        .env(STATE_DIRECTORY_ENV, &state_directory)
+        .env(EDGE_PORT_ENV, port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("app binary should start");
+
+    let ready_response = wait_for_health_response(address);
+    assert!(ready_response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    let mut stalled_client =
+        TcpStream::connect(address).expect("stalled client should connect");
+    stalled_client
+        .write_all(
+            b"PUT /sdk-stall/object.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nabc",
+        )
+        .expect("stalled request should be written");
+
+    let concurrent_response = wait_for_health_response(address);
+
+    stalled_client
+        .shutdown(Shutdown::Both)
+        .expect("stalled client should close");
+    let child_signal =
+        Command::new("kill").arg("-INT").arg(child.id().to_string()).status();
+    child_signal.expect("app binary should receive SIGINT");
+    let status = child.wait().expect("app binary should exit cleanly");
+
+    assert!(concurrent_response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(status.success());
+
+    let root = std::path::Path::new(&state_directory)
+        .parent()
+        .expect("state directory should have a test root");
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn wait_for_health_response(address: SocketAddr) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last_error = None;
@@ -126,4 +176,12 @@ fn wait_for_health_response(address: SocketAddr) -> String {
     panic!(
         "app binary did not expose the health endpoint in time: {last_error:?}"
     );
+}
+
+fn available_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("ephemeral port should bind")
+        .local_addr()
+        .expect("ephemeral listener should expose its address")
+        .port()
 }

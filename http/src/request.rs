@@ -1,15 +1,34 @@
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HttpRequest<'a> {
-    method: &'a str,
-    path: &'a str,
-    headers: Vec<Header<'a>>,
-    body: &'a [u8],
+pub struct EdgeRequest {
+    method: String,
+    path: String,
+    headers: Vec<Header>,
+    body: Vec<u8>,
 }
 
-impl<'a> HttpRequest<'a> {
-    pub(crate) fn parse(request: &'a [u8]) -> Result<Self, RequestParseError> {
+pub(crate) type HttpRequest<'a> = EdgeRequest;
+
+impl EdgeRequest {
+    pub fn new(
+        method: impl Into<String>,
+        path: impl Into<String>,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Self {
+        Self {
+            method: method.into(),
+            path: path.into(),
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| Header { name, value })
+                .collect(),
+            body,
+        }
+    }
+
+    pub(crate) fn parse(request: &[u8]) -> Result<Self, RequestParseError> {
         let header_end = request
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -45,49 +64,103 @@ impl<'a> HttpRequest<'a> {
             let (name, value) = line
                 .split_once(':')
                 .ok_or(RequestParseError::InvalidHeaderLine)?;
-            parsed_headers
-                .push(Header { name: name.trim(), value: value.trim() });
+            parsed_headers.push(Header {
+                name: name.trim().to_owned(),
+                value: value.trim().to_owned(),
+            });
         }
 
-        Ok(Self { method, path, headers: parsed_headers, body })
+        Ok(Self {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            headers: parsed_headers,
+            body: body.to_vec(),
+        })
     }
 
-    pub(crate) fn method(&self) -> &str {
-        self.method
+    pub fn method(&self) -> &str {
+        &self.method
     }
 
-    pub(crate) fn path_without_query(&self) -> &str {
-        self.path.split('?').next().unwrap_or(self.path)
+    pub fn path_without_query(&self) -> &str {
+        self.path.split('?').next().unwrap_or(&self.path)
     }
 
-    pub(crate) fn path(&self) -> &str {
-        self.path
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
-    pub(crate) fn query_string(&self) -> Option<&str> {
+    pub fn query_string(&self) -> Option<&str> {
         self.path.split_once('?').map(|(_, query)| query)
     }
 
-    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+    pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|header| header.name.eq_ignore_ascii_case(name))
-            .map(|header| header.value)
+            .map(|header| header.value.as_str())
     }
 
-    pub(crate) fn body(&self) -> &[u8] {
-        self.body
+    pub fn body(&self) -> &[u8] {
+        &self.body
     }
 
-    pub(crate) fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.headers.iter().map(|header| (header.name, header.value))
+    pub fn set_body(&mut self, body: Vec<u8>) {
+        self.body = body;
+    }
+
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers
+            .iter()
+            .map(|header| (header.name.as_str(), header.value.as_str()))
+    }
+
+    pub fn append_header(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) {
+        self.headers.push(Header { name: name.into(), value: value.into() });
+    }
+
+    pub fn set_header(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) {
+        let name = name.into();
+        let value = value.into();
+
+        if let Some(existing) = self
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case(&name))
+        {
+            existing.name = name;
+            existing.value = value;
+            return;
+        }
+
+        self.headers.push(Header { name, value });
+    }
+
+    pub fn remove_header(&mut self, name: &str) {
+        self.headers.retain(|header| !header.name.eq_ignore_ascii_case(name));
+    }
+
+    pub fn header_values(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.as_str())
+            .collect()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Header<'a> {
-    name: &'a str,
-    value: &'a str,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Header {
+    name: String,
+    value: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,11 +190,11 @@ impl fmt::Display for RequestParseError {
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpRequest, RequestParseError};
+    use super::{EdgeRequest, RequestParseError};
 
     #[test]
     fn parse_http_request_with_headers_and_body() {
-        let request = HttpRequest::parse(
+        let request = EdgeRequest::parse(
             b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-amz-json-1.0\r\n\r\n{}",
         )
         .expect("request should parse");
@@ -137,7 +210,7 @@ mod tests {
 
     #[test]
     fn parse_request_without_header_terminator() {
-        let request = HttpRequest::parse(
+        let request = EdgeRequest::parse(
             b"GET /__cloudish/health HTTP/1.1\r\nHost: localhost",
         )
         .expect("request should parse");
@@ -149,7 +222,7 @@ mod tests {
 
     #[test]
     fn reject_invalid_request_line() {
-        let error = HttpRequest::parse(b"THIS IS NOT HTTP")
+        let error = EdgeRequest::parse(b"THIS IS NOT HTTP")
             .expect_err("invalid request line should fail");
 
         assert_eq!(error, RequestParseError::InvalidRequestLine);
@@ -161,7 +234,7 @@ mod tests {
 
     #[test]
     fn reject_invalid_header_line() {
-        let error = HttpRequest::parse(b"GET / HTTP/1.1\r\nInvalid\r\n\r\n")
+        let error = EdgeRequest::parse(b"GET / HTTP/1.1\r\nInvalid\r\n\r\n")
             .expect_err("invalid header should fail");
 
         assert_eq!(error, RequestParseError::InvalidHeaderLine);
@@ -170,7 +243,7 @@ mod tests {
     #[test]
     fn reject_invalid_header_encoding() {
         let error =
-            HttpRequest::parse(b"GET / HTTP/1.1\r\nHost: \xff\r\n\r\n")
+            EdgeRequest::parse(b"GET / HTTP/1.1\r\nHost: \xff\r\n\r\n")
                 .expect_err("invalid header encoding should fail");
 
         assert_eq!(error, RequestParseError::InvalidEncoding);
@@ -179,9 +252,28 @@ mod tests {
     #[test]
     fn reject_empty_request() {
         let error =
-            HttpRequest::parse(b"").expect_err("empty request should fail");
+            EdgeRequest::parse(b"").expect_err("empty request should fail");
 
         assert_eq!(error, RequestParseError::MissingRequestLine);
         assert_eq!(error.to_string(), "request is empty");
+    }
+
+    #[test]
+    fn update_headers_and_body() {
+        let mut request = EdgeRequest::new(
+            "PUT",
+            "/bucket/key",
+            vec![("Content-Encoding".to_owned(), "aws-chunked".to_owned())],
+            b"encoded".to_vec(),
+        );
+
+        request.set_header("Content-Encoding", "gzip");
+        request.append_header("x-amz-meta-trace", "abc123");
+        request.set_body(b"decoded".to_vec());
+        request.remove_header("x-amz-missing");
+
+        assert_eq!(request.header("content-encoding"), Some("gzip"));
+        assert_eq!(request.header_values("x-amz-meta-trace"), vec!["abc123"]);
+        assert_eq!(request.body(), b"decoded");
     }
 }

@@ -64,6 +64,7 @@ apigateway = { path = "../services/apigateway", optional = true }
 async-trait = "0.1.89"
 auth = { path = "../auth" }
 aws = { path = "../aws" }
+bytes = "1.10.1"
 cloudformation = { path = "../services/cloudformation", optional = true }
 cloudwatch = { path = "../services/cloudwatch", optional = true }
 cognito = { path = "../services/cognito", optional = true }
@@ -75,6 +76,9 @@ futures = "0.3.32"
 getrandom = "0.2"
 http = { path = "../http", default-features = false }
 iam = { path = "../services/iam" }
+http-body-util = "0.1.3"
+hyper = { version = "1.7.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.17", features = ["tokio"] }
 kinesis = { path = "../services/kinesis", optional = true }
 kms = { path = "../services/kms", optional = true }
 lambda = { path = "../services/lambda", optional = true }

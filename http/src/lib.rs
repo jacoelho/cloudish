@@ -62,5 +62,6 @@ mod sts_query;
 mod test_runtime;
 mod xml;
 
+pub use request::EdgeRequest;
 pub use runtime::{EdgeResponse, EdgeRouter};
 pub use service_api::*;

@@ -1,3 +1,9 @@
+use crate::aws_chunked::{
+    AwsChunkedMode, AwsChunkedSigningContext,
+    STREAMING_AWS4_HMAC_SHA256_PAYLOAD,
+    STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER,
+    STREAMING_UNSIGNED_PAYLOAD_TRAILER,
+};
 use aws::{
     AccountId, Arn, AwsError, AwsErrorFamily, CallerIdentity, CredentialScope,
     IamAccessKeyLookup, IamAccessKeyStatus, IamResourceTag, Partition,
@@ -5,6 +11,7 @@ use aws::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -64,6 +71,10 @@ impl<'a> RequestAuth<'a> {
             .filter(|header| header.name().eq_ignore_ascii_case(name))
             .map(RequestHeader::value)
             .collect()
+    }
+
+    fn body_hash(&self) -> String {
+        hash_hex(self.body)
     }
 }
 
@@ -125,6 +136,37 @@ impl VerifiedRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedPayload {
+    SignedBody,
+    UnsignedPayload,
+    AwsChunked(AwsChunkedSigningContext),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSignature {
+    request: VerifiedRequest,
+    payload: VerifiedPayload,
+}
+
+impl VerifiedSignature {
+    pub fn new(request: VerifiedRequest, payload: VerifiedPayload) -> Self {
+        Self { request, payload }
+    }
+
+    pub fn verified_request(&self) -> &VerifiedRequest {
+        &self.request
+    }
+
+    pub fn payload(&self) -> &VerifiedPayload {
+        &self.payload
+    }
+
+    fn into_verified_request(self) -> VerifiedRequest {
+        self.request
+    }
+}
+
 #[derive(Clone)]
 pub struct Authenticator {
     defaults: RuntimeDefaults,
@@ -165,6 +207,29 @@ impl Authenticator {
         access_keys: &L,
         sessions: &S,
     ) -> Result<Option<VerifiedRequest>, AwsError>
+    where
+        L: IamAccessKeyLookup,
+        S: SessionCredentialLookup,
+    {
+        self.verify_details(request, access_keys, sessions).map(|verified| {
+            verified.map(VerifiedSignature::into_verified_request)
+        })
+    }
+
+    /// Verifies a SigV4-authenticated request and retains any streaming
+    /// payload-signing context needed for later payload verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an AWS-compatible validation or access-denied error when the
+    /// request signature, credential scope, timestamps, or credential material
+    /// are invalid.
+    pub fn verify_details<L, S>(
+        &self,
+        request: &RequestAuth<'_>,
+        access_keys: &L,
+        sessions: &S,
+    ) -> Result<Option<VerifiedSignature>, AwsError>
     where
         L: IamAccessKeyLookup,
         S: SessionCredentialLookup,
@@ -218,12 +283,15 @@ impl Authenticator {
             ));
         }
 
-        Ok(Some(VerifiedRequest {
-            account_id: material.account_id,
-            caller_identity: material.caller_identity,
-            scope: authorization.credential.scope,
-            session: material.session,
-        }))
+        Ok(Some(VerifiedSignature::new(
+            VerifiedRequest {
+                account_id: material.account_id,
+                caller_identity: material.caller_identity,
+                scope: authorization.credential.scope,
+                session: material.session,
+            },
+            VerifiedPayload::UnsignedPayload,
+        )))
     }
 
     fn verify_authorization_header<L, S>(
@@ -232,7 +300,7 @@ impl Authenticator {
         access_keys: &L,
         sessions: &S,
         authorization_header: &str,
-    ) -> Result<Option<VerifiedRequest>, AwsError>
+    ) -> Result<Option<VerifiedSignature>, AwsError>
     where
         L: IamAccessKeyLookup,
         S: SessionCredentialLookup,
@@ -257,8 +325,13 @@ impl Authenticator {
             &authorization.credential,
             request.header("x-amz-security-token"),
         )?;
-        let canonical_request =
-            build_canonical_request(request, &authorization.signed_headers)?;
+        let payload =
+            canonical_payload_mode(request.header("x-amz-content-sha256"))?;
+        let canonical_request = build_canonical_request(
+            request,
+            &authorization.signed_headers,
+            &payload,
+        )?;
         let expected_signature = build_signature(
             &material.secret_access_key,
             &authorization.credential.date,
@@ -274,12 +347,22 @@ impl Authenticator {
             ));
         }
 
-        Ok(Some(VerifiedRequest {
-            account_id: material.account_id,
-            caller_identity: material.caller_identity,
-            scope: authorization.credential.scope,
-            session: material.session,
-        }))
+        let payload = payload.verified_payload(
+            &material.secret_access_key,
+            &authorization.credential,
+            amz_date,
+            &authorization.signature,
+        );
+
+        Ok(Some(VerifiedSignature::new(
+            VerifiedRequest {
+                account_id: material.account_id,
+                caller_identity: material.caller_identity,
+                scope: authorization.credential.scope,
+                session: material.session,
+            },
+            payload,
+        )))
     }
 
     fn resolve_credential_material<L, S>(
@@ -614,14 +697,85 @@ impl CredentialFields {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalPayloadMode<'a> {
+    SignedBody,
+    HeaderValue(&'a str),
+    AwsChunked(AwsChunkedMode),
+}
+
+impl CanonicalPayloadMode<'_> {
+    fn canonical_request_payload_hash<'a>(
+        &'a self,
+        request: &'a RequestAuth<'_>,
+    ) -> Cow<'a, str> {
+        match self {
+            Self::SignedBody => Cow::Owned(request.body_hash()),
+            Self::HeaderValue(value) => Cow::Borrowed(value),
+            Self::AwsChunked(AwsChunkedMode::Payload) => {
+                Cow::Borrowed(STREAMING_AWS4_HMAC_SHA256_PAYLOAD)
+            }
+            Self::AwsChunked(AwsChunkedMode::PayloadTrailer) => {
+                Cow::Borrowed(STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER)
+            }
+        }
+    }
+
+    fn verified_payload(
+        self,
+        secret_access_key: &str,
+        credential: &CredentialFields,
+        amz_date: &str,
+        seed_signature: &str,
+    ) -> VerifiedPayload {
+        match self {
+            Self::SignedBody => VerifiedPayload::SignedBody,
+            Self::HeaderValue("UNSIGNED-PAYLOAD") => {
+                VerifiedPayload::UnsignedPayload
+            }
+            Self::HeaderValue(_) => VerifiedPayload::SignedBody,
+            Self::AwsChunked(mode) => {
+                VerifiedPayload::AwsChunked(AwsChunkedSigningContext::new(
+                    secret_access_key,
+                    &credential.date,
+                    credential.scope.region().as_str(),
+                    &credential.signing_service,
+                    amz_date,
+                    seed_signature,
+                    mode,
+                ))
+            }
+        }
+    }
+}
+
+fn canonical_payload_mode(
+    x_amz_content_sha256: Option<&str>,
+) -> Result<CanonicalPayloadMode<'_>, AwsError> {
+    match x_amz_content_sha256 {
+        None => Ok(CanonicalPayloadMode::SignedBody),
+        Some(STREAMING_AWS4_HMAC_SHA256_PAYLOAD) => {
+            Ok(CanonicalPayloadMode::AwsChunked(AwsChunkedMode::Payload))
+        }
+        Some(STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER) => Ok(
+            CanonicalPayloadMode::AwsChunked(AwsChunkedMode::PayloadTrailer),
+        ),
+        Some(STREAMING_UNSIGNED_PAYLOAD_TRAILER) => Err(access_denied_error(
+            "X-Amz-Content-Sha256 payload mode STREAMING-UNSIGNED-PAYLOAD-TRAILER is not supported.",
+        )),
+        Some(value) => Ok(CanonicalPayloadMode::HeaderValue(value)),
+    }
+}
+
 fn build_canonical_request(
     request: &RequestAuth<'_>,
     signed_headers: &[String],
+    payload: &CanonicalPayloadMode<'_>,
 ) -> Result<String, AwsError> {
     build_canonical_request_with_payload(
         request,
         signed_headers,
-        &hash_hex(request.body),
+        &payload.canonical_request_payload_hash(request),
         &[],
     )
 }
@@ -845,7 +999,7 @@ fn build_signature(
     hex_encode(&hmac_bytes(&signing_key, string_to_sign.as_bytes()))
 }
 
-fn signing_key(
+pub(crate) fn signing_key(
     secret_access_key: &str,
     date: &str,
     region: &str,
@@ -860,7 +1014,7 @@ fn signing_key(
     hmac_bytes(&service_key, b"aws4_request")
 }
 
-fn hmac_bytes(key: &[u8], data: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_bytes(key: &[u8], data: &[u8]) -> [u8; 32] {
     const BLOCK_SIZE: usize = 64;
 
     let mut normalized_key = [0_u8; BLOCK_SIZE];
@@ -898,13 +1052,13 @@ fn hmac_bytes(key: &[u8], data: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
-fn hash_hex(bytes: &[u8]) -> String {
+pub(crate) fn hash_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex_encode(&hasher.finalize())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         encoded.push_str(&format!("{byte:02x}"));
@@ -912,7 +1066,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn validate_hex_signature(value: &str) -> Result<(), AwsError> {
+pub(crate) fn validate_hex_signature(value: &str) -> Result<(), AwsError> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(incomplete_signature_error(
@@ -1043,7 +1197,9 @@ fn caller_identity(
     })
 }
 
-fn incomplete_signature_error(message: impl Into<String>) -> AwsError {
+pub(crate) fn incomplete_signature_error(
+    message: impl Into<String>,
+) -> AwsError {
     aws_error(
         AwsErrorFamily::Validation,
         "IncompleteSignature",
@@ -1067,7 +1223,7 @@ fn expired_token_error(message: impl Into<String>) -> AwsError {
     aws_error(AwsErrorFamily::AccessDenied, "ExpiredToken", message, 403, true)
 }
 
-fn access_denied_error(message: impl Into<String>) -> AwsError {
+pub(crate) fn access_denied_error(message: impl Into<String>) -> AwsError {
     aws_error(AwsErrorFamily::AccessDenied, "AccessDenied", message, 403, true)
 }
 
@@ -1083,7 +1239,9 @@ fn invalid_authorization_message_error(
     )
 }
 
-fn signature_does_not_match_error(message: impl Into<String>) -> AwsError {
+pub(crate) fn signature_does_not_match_error(
+    message: impl Into<String>,
+) -> AwsError {
     aws_error(
         AwsErrorFamily::AccessDenied,
         "SignatureDoesNotMatch",
@@ -1203,6 +1361,10 @@ mod tests {
                 .iter()
                 .map(|header| (*header).to_owned())
                 .collect::<Vec<_>>(),
+            &super::canonical_payload_mode(
+                request.header("x-amz-content-sha256"),
+            )
+            .expect("test payload mode should be valid"),
         )
         .expect("test canonical request should build");
         let signature = build_signature(
@@ -1252,6 +1414,67 @@ mod tests {
         request_path.push_str("&X-Amz-Signature=");
         request_path.push_str(&signature);
         request_path
+    }
+
+    #[test]
+    fn canonical_request_uses_x_amz_content_sha256_header_value() {
+        let request = RequestAuth::new(
+            "PUT",
+            "/examplebucket/chunkObject.txt",
+            vec![
+                RequestHeader::new("Content-Encoding", "aws-chunked"),
+                RequestHeader::new("Content-Length", "66824"),
+                RequestHeader::new("Host", "s3.amazonaws.com"),
+                RequestHeader::new(
+                    "X-Amz-Content-Sha256",
+                    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+                ),
+                RequestHeader::new("X-Amz-Date", "20130524T000000Z"),
+                RequestHeader::new("X-Amz-Decoded-Content-Length", "66560"),
+                RequestHeader::new(
+                    "X-Amz-Storage-Class",
+                    "REDUCED_REDUNDANCY",
+                ),
+            ],
+            b"not-the-canonical-payload",
+        );
+
+        let canonical = super::build_canonical_request(
+            &request,
+            &[
+                "content-encoding",
+                "content-length",
+                "host",
+                "x-amz-content-sha256",
+                "x-amz-date",
+                "x-amz-decoded-content-length",
+                "x-amz-storage-class",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+            &super::canonical_payload_mode(
+                request.header("x-amz-content-sha256"),
+            )
+            .expect("payload mode should be valid"),
+        )
+        .expect("canonical request should build");
+
+        assert!(canonical.ends_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"));
+        assert!(
+            !canonical
+                .ends_with(&super::hash_hex(b"not-the-canonical-payload"))
+        );
+    }
+
+    #[test]
+    fn reject_unsupported_unsigned_trailing_payload_mode() {
+        let error = super::canonical_payload_mode(Some(
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        ))
+        .expect_err("unsigned trailing payload mode must fail explicitly");
+
+        assert_eq!(error.code(), "AccessDenied");
     }
 
     #[test]

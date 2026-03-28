@@ -95,17 +95,17 @@ async fn health_and_status_endpoints_return_internal_json() {
     .expect("status request task should complete")
     .expect("status request should succeed");
 
-    assert!(health.starts_with("HTTP/1.1 200 OK\r\n"));
-    let health_date = health
-        .lines()
-        .find_map(|line| line.strip_prefix("Date: "))
+    let (health_status, health_headers, health_body) =
+        split_response(health.as_bytes());
+    let (status_status, _, status_body) = split_response(status.as_bytes());
+
+    assert_eq!(health_status, "HTTP/1.1 200 OK");
+    let health_date = header_value(&health_headers, "date")
         .expect("health response should expose a Date header");
     parse_http_date(health_date)
         .expect("health Date header should use HTTP-date format");
-    assert!(status.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert_eq!(status_status, "HTTP/1.1 200 OK");
 
-    let (_, _, health_body) = split_response(health.as_bytes());
-    let (_, _, status_body) = split_response(status.as_bytes());
     let health_json: Value = serde_json::from_slice(health_body)
         .expect("health response body should be valid JSON");
     let status_json: Value = serde_json::from_slice(status_body)
@@ -168,27 +168,30 @@ async fn unknown_json_and_query_requests_return_protocol_shaped_errors() {
     .expect("query request task should complete")
     .expect("query request should succeed");
 
-    let json_headers_end = json_response
-        .find("\r\n\r\n")
-        .expect("JSON response should contain headers");
+    let (json_status, json_headers, json_body) =
+        split_response(json_response.as_bytes());
+    let (query_status, query_headers, query_body) =
+        split_response(query_response.as_bytes());
     let json_body: AwsJsonErrorBody =
-        serde_json::from_str(&json_response[json_headers_end + 4..])
-            .expect("JSON body should decode");
+        serde_json::from_slice(json_body).expect("JSON body should decode");
+    let query_body =
+        std::str::from_utf8(query_body).expect("query body should be UTF-8");
 
-    assert!(json_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-    assert!(
-        json_response.contains("Content-Type: application/x-amz-json-1.0\r\n")
+    assert_eq!(json_status, "HTTP/1.1 400 Bad Request");
+    assert_eq!(
+        header_value(&json_headers, "content-type"),
+        Some("application/x-amz-json-1.0")
     );
     assert_eq!(json_body.error_type, "UnknownOperationException");
     assert_eq!(
         json_body.message,
         "Unknown operation: missing X-Amz-Target header."
     );
-    assert!(query_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-    assert!(query_response.contains("Content-Type: text/xml\r\n"));
-    assert!(query_response.contains("<Code>InvalidAction</Code>"));
+    assert_eq!(query_status, "HTTP/1.1 400 Bad Request");
+    assert_eq!(header_value(&query_headers, "content-type"), Some("text/xml"));
+    assert!(query_body.contains("<Code>InvalidAction</Code>"));
     assert!(
-        query_response
+        query_body
             .contains("<Message>Unknown action UnknownAction.</Message>")
     );
 }

@@ -13,6 +13,7 @@
 )]
 
 mod hosting;
+mod transport;
 
 use auth::Authenticator;
 use aws::{
@@ -41,15 +42,16 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use storage::StorageRuntime;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
-const MAX_REQUEST_BYTES: usize = 64 * 1024;
-
-pub use hosting::{EDGE_HOST_ENV, EDGE_PORT_ENV, HostingPlanError};
+pub use hosting::{
+    EDGE_HOST_ENV, EDGE_MAX_REQUEST_BYTES_ENV, EDGE_PORT_ENV, HostingPlanError,
+};
 
 #[derive(Clone)]
 pub struct CloudishApp {
     address: SocketAddr,
+    max_request_bytes: usize,
     #[cfg(feature = "lambda")]
     _lambda_background_tasks: Arc<ManagedBackgroundTasks>,
     router: EdgeRouter,
@@ -118,6 +120,7 @@ impl CloudishApp {
 
         Ok(Self {
             address: hosting.edge_address(),
+            max_request_bytes: hosting.max_request_bytes(),
             #[cfg(feature = "lambda")]
             _lambda_background_tasks: Arc::new(background_tasks),
             router,
@@ -132,9 +135,8 @@ impl CloudishApp {
     ///
     /// # Errors
     ///
-    /// Returns [`StartupError`] when the edge listener cannot bind, a
-    /// connection cannot be accepted, or an accepted connection cannot be
-    /// served.
+    /// Returns [`StartupError`] when the edge listener cannot bind or a
+    /// connection cannot be accepted.
     pub async fn serve_with_shutdown<F>(
         self,
         shutdown: F,
@@ -156,8 +158,7 @@ impl CloudishApp {
     ///
     /// # Errors
     ///
-    /// Returns [`StartupError`] when the listener cannot accept a connection or
-    /// an accepted connection cannot be served.
+    /// Returns [`StartupError`] when the listener cannot accept a connection.
     pub async fn serve_listener_with_shutdown<F>(
         self,
         listener: TcpListener,
@@ -166,19 +167,13 @@ impl CloudishApp {
     where
         F: Future<Output = ()>,
     {
-        let router = self.router;
-        tokio::pin!(shutdown);
-
-        loop {
-            tokio::select! {
-                () = &mut shutdown => return Ok(()),
-                accepted = listener.accept() => {
-                    let (stream, _) = accepted
-                        .map_err(|source| StartupError::Accept { source })?;
-                    serve_connection(&router, stream).await?;
-                }
-            }
-        }
+        transport::serve_listener_with_shutdown(
+            listener,
+            self.router,
+            self.max_request_bytes,
+            shutdown,
+        )
+        .await
     }
 }
 
@@ -191,7 +186,7 @@ pub fn supported_service_count() -> usize {
 /// # Errors
 ///
 /// Returns [`StartupError`] when configuration is invalid, runtime startup
-/// fails, the edge listener cannot bind, or serving a connection fails.
+/// fails, or the edge listener cannot bind.
 pub async fn run_from_env() -> Result<(), StartupError> {
     let app = CloudishApp::from_env()?;
     app.serve_with_shutdown(async {
@@ -229,134 +224,6 @@ where
     HostingPlan::from_env(read_env).map_err(StartupError::HostingConfig)
 }
 
-async fn serve_connection(
-    router: &EdgeRouter,
-    stream: TcpStream,
-) -> Result<(), StartupError> {
-    let request = read_request(&stream).await?;
-    let response = router.handle_bytes(&request).to_http_bytes();
-    write_response(&stream, &response).await
-}
-
-async fn read_request(stream: &TcpStream) -> Result<Vec<u8>, StartupError> {
-    let mut buffer = vec![0; MAX_REQUEST_BYTES];
-    let mut used = 0;
-    let mut expected_total = None;
-
-    loop {
-        stream
-            .readable()
-            .await
-            .map_err(|source| StartupError::ConnectionRead { source })?;
-
-        let Some(read_buffer) = buffer.get_mut(used..) else {
-            return Err(StartupError::ConnectionRead {
-                source: io::Error::other(
-                    "request buffer cursor exceeded the maximum request size",
-                ),
-            });
-        };
-
-        match stream.try_read(read_buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                used += read;
-
-                let Some(received) = buffer.get(..used) else {
-                    return Err(StartupError::ConnectionRead {
-                        source: io::Error::other(
-                            "request length exceeded the available buffer",
-                        ),
-                    });
-                };
-
-                if expected_total.is_none()
-                    && let Some(header_end) = header_end(received)
-                    && let Some(headers) = received.get(..header_end)
-                {
-                    expected_total = Some(
-                        header_end + content_length(headers).unwrap_or(0),
-                    );
-                }
-
-                if expected_total.is_some_and(|expected| used >= expected)
-                    || used == buffer.len()
-                {
-                    break;
-                }
-            }
-            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
-            Err(source) => {
-                return Err(StartupError::ConnectionRead { source });
-            }
-        }
-    }
-
-    buffer.truncate(used);
-    Ok(buffer)
-}
-
-fn header_end(buffer: &[u8]) -> Option<usize> {
-    buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4)
-}
-
-fn content_length(headers: &[u8]) -> Option<usize> {
-    let headers = std::str::from_utf8(headers).ok()?;
-
-    headers.split("\r\n").skip(1).find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-
-        if name.eq_ignore_ascii_case("content-length") {
-            value.trim().parse().ok()
-        } else {
-            None
-        }
-    })
-}
-
-async fn write_response(
-    stream: &TcpStream,
-    response: &[u8],
-) -> Result<(), StartupError> {
-    let mut written = 0;
-
-    while written < response.len() {
-        stream
-            .writable()
-            .await
-            .map_err(|source| StartupError::ConnectionWrite { source })?;
-
-        let Some(remaining) = response.get(written..) else {
-            return Err(StartupError::ConnectionWrite {
-                source: io::Error::other(
-                    "response write cursor exceeded the response length",
-                ),
-            });
-        };
-
-        match stream.try_write(remaining) {
-            Ok(0) => {
-                return Err(StartupError::ConnectionWrite {
-                    source: io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "connection closed before the response completed",
-                    ),
-                });
-            }
-            Ok(bytes) => written += bytes,
-            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
-            Err(source) => {
-                return Err(StartupError::ConnectionWrite { source });
-            }
-        }
-    }
-
-    Ok(())
-}
-
 #[derive(Debug)]
 pub enum StartupError {
     Accept {
@@ -369,12 +236,6 @@ pub enum StartupError {
     BuildConfiguration(String),
     Config(RuntimeDefaultsError),
     HostingConfig(HostingPlanError),
-    ConnectionRead {
-        source: io::Error,
-    },
-    ConnectionWrite {
-        source: io::Error,
-    },
     #[cfg(feature = "dynamodb")]
     DynamoDbState(DynamoDbInitError),
     #[cfg(feature = "eventbridge")]
@@ -413,12 +274,6 @@ impl fmt::Display for StartupError {
             Self::HostingConfig(source) => {
                 write!(formatter, "startup configuration error: {source}")
             }
-            Self::ConnectionRead { source } => {
-                write!(formatter, "failed to read edge request: {source}")
-            }
-            Self::ConnectionWrite { source } => {
-                write!(formatter, "failed to write edge response: {source}")
-            }
             #[cfg(feature = "dynamodb")]
             Self::DynamoDbState(source) => {
                 write!(formatter, "failed to load DynamoDB state: {source}")
@@ -455,8 +310,6 @@ impl Error for StartupError {
         match self {
             Self::Accept { source }
             | Self::Bind { source, .. }
-            | Self::ConnectionRead { source }
-            | Self::ConnectionWrite { source }
             | Self::StateDirectory { source, .. } => Some(source),
             #[cfg(feature = "dynamodb")]
             Self::DynamoDbState(source) => Some(source),
@@ -506,8 +359,8 @@ impl From<RuntimeBuildError> for StartupError {
 #[cfg(all(test, feature = "all-services"))]
 mod tests {
     use super::{
-        CloudishApp, EDGE_HOST_ENV, EDGE_PORT_ENV, load_hosting_plan,
-        load_runtime_defaults,
+        CloudishApp, EDGE_HOST_ENV, EDGE_MAX_REQUEST_BYTES_ENV, EDGE_PORT_ENV,
+        load_hosting_plan, load_runtime_defaults,
     };
     use aws::{
         DEFAULT_ACCOUNT_ENV, DEFAULT_REGION_ENV, RuntimeDefaults,
@@ -518,18 +371,15 @@ mod tests {
     use std::error::Error;
     use std::io;
     use std::io::Write;
+    use std::net::Shutdown;
     use std::net::TcpListener as StdTcpListener;
-    use std::sync::OnceLock;
     use std::thread;
     use std::time::Duration;
-    use test_support::{send_http_request, temporary_directory};
+    use test_support::{
+        send_http_request, send_http_request_bytes, temporary_directory,
+    };
     use tokio::net::TcpListener;
-    use tokio::sync::{Mutex, oneshot};
-
-    fn default_edge_port_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use tokio::sync::oneshot;
 
     fn runtime_defaults(label: &str) -> RuntimeDefaults {
         let state_directory = temporary_directory(label).join("state");
@@ -591,15 +441,17 @@ mod tests {
     }
 
     #[test]
-    fn load_hosting_plan_accepts_edge_host_and_port_overrides() {
+    fn load_hosting_plan_accepts_edge_host_port_and_request_limit() {
         let plan = load_hosting_plan(|name| match name {
             EDGE_HOST_ENV => Some("0.0.0.0".to_owned()),
             EDGE_PORT_ENV => Some("4570".to_owned()),
+            EDGE_MAX_REQUEST_BYTES_ENV => Some("1048576".to_owned()),
             _ => None,
         })
         .expect("valid hosting overrides should build");
 
         assert_eq!(plan.edge_address().to_string(), "0.0.0.0:4570");
+        assert_eq!(plan.max_request_bytes(), 1_048_576);
     }
 
     #[test]
@@ -635,12 +487,6 @@ mod tests {
         let accept_error = super::StartupError::Accept {
             source: io::Error::other("accept failure"),
         };
-        let read_error = super::StartupError::ConnectionRead {
-            source: io::Error::other("read failure"),
-        };
-        let write_error = super::StartupError::ConnectionWrite {
-            source: io::Error::other("write failure"),
-        };
         let hosting_config_error = super::StartupError::HostingConfig(
             super::HostingPlanError::BlankPort,
         );
@@ -663,14 +509,6 @@ mod tests {
         assert_eq!(
             accept_error.to_string(),
             "failed to accept edge connection: accept failure"
-        );
-        assert_eq!(
-            read_error.to_string(),
-            "failed to read edge request: read failure"
-        );
-        assert_eq!(
-            write_error.to_string(),
-            "failed to write edge response: write failure"
         );
         assert_eq!(
             hosting_config_error.to_string(),
@@ -720,10 +558,16 @@ mod tests {
 
     #[tokio::test]
     async fn serve_with_shutdown_binds_and_stops_cleanly() {
-        let _guard = default_edge_port_lock().lock().await;
-        let server = CloudishApp::from_runtime_defaults(runtime_defaults(
-            "server-bind-success",
-        ))
+        let port = available_port();
+        let hosting = load_hosting_plan(|name| match name {
+            EDGE_PORT_ENV => Some(port.to_string()),
+            _ => None,
+        })
+        .expect("ephemeral hosting plan should build");
+        let server = CloudishApp::from_runtime_defaults_with_hosting(
+            runtime_defaults("server-bind-success"),
+            hosting,
+        )
         .expect("server bootstrap should succeed");
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -743,12 +587,18 @@ mod tests {
 
     #[tokio::test]
     async fn serve_with_shutdown_reports_bind_errors() {
-        let _guard = default_edge_port_lock().lock().await;
-        let occupied =
-            StdTcpListener::bind("127.0.0.1:4566").expect("port should bind");
-        let server = CloudishApp::from_runtime_defaults(runtime_defaults(
-            "server-bind-error",
-        ))
+        let port = available_port();
+        let occupied = StdTcpListener::bind(("127.0.0.1", port))
+            .expect("port should bind");
+        let hosting = load_hosting_plan(|name| match name {
+            EDGE_PORT_ENV => Some(port.to_string()),
+            _ => None,
+        })
+        .expect("ephemeral hosting plan should build");
+        let server = CloudishApp::from_runtime_defaults_with_hosting(
+            runtime_defaults("server-bind-error"),
+            hosting,
+        )
         .expect("server bootstrap should succeed");
 
         let error = server
@@ -761,83 +611,319 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_request_returns_empty_when_client_closes() {
+    async fn serve_listener_keeps_accepting_while_a_client_stalls() {
+        let state_directory =
+            temporary_directory("server-stalled-client").join("state");
+        let defaults = RuntimeDefaults::try_new(
+            Some("000000000000".to_owned()),
+            Some("eu-west-2".to_owned()),
+            Some(state_directory.to_string_lossy().into_owned()),
+        )
+        .expect("test defaults should be valid");
+        let server = CloudishApp::from_runtime_defaults(defaults)
+            .expect("server bootstrap should succeed");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("listener should bind");
-        let address =
-            listener.local_addr().expect("listener should expose its address");
-        let client = std::net::TcpStream::connect(address)
-            .expect("client should connect");
-        let (server_stream, _) = listener
-            .accept()
-            .await
-            .expect("server should accept a connection");
-        drop(client);
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should expose its address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            server
+                .serve_listener_with_shutdown(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let request = super::read_request(&server_stream)
-            .await
-            .expect("closed connections should read as empty");
+        let mut stalled_client = std::net::TcpStream::connect(address)
+            .expect("stalled client should connect");
+        stalled_client
+            .write_all(
+                b"PUT /stalled-bucket/object.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nabc",
+            )
+            .expect("stalled request should be written");
 
-        assert!(request.is_empty());
+        let health_response = tokio::task::spawn_blocking(move || {
+            send_http_request(
+                address,
+                "GET /__cloudish/health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+        })
+        .await
+        .expect("health request task should complete")
+        .expect("health request should succeed");
+
+        stalled_client
+            .shutdown(Shutdown::Both)
+            .expect("stalled client should close");
+        shutdown_tx.send(()).expect("server should still be running");
+        let result = handle.await.expect("server task should complete");
+        result.expect("server should stop cleanly");
+
+        assert!(health_response.starts_with("HTTP/1.1 200 OK\r\n"));
     }
 
     #[tokio::test]
-    async fn write_response_reports_closed_connections() {
+    async fn serve_listener_survives_a_client_disconnect_mid_body() {
+        let state_directory =
+            temporary_directory("server-disconnect-mid-body").join("state");
+        let defaults = RuntimeDefaults::try_new(
+            Some("000000000000".to_owned()),
+            Some("eu-west-2".to_owned()),
+            Some(state_directory.to_string_lossy().into_owned()),
+        )
+        .expect("test defaults should be valid");
+        let server = CloudishApp::from_runtime_defaults(defaults)
+            .expect("server bootstrap should succeed");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("listener should bind");
-        let address =
-            listener.local_addr().expect("listener should expose its address");
-        let client = std::net::TcpStream::connect(address)
-            .expect("client should connect");
-        let (server_stream, _) = listener
-            .accept()
-            .await
-            .expect("server should accept a connection");
-        drop(client);
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should expose its address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            server
+                .serve_listener_with_shutdown(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let response = vec![b'x'; 1024 * 1024];
-        let error = super::write_response(&server_stream, &response)
-            .await
-            .expect_err("closed connections should fail writes");
+        let mut broken_client = std::net::TcpStream::connect(address)
+            .expect("broken client should connect");
+        broken_client
+            .write_all(
+                b"PUT /broken-bucket/object.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\n\r\nabc",
+            )
+            .expect("partial request should be written");
+        broken_client
+            .shutdown(Shutdown::Both)
+            .expect("broken client should close");
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert!(matches!(error, super::StartupError::ConnectionWrite { .. }));
+        let health_response = tokio::task::spawn_blocking(move || {
+            send_http_request(
+                address,
+                "GET /__cloudish/health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+        })
+        .await
+        .expect("health request task should complete")
+        .expect("health request should succeed");
+
+        shutdown_tx.send(()).expect("server should still be running");
+        let result = handle.await.expect("server task should complete");
+        result.expect("server should stop cleanly");
+
+        assert!(health_response.starts_with("HTTP/1.1 200 OK\r\n"));
     }
 
     #[tokio::test]
-    async fn read_request_reads_body_without_waiting_for_socket_close() {
+    async fn serve_listener_reads_content_length_bodies_without_waiting_for_close()
+     {
+        let state_directory =
+            temporary_directory("server-content-length").join("state");
+        let defaults = RuntimeDefaults::try_new(
+            Some("000000000000".to_owned()),
+            Some("eu-west-2".to_owned()),
+            Some(state_directory.to_string_lossy().into_owned()),
+        )
+        .expect("test defaults should be valid");
+        let server = CloudishApp::from_runtime_defaults(defaults)
+            .expect("server bootstrap should succeed");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("listener should bind");
-        let address =
-            listener.local_addr().expect("listener should expose its address");
-        let client = thread::spawn(move || {
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should expose its address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            server
+                .serve_listener_with_shutdown(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let create_bucket = tokio::task::spawn_blocking(move || {
+            send_http_request(
+                address,
+                "PUT /transport-content-length HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            )
+        })
+        .await
+        .expect("bucket creation task should complete")
+        .expect("bucket creation should succeed");
+        assert!(create_bucket.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let writer = thread::spawn(move || {
             let mut stream = std::net::TcpStream::connect(address)
-                .expect("client should connect");
+                .expect("writer should connect");
             stream
                 .write_all(
-                    b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+                    b"PUT /transport-content-length/object.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\n\r\npayload",
                 )
                 .expect("request should be written");
             thread::sleep(Duration::from_millis(250));
         });
-        let (server_stream, _) = listener
-            .accept()
-            .await
-            .expect("server should accept a connection");
 
-        let request = tokio::time::timeout(
-            Duration::from_millis(100),
-            super::read_request(&server_stream),
-        )
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let get_response = tokio::task::spawn_blocking(move || {
+            send_http_request_bytes(
+                address,
+                b"GET /transport-content-length/object.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+        })
         .await
-        .expect("body read should finish before the client closes")
-        .expect("request should be readable");
+        .expect("get task should complete")
+        .expect("get request should succeed");
 
-        client.join().expect("client thread should finish");
+        writer.join().expect("writer thread should finish");
+        shutdown_tx.send(()).expect("server should still be running");
+        let result = handle.await.expect("server task should complete");
+        result.expect("server should stop cleanly");
 
-        assert!(request.ends_with(b"{}"));
+        assert_eq!(response_body(&get_response), b"payload");
+    }
+
+    #[tokio::test]
+    async fn serve_listener_reads_http_chunked_bodies() {
+        let state_directory =
+            temporary_directory("server-http-chunked").join("state");
+        let defaults = RuntimeDefaults::try_new(
+            Some("000000000000".to_owned()),
+            Some("eu-west-2".to_owned()),
+            Some(state_directory.to_string_lossy().into_owned()),
+        )
+        .expect("test defaults should be valid");
+        let server = CloudishApp::from_runtime_defaults(defaults)
+            .expect("server bootstrap should succeed");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should expose its address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            server
+                .serve_listener_with_shutdown(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let create_bucket = tokio::task::spawn_blocking(move || {
+            send_http_request(
+                address,
+                "PUT /transport-chunked HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            )
+        })
+        .await
+        .expect("bucket creation task should complete")
+        .expect("bucket creation should succeed");
+        assert!(create_bucket.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let put_response = tokio::task::spawn_blocking(move || {
+            send_http_request(
+                address,
+                "PUT /transport-chunked/object.txt HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ndata\r\n3\r\n123\r\n0\r\n\r\n",
+            )
+        })
+        .await
+        .expect("put task should complete")
+        .expect("put request should succeed");
+        let get_response = tokio::task::spawn_blocking(move || {
+            send_http_request_bytes(
+                address,
+                b"GET /transport-chunked/object.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+        })
+        .await
+        .expect("get task should complete")
+        .expect("get request should succeed");
+
+        shutdown_tx.send(()).expect("server should still be running");
+        let result = handle.await.expect("server task should complete");
+        result.expect("server should stop cleanly");
+
+        assert!(put_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(response_body(&get_response), b"data123");
+    }
+
+    #[tokio::test]
+    async fn serve_listener_rejects_oversized_request_bodies() {
+        let state_directory =
+            temporary_directory("server-request-limit").join("state");
+        let defaults = RuntimeDefaults::try_new(
+            Some("000000000000".to_owned()),
+            Some("eu-west-2".to_owned()),
+            Some(state_directory.to_string_lossy().into_owned()),
+        )
+        .expect("test defaults should be valid");
+        let hosting = load_hosting_plan(|name| match name {
+            EDGE_MAX_REQUEST_BYTES_ENV => Some("8".to_owned()),
+            _ => None,
+        })
+        .expect("request size override should build");
+        let server =
+            CloudishApp::from_runtime_defaults_with_hosting(defaults, hosting)
+                .expect("server bootstrap should succeed");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should expose its address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            server
+                .serve_listener_with_shutdown(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let oversized_response = tokio::task::spawn_blocking(move || {
+            send_http_request(
+                address,
+                "POST /__cloudish/health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 9\r\n\r\n123456789",
+            )
+        })
+        .await
+        .expect("oversized request task should complete")
+        .expect("oversized request should return a response");
+        let health_response = tokio::task::spawn_blocking(move || {
+            send_http_request(
+                address,
+                "GET /__cloudish/health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+        })
+        .await
+        .expect("health request task should complete")
+        .expect("health request should succeed");
+
+        shutdown_tx.send(()).expect("server should still be running");
+        let result = handle.await.expect("server task should complete");
+        result.expect("server should stop cleanly");
+
+        assert!(
+            oversized_response
+                .starts_with("HTTP/1.1 413 Payload Too Large\r\n")
+        );
+        assert!(oversized_response.contains(
+            "\"message\":\"request body exceeds configured limit of 8 bytes\""
+        ));
+        assert!(health_response.starts_with("HTTP/1.1 200 OK\r\n"));
     }
 
     #[tokio::test]
@@ -899,7 +985,10 @@ mod tests {
         assert!(health_response.contains("\"status\":\"ok\""));
         let health_date = health_response
             .lines()
-            .find_map(|line| line.strip_prefix("Date: "))
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("date").then_some(value.trim())
+            })
             .expect("health response should include a Date header");
         parse_http_date(health_date)
             .expect("health Date header should use HTTP-date format");
@@ -935,5 +1024,23 @@ mod tests {
             .and_then(|path| path.parent())
             .expect("nested state directory should have a test root");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn response_body(response: &[u8]) -> &[u8] {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("response should contain a header terminator");
+
+        &response[header_end..]
+    }
+
+    fn available_port() -> u16 {
+        StdTcpListener::bind("127.0.0.1:0")
+            .expect("ephemeral port should bind")
+            .local_addr()
+            .expect("ephemeral listener should expose its address")
+            .port()
     }
 }

@@ -5,11 +5,14 @@ use std::num::ParseIntError;
 
 pub const EDGE_HOST_ENV: &str = "CLOUDISH_EDGE_HOST";
 pub const EDGE_PORT_ENV: &str = "CLOUDISH_EDGE_PORT";
+pub const EDGE_MAX_REQUEST_BYTES_ENV: &str = "CLOUDISH_EDGE_MAX_REQUEST_BYTES";
 const DEFAULT_EDGE_PORT: u16 = 4566;
+const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct HostingPlan {
     edge_address: SocketAddr,
+    max_request_bytes: usize,
 }
 
 impl HostingPlan {
@@ -27,8 +30,15 @@ impl HostingPlan {
             .map(parse_edge_port)
             .transpose()?
             .unwrap_or(DEFAULT_EDGE_PORT);
+        let max_request_bytes = read_env(EDGE_MAX_REQUEST_BYTES_ENV)
+            .map(parse_max_request_bytes)
+            .transpose()?
+            .unwrap_or(DEFAULT_MAX_REQUEST_BYTES);
 
-        Ok(Self { edge_address: SocketAddr::new(host, port) })
+        Ok(Self {
+            edge_address: SocketAddr::new(host, port),
+            max_request_bytes,
+        })
     }
 
     pub(crate) fn local() -> Self {
@@ -37,20 +47,28 @@ impl HostingPlan {
                 Ipv4Addr::LOCALHOST,
                 DEFAULT_EDGE_PORT,
             )),
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
         }
     }
 
     pub(crate) fn edge_address(&self) -> SocketAddr {
         self.edge_address
     }
+
+    pub(crate) fn max_request_bytes(&self) -> usize {
+        self.max_request_bytes
+    }
 }
 
 #[derive(Debug)]
 pub enum HostingPlanError {
     BlankHost,
+    BlankMaxRequestBytes,
     InvalidHost { source: AddrParseError },
+    InvalidMaxRequestBytes { source: ParseIntError },
     BlankPort,
     InvalidPort { source: ParseIntError },
+    ZeroMaxRequestBytes,
 }
 
 impl fmt::Display for HostingPlanError {
@@ -60,9 +78,17 @@ impl fmt::Display for HostingPlanError {
                 formatter,
                 "invalid edge host in {EDGE_HOST_ENV}: value must not be blank"
             ),
+            Self::BlankMaxRequestBytes => write!(
+                formatter,
+                "invalid edge request size in {EDGE_MAX_REQUEST_BYTES_ENV}: value must not be blank"
+            ),
             Self::InvalidHost { source, .. } => write!(
                 formatter,
                 "invalid edge host in {EDGE_HOST_ENV}: {source}"
+            ),
+            Self::InvalidMaxRequestBytes { source, .. } => write!(
+                formatter,
+                "invalid edge request size in {EDGE_MAX_REQUEST_BYTES_ENV}: {source}"
             ),
             Self::BlankPort => write!(
                 formatter,
@@ -72,6 +98,10 @@ impl fmt::Display for HostingPlanError {
                 formatter,
                 "invalid edge port in {EDGE_PORT_ENV}: {source}"
             ),
+            Self::ZeroMaxRequestBytes => write!(
+                formatter,
+                "invalid edge request size in {EDGE_MAX_REQUEST_BYTES_ENV}: value must be greater than zero"
+            ),
         }
     }
 }
@@ -80,8 +110,12 @@ impl Error for HostingPlanError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidHost { source, .. } => Some(source),
+            Self::InvalidMaxRequestBytes { source, .. } => Some(source),
             Self::InvalidPort { source, .. } => Some(source),
-            Self::BlankHost | Self::BlankPort => None,
+            Self::BlankHost
+            | Self::BlankMaxRequestBytes
+            | Self::BlankPort
+            | Self::ZeroMaxRequestBytes => None,
         }
     }
 }
@@ -104,9 +138,28 @@ fn parse_edge_port(value: String) -> Result<u16, HostingPlanError> {
     value.parse().map_err(|source| HostingPlanError::InvalidPort { source })
 }
 
+fn parse_max_request_bytes(value: String) -> Result<usize, HostingPlanError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(HostingPlanError::BlankMaxRequestBytes);
+    }
+
+    let parsed = value.parse().map_err(|source| {
+        HostingPlanError::InvalidMaxRequestBytes { source }
+    })?;
+    if parsed == 0 {
+        return Err(HostingPlanError::ZeroMaxRequestBytes);
+    }
+
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EDGE_HOST_ENV, EDGE_PORT_ENV, HostingPlan, HostingPlanError};
+    use super::{
+        EDGE_HOST_ENV, EDGE_MAX_REQUEST_BYTES_ENV, EDGE_PORT_ENV, HostingPlan,
+        HostingPlanError,
+    };
     use std::error::Error;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
@@ -118,6 +171,7 @@ mod tests {
             plan.edge_address(),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4566))
         );
+        assert_eq!(plan.max_request_bytes(), 64 * 1024 * 1024);
     }
 
     #[test]
@@ -129,18 +183,21 @@ mod tests {
             plan.edge_address(),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4566))
         );
+        assert_eq!(plan.max_request_bytes(), 64 * 1024 * 1024);
     }
 
     #[test]
-    fn env_plan_uses_configured_edge_host_and_port() {
+    fn env_plan_uses_configured_edge_settings() {
         let plan = HostingPlan::from_env(|name| match name {
             EDGE_HOST_ENV => Some("0.0.0.0".to_owned()),
             EDGE_PORT_ENV => Some("4570".to_owned()),
+            EDGE_MAX_REQUEST_BYTES_ENV => Some("1048576".to_owned()),
             _ => None,
         })
         .expect("valid overrides should build a listener plan");
 
         assert_eq!(plan.edge_address().to_string(), "0.0.0.0:4570");
+        assert_eq!(plan.max_request_bytes(), 1_048_576);
     }
 
     #[test]
@@ -206,6 +263,60 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "invalid edge port in CLOUDISH_EDGE_PORT: invalid digit found in string"
+        );
+        assert_eq!(
+            Error::source(&error).map(ToString::to_string).as_deref(),
+            Some("invalid digit found in string")
+        );
+    }
+
+    #[test]
+    fn env_plan_rejects_blank_request_size() {
+        let error = HostingPlan::from_env(|name| match name {
+            EDGE_MAX_REQUEST_BYTES_ENV => Some("   ".to_owned()),
+            _ => None,
+        })
+        .expect_err("blank request size must fail");
+
+        assert!(matches!(error, HostingPlanError::BlankMaxRequestBytes));
+        assert_eq!(
+            error.to_string(),
+            "invalid edge request size in CLOUDISH_EDGE_MAX_REQUEST_BYTES: value must not be blank"
+        );
+        assert!(Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn env_plan_rejects_zero_request_size() {
+        let error = HostingPlan::from_env(|name| match name {
+            EDGE_MAX_REQUEST_BYTES_ENV => Some("0".to_owned()),
+            _ => None,
+        })
+        .expect_err("zero request size must fail");
+
+        assert!(matches!(error, HostingPlanError::ZeroMaxRequestBytes));
+        assert_eq!(
+            error.to_string(),
+            "invalid edge request size in CLOUDISH_EDGE_MAX_REQUEST_BYTES: value must be greater than zero"
+        );
+        assert!(Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn env_plan_rejects_invalid_request_size() {
+        let error = HostingPlan::from_env(|name| match name {
+            EDGE_MAX_REQUEST_BYTES_ENV => Some("not-a-number".to_owned()),
+            _ => None,
+        })
+        .expect_err("invalid request size must fail");
+
+        assert!(matches!(
+            error,
+            HostingPlanError::InvalidMaxRequestBytes { .. }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "invalid edge request size in CLOUDISH_EDGE_MAX_REQUEST_BYTES: invalid digit found in string"
         );
         assert_eq!(
             Error::source(&error).map(ToString::to_string).as_deref(),

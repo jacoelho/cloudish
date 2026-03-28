@@ -23,7 +23,7 @@ use crate::lambda;
 use crate::query::missing_action_error;
 #[cfg(feature = "rds")]
 use crate::rds;
-use crate::request::HttpRequest;
+use crate::request::{EdgeRequest, HttpRequest};
 #[cfg(feature = "s3")]
 use crate::s3;
 #[cfg(feature = "secrets-manager")]
@@ -38,7 +38,10 @@ use crate::ssm;
 use crate::step_functions;
 use crate::sts_query;
 use crate::xml::XmlBuilder;
-use auth::{Authenticator, RequestAuth, RequestHeader, VerifiedRequest};
+use auth::{
+    Authenticator, RequestAuth, RequestHeader, VerifiedRequest,
+    VerifiedSignature,
+};
 use aws::{
     AwsError, AwsErrorFamily, CredentialScope, ProtocolFamily, RegionId,
     RequestContext, RuntimeDefaults, ServiceName,
@@ -106,8 +109,8 @@ impl EdgeRouter {
     }
 
     pub fn handle_bytes(&self, request: &[u8]) -> EdgeResponse {
-        match HttpRequest::parse(request) {
-            Ok(request) => self.route(request),
+        match EdgeRequest::parse(request) {
+            Ok(request) => self.handle_request(request),
             Err(error) => EdgeResponse::json(
                 400,
                 json!({ "message": error.to_string() }),
@@ -115,7 +118,11 @@ impl EdgeRouter {
         }
     }
 
-    fn route(&self, request: HttpRequest<'_>) -> EdgeResponse {
+    pub fn handle_request(&self, request: EdgeRequest) -> EdgeResponse {
+        self.route(request)
+    }
+
+    fn route(&self, request: EdgeRequest) -> EdgeResponse {
         if let Some(response) = self.internal_route(&request) {
             return response;
         }
@@ -132,8 +139,8 @@ impl EdgeRouter {
             return EdgeResponse::json(404, json!({ "message": "not found" }));
         };
 
-        let verified_request = match self.authenticate(&request) {
-            Ok(verified_request) => verified_request,
+        let verified_signature = match self.authenticate_details(&request) {
+            Ok(verified_signature) => verified_signature,
             Err(error) => {
                 return if protocol == ProtocolFamily::RestXml {
                     #[cfg(feature = "s3")]
@@ -149,22 +156,25 @@ impl EdgeRouter {
                 };
             }
         };
+        let verified_request = verified_signature
+            .as_ref()
+            .map(VerifiedSignature::verified_request);
 
         let response = match protocol {
             ProtocolFamily::Query => {
-                self.route_query(&request, verified_request.as_ref())
+                self.route_query(&request, verified_request)
             }
             ProtocolFamily::AwsJson10 | ProtocolFamily::AwsJson11 => {
-                self.route_json(&request, protocol, verified_request.as_ref())
+                self.route_json(&request, protocol, verified_request)
             }
             ProtocolFamily::RestJson => {
-                self.route_rest_json(&request, verified_request.as_ref())
+                self.route_rest_json(&request, verified_request)
             }
             ProtocolFamily::SmithyRpcV2Cbor => {
-                self.route_smithy_cbor(&request, verified_request.as_ref())
+                self.route_smithy_cbor(&request, verified_request)
             }
             ProtocolFamily::RestXml => {
-                self.route_rest_xml(&request, verified_request.as_ref())
+                self.route_rest_xml(request, verified_signature.as_ref())
             }
         };
 
@@ -1009,9 +1019,11 @@ impl EdgeRouter {
     #[cfg(feature = "s3")]
     fn route_rest_xml(
         &self,
-        request: &HttpRequest<'_>,
-        verified_request: Option<&VerifiedRequest>,
+        mut request: EdgeRequest,
+        verified_signature: Option<&VerifiedSignature>,
     ) -> EdgeResponse {
+        let verified_request =
+            verified_signature.map(VerifiedSignature::verified_request);
         if let Some(verified_request) = verified_request
             && verified_request.scope().service() != ServiceName::S3
         {
@@ -1028,6 +1040,12 @@ impl EdgeRouter {
             ));
         }
 
+        if let Err(error) =
+            s3::normalize_request(&mut request, verified_signature)
+        {
+            return s3::s3_error_response(&error);
+        }
+
         let scope = S3Scope::new(
             verified_request
                 .map(|verified_request| verified_request.account_id().clone())
@@ -1039,7 +1057,7 @@ impl EdgeRouter {
                 .unwrap_or_else(|| self.defaults.default_region_id().clone()),
         );
 
-        match s3::handle(request, &scope, self.runtime.s3()) {
+        match s3::handle(&request, &scope, self.runtime.s3()) {
             Ok(response) => response,
             Err(error) => s3::s3_error_response(&error),
         }
@@ -1048,8 +1066,8 @@ impl EdgeRouter {
     #[cfg(not(feature = "s3"))]
     fn route_rest_xml(
         &self,
-        _request: &HttpRequest<'_>,
-        _verified_request: Option<&VerifiedRequest>,
+        _request: EdgeRequest,
+        _verified_signature: Option<&VerifiedSignature>,
     ) -> EdgeResponse {
         EdgeResponse::aws(
             ProtocolFamily::RestXml,
@@ -1088,6 +1106,25 @@ impl EdgeRouter {
         request: &HttpRequest<'_>,
     ) -> Result<Option<VerifiedRequest>, AwsError> {
         self.authenticator.verify(
+            &RequestAuth::new(
+                request.method(),
+                request.path(),
+                request
+                    .headers()
+                    .map(|(name, value)| RequestHeader::new(name, value))
+                    .collect(),
+                request.body(),
+            ),
+            self.runtime.iam(),
+            self.runtime.sts(),
+        )
+    }
+
+    fn authenticate_details(
+        &self,
+        request: &HttpRequest<'_>,
+    ) -> Result<Option<VerifiedSignature>, AwsError> {
+        self.authenticator.verify_details(
             &RequestAuth::new(
                 request.method(),
                 request.path(),
@@ -1251,6 +1288,10 @@ impl EdgeResponse {
         response.extend_from_slice(b"\r\n");
         response.extend_from_slice(&self.body);
         response
+    }
+
+    pub fn into_parts(self) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        (self.status_code, self.headers, self.body)
     }
 }
 
