@@ -1,0 +1,101 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["all-services"]
+all-services = [
+    "apigateway",
+    "cloudformation",
+    "cloudwatch",
+    "cognito",
+    "dynamodb",
+    "elasticache",
+    "eventbridge",
+    "kinesis",
+    "kms",
+    "lambda",
+    "rds",
+    "s3",
+    "secrets-manager",
+    "sns",
+    "sqs",
+    "ssm",
+    "step-functions",
+]
+apigateway = ["dep:apigateway", "edge-runtime/apigateway", "lambda", "http/apigateway"]
+cloudformation = [
+    "dep:cloudformation",
+    "edge-runtime/cloudformation",
+    "dynamodb",
+    "kms",
+    "lambda",
+    "s3",
+    "secrets-manager",
+    "sns",
+    "sqs",
+    "ssm",
+    "http/cloudformation",
+]
+cloudwatch = ["dep:cloudwatch", "edge-runtime/cloudwatch", "http/cloudwatch"]
+cognito = ["dep:cognito", "edge-runtime/cognito", "http/cognito"]
+dynamodb = ["dep:dynamodb", "edge-runtime/dynamodb", "http/dynamodb"]
+elasticache = ["dep:elasticache", "edge-runtime/elasticache", "http/elasticache"]
+eventbridge = ["dep:eventbridge", "edge-runtime/eventbridge", "lambda", "sns", "sqs", "http/eventbridge"]
+kinesis = ["dep:kinesis", "edge-runtime/kinesis", "http/kinesis"]
+kms = ["dep:kms", "edge-runtime/kms", "http/kms"]
+lambda = ["dep:lambda", "edge-runtime/lambda", "s3", "sqs", "http/lambda"]
+rds = ["dep:rds", "edge-runtime/rds", "http/rds"]
+s3 = ["dep:s3", "edge-runtime/s3", "sns", "sqs", "http/s3"]
+secrets-manager = ["dep:secrets-manager", "edge-runtime/secrets-manager", "http/secrets-manager"]
+sns = ["dep:sns", "edge-runtime/sns", "lambda", "sqs", "http/sns"]
+sqs = ["dep:sqs", "edge-runtime/sqs", "http/sqs"]
+ssm = ["dep:ssm", "edge-runtime/ssm", "http/ssm"]
+step-functions = ["dep:step-functions", "edge-runtime/step-functions", "lambda", "http/step-functions"]
+
+[lints]
+workspace = true
+
+[dependencies]
+apigateway = { path = "../services/apigateway", optional = true }
+async-trait = "0.1.89"
+auth = { path = "../auth" }
+aws = { path = "../aws" }
+cloudformation = { path = "../services/cloudformation", optional = true }
+cloudwatch = { path = "../services/cloudwatch", optional = true }
+cognito = { path = "../services/cognito", optional = true }
+dynamodb = { path = "../services/dynamodb", optional = true }
+elasticache = { path = "../services/elasticache", optional = true }
+eventbridge = { path = "../services/eventbridge", optional = true }
+edge-runtime = { path = "../edge-runtime", default-features = false }
+futures = "0.3.32"
+getrandom = "0.2"
+http = { path = "../http", default-features = false }
+iam = { path = "../services/iam" }
+kinesis = { path = "../services/kinesis", optional = true }
+kms = { path = "../services/kms", optional = true }
+lambda = { path = "../services/lambda", optional = true }
+opensrv-mysql = { version = "0.7.0", default-features = false }
+pgwire = { version = "0.38.2", default-features = false, features = ["server-api"] }
+rds = { path = "../services/rds", optional = true }
+s3 = { path = "../services/s3", optional = true }
+secrets-manager = { path = "../services/secrets-manager", optional = true }
+serde_json.workspace = true
+sha1 = "0.10.6"
+sns = { path = "../services/sns", optional = true }
+sqs = { path = "../services/sqs", optional = true }
+ssm = { path = "../services/ssm", optional = true }
+step-functions = { path = "../services/step-functions", optional = true }
+storage = { path = "../storage" }
+sts = { path = "../services/sts" }
+time = { version = "0.3.47", features = ["formatting"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "signal", "time", "net", "sync"] }
+urlencoding = "2.1.3"
+zip = "0.6.6"
+
+[dev-dependencies]
+httpdate = "1.0.3"
+test-support = { path = "../test-support" }

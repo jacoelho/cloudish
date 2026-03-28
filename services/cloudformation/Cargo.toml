@@ -1,0 +1,28 @@
+[package]
+name = "cloudformation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aws = { path = "../../aws" }
+base64 = "0.22.1"
+dynamodb = { path = "../dynamodb" }
+iam = { path = "../iam" }
+kms = { path = "../kms" }
+lambda = { path = "../lambda" }
+s3 = { path = "../s3" }
+secrets-manager = { path = "../secrets-manager" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.9.34"
+sha2 = "0.10.9"
+sns = { path = "../sns" }
+sqs = { path = "../sqs" }
+ssm = { path = "../ssm" }
+thiserror.workspace = true
+zip = "2.4.2"

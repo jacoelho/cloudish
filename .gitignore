@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+logs
+out
+core
+*.vdev
+debug.out
+rusty-tags.vi
+*.sw*
+tags
+.direnv
+.img/*
+*.local
+.DS_Store

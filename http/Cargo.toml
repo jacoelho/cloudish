@@ -1,0 +1,87 @@
+[package]
+name = "http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["all-services"]
+all-services = [
+    "apigateway",
+    "cloudformation",
+    "cloudwatch",
+    "cognito",
+    "dynamodb",
+    "elasticache",
+    "eventbridge",
+    "kinesis",
+    "kms",
+    "lambda",
+    "rds",
+    "s3",
+    "secrets-manager",
+    "sns",
+    "sqs",
+    "ssm",
+    "step-functions",
+]
+apigateway = ["dep:apigateway", "edge-runtime/apigateway", "lambda"]
+cloudformation = ["dep:cloudformation", "edge-runtime/cloudformation"]
+cloudwatch = ["dep:cloudwatch", "edge-runtime/cloudwatch"]
+cognito = ["dep:cognito", "edge-runtime/cognito"]
+dynamodb = ["dep:dynamodb", "edge-runtime/dynamodb"]
+elasticache = ["dep:elasticache", "edge-runtime/elasticache"]
+eventbridge = ["dep:eventbridge", "edge-runtime/eventbridge", "lambda", "sns", "sqs"]
+kinesis = ["dep:kinesis", "edge-runtime/kinesis"]
+kms = ["dep:kms", "edge-runtime/kms"]
+lambda = ["dep:lambda", "edge-runtime/lambda"]
+rds = ["dep:rds", "edge-runtime/rds"]
+s3 = ["dep:s3", "edge-runtime/s3", "sns", "sqs"]
+secrets-manager = ["dep:secrets-manager", "edge-runtime/secrets-manager"]
+sns = ["dep:sns", "edge-runtime/sns", "lambda", "sqs"]
+sqs = ["dep:sqs", "edge-runtime/sqs"]
+ssm = ["dep:ssm", "edge-runtime/ssm"]
+step-functions = ["dep:step-functions", "edge-runtime/step-functions", "lambda"]
+
+[lints]
+workspace = true
+
+[dependencies]
+apigateway = { path = "../services/apigateway", optional = true }
+auth = { path = "../auth" }
+aws = { path = "../aws" }
+aws-smithy-eventstream = "=0.60.6"
+aws-smithy-types = "=1.3.5"
+base64 = "0.22.1"
+bytes = "1.10.1"
+ciborium.workspace = true
+cloudformation = { path = "../services/cloudformation", optional = true }
+cloudwatch = { path = "../services/cloudwatch", optional = true }
+cognito = { path = "../services/cognito", optional = true }
+dynamodb = { path = "../services/dynamodb", optional = true }
+elasticache = { path = "../services/elasticache", optional = true }
+eventbridge = { path = "../services/eventbridge", optional = true }
+edge-runtime = { path = "../edge-runtime", default-features = false }
+httpdate = "1.0.3"
+iam = { path = "../services/iam" }
+kinesis = { path = "../services/kinesis", optional = true }
+kms = { path = "../services/kms", optional = true }
+lambda = { path = "../services/lambda", optional = true }
+quick-xml = { version = "0.37.5", features = ["serialize"] }
+rds = { path = "../services/rds", optional = true }
+s3 = { path = "../services/s3", optional = true }
+secrets-manager = { path = "../services/secrets-manager", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sns = { path = "../services/sns", optional = true }
+sqs = { path = "../services/sqs", optional = true }
+ssm = { path = "../services/ssm", optional = true }
+step-functions = { path = "../services/step-functions", optional = true }
+sts = { path = "../services/sts" }
+time = { version = "0.3.47", features = ["formatting"] }
+urlencoding = "2.1.3"
+
+[dev-dependencies]
+storage = { path = "../storage" }
+zip = "0.6.6"
