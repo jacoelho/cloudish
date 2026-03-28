@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 #![cfg_attr(
     test,
     allow(
@@ -12,3 +11,5 @@
         clippy::unwrap_used
     )
 )]
+
+pub mod common;

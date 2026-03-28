@@ -8,12 +8,9 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/lambda.rs"]
-mod lambda_fixture;
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::lambda as lambda_fixture;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_iam::Client as IamClient;
 use aws_sdk_lambda::Client as LambdaClient;

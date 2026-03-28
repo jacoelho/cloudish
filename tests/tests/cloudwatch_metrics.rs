@@ -8,10 +8,8 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_cloudwatch::Client as CloudWatchClient;
 use aws_sdk_cloudwatch::error::ProvideErrorMetadata;

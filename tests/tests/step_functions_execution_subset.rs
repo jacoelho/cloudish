@@ -8,12 +8,9 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/lambda.rs"]
-mod lambda_fixture;
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::lambda as lambda_fixture;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_iam::Client as IamClient;
 use aws_sdk_lambda::Client as LambdaClient;
@@ -21,8 +18,16 @@ use aws_sdk_lambda::primitives::Blob;
 use aws_sdk_lambda::types::{FunctionCode, Runtime};
 use aws_sdk_sfn::Client as SfnClient;
 use aws_sdk_sfn::error::ProvideErrorMetadata;
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("step_functions_execution_subset");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::time::Duration;
 
 async fn wait_for_execution_completion(
@@ -57,7 +62,7 @@ async fn wait_for_execution_completion(
 #[tokio::test]
 async fn step_functions_execution_subset_lifecycle_history_and_lambda_task_round_trip()
  {
-    let runtime = RuntimeServer::spawn("sdk-step-functions-execution").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -232,12 +237,11 @@ async fn step_functions_execution_subset_lifecycle_history_and_lambda_task_round
         .send()
         .await
         .expect("state machine should delete");
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn step_functions_execution_subset_rejects_retry_during_validation() {
-    let runtime = RuntimeServer::spawn("sdk-step-functions-invalid").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -277,5 +281,4 @@ async fn step_functions_execution_subset_rejects_retry_during_validation() {
 
     assert_eq!(error.code(), Some("InvalidDefinition"));
     assert!(error.message().is_some_and(|message| message.contains("Retry")));
-    runtime.shutdown().await;
 }

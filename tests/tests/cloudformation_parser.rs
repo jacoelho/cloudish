@@ -8,15 +8,20 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_cloudformation::Client as CloudFormationClient;
 use aws_sdk_cloudformation::error::ProvideErrorMetadata;
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("cloudformation_parser");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 const SUCCESS_TEMPLATE: &str = r#"Description: parser story
 Parameters:
@@ -60,7 +65,7 @@ Outputs:
 #[tokio::test]
 async fn cloudformation_parser_validate_template_reports_description_and_parameters()
  {
-    let runtime = RuntimeServer::spawn("sdk-cloudformation-parser").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -83,14 +88,11 @@ async fn cloudformation_parser_validate_template_reports_description_and_paramet
     assert_eq!(parameter.parameter_key(), Some("Prefix"));
     assert_eq!(parameter.default_value(), Some("demo"));
     assert_eq!(parameter.no_echo(), Some(false));
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn cloudformation_parser_validate_template_accepts_supported_get_att() {
-    let runtime =
-        RuntimeServer::spawn("sdk-cloudformation-parser-getatt").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -106,15 +108,12 @@ async fn cloudformation_parser_validate_template_accepts_supported_get_att() {
         .expect("supported Fn::GetAtt should validate");
 
     assert!(output.parameters().is_empty());
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn cloudformation_parser_validate_template_rejects_unsupported_get_att()
 {
-    let runtime =
-        RuntimeServer::spawn("sdk-cloudformation-parser-getatt-bogus").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -133,6 +132,4 @@ async fn cloudformation_parser_validate_template_rejects_unsupported_get_att()
     assert!(error.message().is_some_and(|message| {
         message.contains("Fn::GetAtt attribute Bogus")
     }));
-
-    runtime.shutdown().await;
 }

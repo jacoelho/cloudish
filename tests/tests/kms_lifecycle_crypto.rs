@@ -8,10 +8,8 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_kms::Client as KmsClient;
 use aws_sdk_kms::error::ProvideErrorMetadata;
@@ -19,8 +17,16 @@ use aws_sdk_kms::primitives::Blob;
 use aws_sdk_kms::types::{
     DataKeySpec, KeySpec, KeyUsageType, SigningAlgorithmSpec, Tag,
 };
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("kms_lifecycle_crypto");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -32,7 +38,7 @@ fn unique_alias() -> String {
 
 #[tokio::test]
 async fn kms_lifecycle_and_crypto_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-kms-lifecycle").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -261,12 +267,11 @@ async fn kms_lifecycle_and_crypto_round_trip() {
     );
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn kms_reports_explicit_errors() {
-    let runtime = RuntimeServer::spawn("sdk-kms-errors").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -355,5 +360,4 @@ async fn kms_reports_explicit_errors() {
     assert_eq!(wrong_signature.code(), Some("KMSInvalidSignatureException"));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

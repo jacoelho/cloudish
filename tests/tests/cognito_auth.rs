@@ -8,20 +8,25 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/cognito.rs"]
-mod cognito;
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::cognito;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_cognitoidentityprovider::Client as CognitoClient;
 use aws_sdk_cognitoidentityprovider::error::ProvideErrorMetadata;
 use aws_sdk_cognitoidentityprovider::types::{
     AttributeType, AuthFlowType, ChallengeNameType, ExplicitAuthFlowsType,
 };
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("cognito_auth");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -33,7 +38,7 @@ fn unique_name(prefix: &str) -> String {
 
 #[tokio::test]
 async fn cognito_auth_round_trips_signup_password_and_oidc_metadata() {
-    let runtime = RuntimeServer::spawn("sdk-cognito-auth").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -201,13 +206,11 @@ async fn cognito_auth_round_trips_signup_password_and_oidc_metadata() {
         .send()
         .await
         .expect("updated password should authenticate");
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn cognito_auth_handles_new_password_required_challenge() {
-    let runtime = RuntimeServer::spawn("sdk-cognito-auth-challenge").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -301,13 +304,11 @@ async fn cognito_auth_handles_new_password_required_challenge() {
         fetched_user.user_status().map(|status| status.as_str()),
         Some("CONFIRMED")
     );
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn cognito_auth_rejects_unsupported_refresh_flows_explicitly() {
-    let runtime = RuntimeServer::spawn("sdk-cognito-auth-negative").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -358,6 +359,4 @@ async fn cognito_auth_rejects_unsupported_refresh_flows_explicitly() {
             .and_then(|service_error| service_error.code()),
         Some("UnsupportedOperation")
     );
-
-    runtime.shutdown().await;
 }

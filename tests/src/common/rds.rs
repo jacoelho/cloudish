@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -16,10 +15,8 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{OptsBuilder, Pool};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use test_support::send_http_request;
 use time::OffsetDateTime;
 use time::format_description::parse;
 use tokio::net::TcpStream;
@@ -29,76 +26,11 @@ type HmacSha256 = Hmac<Sha256>;
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
-pub(crate) fn unique_name(prefix: &str) -> String {
+pub fn unique_name(prefix: &str) -> String {
     format!("{prefix}-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
 
-pub(crate) fn query_request(body: &str) -> String {
-    format!(
-        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-}
-
-pub(crate) fn response_status(response: &str) -> &str {
-    response
-        .split("\r\n")
-        .next()
-        .expect("response should contain a status line")
-}
-
-pub(crate) fn response_body(response: &str) -> &str {
-    response.split("\r\n\r\n").nth(1).expect("response should contain a body")
-}
-
-pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
-    let start = format!("<{tag}>");
-    let end = format!("</{tag}>");
-    let (_, rest) = xml.split_once(&start)?;
-    let (value, _) = rest.split_once(&end)?;
-    Some(value.to_owned())
-}
-
-pub(crate) fn endpoint_from_xml(xml: &str) -> (String, u16) {
-    let address =
-        xml_text(xml, "Address").expect("endpoint should include Address");
-    let port = xml_text(xml, "Port")
-        .expect("endpoint should include Port")
-        .parse::<u16>()
-        .expect("endpoint port should parse");
-    (address, port)
-}
-
-pub(crate) async fn send_request(
-    address: SocketAddr,
-    request: &str,
-) -> String {
-    let mut last_error = None;
-
-    for _ in 0..10 {
-        let request = request.to_owned();
-        match tokio::task::spawn_blocking(move || {
-            send_http_request(address, &request)
-        })
-        .await
-        .expect("blocking request task should join")
-        {
-            Ok(response) => return response,
-            Err(error) => last_error = Some(error),
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let exhausted_retries = last_error.is_some();
-    assert!(
-        !exhausted_retries,
-        "request should succeed: {:?}",
-        last_error.expect("retry loop should capture an error")
-    );
-    std::process::abort();
-}
-
-pub(crate) async fn postgres_query(
+pub async fn postgres_query(
     host: &str,
     port: u16,
     username: &str,
@@ -138,7 +70,7 @@ pub(crate) async fn postgres_query(
     Ok(value)
 }
 
-pub(crate) async fn postgres_query_eventually(
+pub async fn postgres_query_eventually(
     host: &str,
     port: u16,
     username: &str,
@@ -166,7 +98,7 @@ pub(crate) async fn postgres_query_eventually(
     std::process::abort();
 }
 
-pub(crate) async fn mysql_query(
+pub async fn mysql_query(
     host: &str,
     port: u16,
     username: &str,
@@ -199,7 +131,7 @@ pub(crate) async fn mysql_query(
     Ok(value)
 }
 
-pub(crate) async fn mysql_query_eventually(
+pub async fn mysql_query_eventually(
     host: &str,
     port: u16,
     username: &str,
@@ -226,7 +158,7 @@ pub(crate) async fn mysql_query_eventually(
     std::process::abort();
 }
 
-pub(crate) async fn wait_for_port_closed(host: &str, port: u16) {
+pub async fn wait_for_port_closed(host: &str, port: u16) {
     for _ in 0..30 {
         if TcpStream::connect((host, port)).await.is_err() {
             return;
@@ -239,7 +171,7 @@ pub(crate) async fn wait_for_port_closed(host: &str, port: u16) {
     std::process::abort();
 }
 
-pub(crate) fn postgres_iam_token(
+pub fn postgres_iam_token(
     host: &str,
     port: u16,
     region: &str,

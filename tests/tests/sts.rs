@@ -8,17 +8,22 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_iam::Client as IamClient;
 use aws_sdk_sts::Client as StsClient;
 use aws_sdk_sts::error::ProvideErrorMetadata;
 use aws_sdk_sts::types::Tag;
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("sts");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 fn assume_role_policy(account_id: &str) -> String {
     format!(
@@ -47,7 +52,7 @@ fn session_target(
 
 #[tokio::test]
 async fn assume_role_credentials_sign_downstream_iam_requests() {
-    let runtime = RuntimeServer::spawn("sdk-sts-assume-role").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -133,12 +138,11 @@ async fn assume_role_credentials_sign_downstream_iam_requests() {
     assert_eq!(error.code(), Some("InvalidClientTokenId"));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn root_caller_identity_and_invalid_session_names_match_sts_rules() {
-    let runtime = RuntimeServer::spawn("tests-sts-query").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -176,12 +180,11 @@ async fn root_caller_identity_and_invalid_session_names_match_sts_rules() {
     }));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn extended_query_paths_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-sts-extended").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -264,5 +267,4 @@ async fn extended_query_paths_round_trip() {
     assert_eq!(decoded.decoded_message(), Some(r#"{"reason":"denied"}"#));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

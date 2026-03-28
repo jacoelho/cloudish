@@ -8,10 +8,8 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_apigateway::Client as ApiGatewayClient;
 use aws_sdk_apigateway::error::ProvideErrorMetadata;
@@ -19,8 +17,16 @@ use aws_sdk_apigateway::types::{
     ApiStage, AuthorizerType, ConnectionType, EndpointConfiguration,
     EndpointType, IntegrationType, SecurityPolicy,
 };
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("apigw_v1_control");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -39,7 +45,7 @@ fn authorizer_uri(name: &str) -> String {
 
 #[tokio::test]
 async fn apigw_v1_control_rest_api_crud_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-apigw-v1-control-core").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -310,12 +316,11 @@ async fn apigw_v1_control_rest_api_crud_round_trip() {
     );
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn apigw_v1_control_api_keys_usage_plans_and_domains_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-apigw-v1-control-metadata").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -469,12 +474,11 @@ async fn apigw_v1_control_api_keys_usage_plans_and_domains_round_trip() {
     assert_eq!(fetched_mapping.stage(), Some("dev"));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn apigw_v1_control_reports_explicit_errors() {
-    let runtime = RuntimeServer::spawn("sdk-apigw-v1-control-errors").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -572,5 +576,4 @@ async fn apigw_v1_control_reports_explicit_errors() {
     );
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

@@ -8,16 +8,22 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_ssm::Client as SsmClient;
 use aws_sdk_ssm::error::ProvideErrorMetadata;
 use aws_sdk_ssm::types::{ParameterType, ResourceTypeForTagging, Tag};
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("ssm_parameter_store");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -29,7 +35,7 @@ fn unique_root() -> String {
 
 #[tokio::test]
 async fn ssm_parameter_store_core_history_and_tags_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-ssm-parameter-store").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -251,12 +257,11 @@ async fn ssm_parameter_store_core_history_and_tags_round_trip() {
     assert_eq!(deleted_error.code(), Some("ParameterNotFound"));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn ssm_parameter_store_reports_explicit_errors() {
-    let runtime = RuntimeServer::spawn("sdk-ssm-parameter-store-errors").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -315,5 +320,4 @@ async fn ssm_parameter_store_reports_explicit_errors() {
     assert_eq!(missing_tags.code(), Some("InvalidResourceId"));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

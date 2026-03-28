@@ -8,16 +8,22 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_secretsmanager::error::ProvideErrorMetadata;
 use aws_sdk_secretsmanager::types::{RotationRulesType, Tag};
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("secrets_manager_lifecycle");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -29,7 +35,7 @@ fn unique_name() -> String {
 
 #[tokio::test]
 async fn secrets_manager_lifecycle_versions_tags_and_delete_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-secrets-manager-lifecycle").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -166,12 +172,11 @@ async fn secrets_manager_lifecycle_versions_tags_and_delete_round_trip() {
     assert!(described_deleted.deleted_date().is_some());
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn secrets_manager_reports_explicit_lifecycle_errors() {
-    let runtime = RuntimeServer::spawn("sdk-secrets-manager-errors").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -225,5 +230,4 @@ async fn secrets_manager_reports_explicit_lifecycle_errors() {
     assert_eq!(deleted_write.code(), Some("InvalidRequestException"));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

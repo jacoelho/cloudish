@@ -8,12 +8,9 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/http_fixture.rs"]
-mod http_fixture;
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::http_fixture;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_apigatewayv2::Client as ApiGatewayV2Client;
 use aws_sdk_apigatewayv2::types::{IntegrationType, ProtocolType};

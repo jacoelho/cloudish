@@ -8,10 +8,8 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
@@ -30,7 +28,15 @@ use aws_sdk_s3::types::{
 use aws_sdk_sqs::Client as SqsClient;
 use aws_sdk_sqs::types::QueueAttributeName;
 use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("s3_notifications");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 async fn shared_clients(target: &SdkSmokeTarget) -> (S3Client, SqsClient) {
     let shared = target.load().await;
@@ -52,7 +58,7 @@ fn assert_target(target: &SdkSmokeTarget, runtime: &RuntimeServer) {
 
 #[tokio::test]
 async fn s3_notifications_sqs_event_configuration_and_delivery_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-s3-notifications-events").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -206,13 +212,11 @@ async fn s3_notifications_sqs_event_configuration_and_delivery_round_trip() {
         .await
         .expect("filtered receive should succeed");
     assert!(filtered.messages().is_empty());
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn s3_notifications_object_lock_select_and_restore_behave_explicitly() {
-    let runtime = RuntimeServer::spawn("sdk-s3-notifications-advanced").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -502,6 +506,4 @@ async fn s3_notifications_object_lock_select_and_restore_behave_explicitly() {
         restore_error.message(),
         Some("RestoreObject lifecycle is not implemented.")
     );
-
-    runtime.shutdown().await;
 }

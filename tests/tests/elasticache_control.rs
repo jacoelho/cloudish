@@ -8,20 +8,24 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/elasticache.rs"]
-mod elasticache;
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::elasticache;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_elasticache::Client as ElastiCacheClient;
 use aws_sdk_elasticache::error::ProvideErrorMetadata;
 use aws_sdk_elasticache::types::{
     AuthenticationMode, ClusterMode, InputAuthenticationType,
 };
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("elasticache_control");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 fn assert_auth_failure(error: &str) {
     let normalized = error.to_ascii_lowercase();
@@ -39,7 +43,7 @@ fn assert_auth_failure(error: &str) {
 
 #[tokio::test]
 async fn user_lifecycle_and_password_proxy_round_trip() {
-    let runtime = RuntimeServer::spawn("tests-elasticache-password").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -189,13 +193,11 @@ async fn user_lifecycle_and_password_proxy_round_trip() {
         .await
         .expect("replication group should delete");
     elasticache::wait_for_port_closed(&host, port).await;
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn iam_proxy_and_topology_failures_are_explicit() {
-    let runtime = RuntimeServer::spawn("tests-elasticache-iam").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -283,6 +285,4 @@ async fn iam_proxy_and_topology_failures_are_explicit() {
         .await
         .expect("replication group should delete");
     elasticache::wait_for_port_closed(&host, port).await;
-
-    runtime.shutdown().await;
 }

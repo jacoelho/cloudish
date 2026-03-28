@@ -8,10 +8,8 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
@@ -24,7 +22,16 @@ use aws_sdk_s3::types::{
 };
 use reqwest::Method;
 use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("s3_advanced");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::time::{Duration, SystemTime};
 
 async fn s3_client(target: &SdkSmokeTarget) -> S3Client {
@@ -62,7 +69,7 @@ async fn execute_presigned(
 
 #[tokio::test]
 async fn s3_advanced_versioning_delete_markers_and_historical_reads() {
-    let runtime = RuntimeServer::spawn("sdk-s3-advanced-versioning").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -162,13 +169,11 @@ async fn s3_advanced_versioning_delete_markers_and_historical_reads() {
         delete.version_id(),
         "list versions should surface the delete marker id"
     );
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn s3_advanced_presigned_put_get_and_expiry_work() {
-    let runtime = RuntimeServer::spawn("sdk-s3-advanced-presign").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -261,13 +266,11 @@ async fn s3_advanced_presigned_put_get_and_expiry_work() {
     assert_eq!(expired_status, reqwest::StatusCode::FORBIDDEN);
     assert!(expired_body.contains("<Code>AccessDenied</Code>"));
     assert!(expired_body.contains("<Message>Request has expired.</Message>"));
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn s3_advanced_multipart_abort_cleanup_and_validation_failures() {
-    let runtime = RuntimeServer::spawn("sdk-s3-advanced-multipart").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -367,6 +370,4 @@ async fn s3_advanced_multipart_abort_cleanup_and_validation_failures() {
     assert_eq!(missing_object.code(), Some("NoSuchKey"));
     assert_eq!(malformed_status, reqwest::StatusCode::BAD_REQUEST);
     assert!(malformed_body.contains("<Code>MalformedXML</Code>"));
-
-    runtime.shutdown().await;
 }

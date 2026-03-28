@@ -8,14 +8,10 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/http_fixture.rs"]
-mod http_fixture;
-#[path = "common/lambda.rs"]
-mod lambda_fixture;
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::http_fixture;
+use tests::common::lambda as lambda_fixture;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_apigateway::Client as ApiGatewayClient;
 use aws_sdk_apigateway::types::IntegrationType;
@@ -24,8 +20,16 @@ use aws_sdk_lambda::Client as LambdaClient;
 use aws_sdk_lambda::primitives::Blob;
 use aws_sdk_lambda::types::{FunctionCode, Runtime};
 use reqwest::header::HOST;
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("apigw_v1_runtime");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -45,7 +49,7 @@ fn lambda_integration_uri(function_name: &str) -> String {
 
 #[tokio::test]
 async fn apigw_v1_runtime_lambda_proxy_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-apigw-v1-runtime-lambda").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -173,12 +177,11 @@ async fn apigw_v1_runtime_lambda_proxy_round_trip() {
     assert_eq!(event["requestContext"]["stage"], "dev");
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn apigw_v1_runtime_http_proxy_custom_domain_and_missing_mapping() {
-    let runtime = RuntimeServer::spawn("sdk-apigw-v1-runtime-domain").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -300,5 +303,4 @@ async fn apigw_v1_runtime_http_proxy_custom_domain_and_missing_mapping() {
 
     backend.join();
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

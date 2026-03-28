@@ -8,10 +8,8 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_kinesis::Client as KinesisClient;
 use aws_sdk_kinesis::error::ProvideErrorMetadata;
@@ -19,8 +17,16 @@ use aws_sdk_kinesis::primitives::Blob;
 use aws_sdk_kinesis::types::{
     EncryptionType, PutRecordsRequestEntry, ShardIteratorType,
 };
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("kinesis_streams");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -32,7 +38,7 @@ fn unique_stream(prefix: &str) -> String {
 
 #[tokio::test]
 async fn kinesis_stream_lifecycle_and_records_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-kinesis-records").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -123,12 +129,11 @@ async fn kinesis_stream_lifecycle_and_records_round_trip() {
         .send()
         .await
         .expect("stream should delete");
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn kinesis_consumers_topology_tags_and_encryption_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-kinesis-metadata").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -305,12 +310,11 @@ async fn kinesis_consumers_topology_tags_and_encryption_round_trip() {
         .send()
         .await
         .expect("stream should delete");
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn kinesis_reports_explicit_errors() {
-    let runtime = RuntimeServer::spawn("sdk-kinesis-errors").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -344,6 +348,4 @@ async fn kinesis_reports_explicit_errors() {
         .await
         .expect_err("invalid iterator should fail");
     assert_eq!(invalid_iterator.code(), Some("InvalidArgumentException"));
-
-    runtime.shutdown().await;
 }

@@ -13,7 +13,7 @@ use jsonwebtoken::{
 };
 use serde_json::Value;
 
-pub(crate) fn verify_token_with_jwks(
+pub fn verify_token_with_jwks(
     token: &str,
     issuer: &str,
     jwks: &Value,

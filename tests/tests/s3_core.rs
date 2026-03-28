@@ -8,17 +8,22 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("s3_core");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 async fn s3_client(target: &SdkSmokeTarget) -> S3Client {
     let shared = target.load().await;
@@ -28,7 +33,7 @@ async fn s3_client(target: &SdkSmokeTarget) -> S3Client {
 
 #[tokio::test]
 async fn s3_core_put_get_head_copy_and_list_objects() {
-    let runtime = RuntimeServer::spawn("sdk-s3-core-flow").await;
+    let runtime = shared_runtime().await;
     assert!(runtime.state_directory().exists());
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
@@ -120,13 +125,11 @@ async fn s3_core_put_get_head_copy_and_list_objects() {
             .collect::<Vec<_>>(),
         vec!["reports/data-copy.txt", "reports/data.txt"]
     );
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn s3_core_missing_key_and_non_empty_bucket_errors_are_shaped() {
-    let runtime = RuntimeServer::spawn("sdk-s3-core-errors").await;
+    let runtime = shared_runtime().await;
     assert!(runtime.state_directory().exists());
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
@@ -169,6 +172,4 @@ async fn s3_core_missing_key_and_non_empty_bucket_errors_are_shaped() {
 
     assert_eq!(missing.code(), Some("NoSuchKey"));
     assert_eq!(non_empty.code(), Some("BucketNotEmpty"));
-
-    runtime.shutdown().await;
 }

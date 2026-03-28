@@ -8,22 +8,26 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/rds.rs"]
-mod rds;
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::rds;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_rds::Client as RdsClient;
 use aws_sdk_rds::error::ProvideErrorMetadata;
 use aws_sdk_rds::types::{ApplyMethod, Parameter};
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("rds_control");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 #[tokio::test]
 async fn instances_and_parameter_groups_round_trip() {
-    let runtime = RuntimeServer::spawn("tests-rds-control-instance").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -169,13 +173,11 @@ async fn instances_and_parameter_groups_round_trip() {
         .await
         .expect_err("unsupported engines should fail");
     assert_eq!(unsupported.code(), Some("InvalidParameterValue"));
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn clusters_reject_invalid_delete_state() {
-    let runtime = RuntimeServer::spawn("tests-rds-control-cluster").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -259,13 +261,11 @@ async fn clusters_reject_invalid_delete_state() {
         .await
         .expect("cluster should delete");
     rds::wait_for_port_closed(host, port).await;
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn postgres_and_mysql_proxy_auth_round_trip() {
-    let runtime = RuntimeServer::spawn("tests-rds-proxy-auth").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -429,6 +429,4 @@ async fn postgres_and_mysql_proxy_auth_round_trip() {
         .await
         .expect("mysql instance should delete");
     rds::wait_for_port_closed(&mysql_host, mysql_port).await;
-
-    runtime.shutdown().await;
 }

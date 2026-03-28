@@ -8,14 +8,21 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
+use tests::common::runtime;
 
 use ciborium::from_reader;
 use httpdate::parse_http_date;
+use runtime::SharedRuntimeLease;
 use serde::Deserialize;
 use serde_json::Value;
 use test_support::{send_http_request, send_http_request_bytes};
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("core_runtime");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 fn split_response(response: &[u8]) -> (&str, Vec<(&str, &str)>, &[u8]) {
     let header_end = response
@@ -66,8 +73,7 @@ struct AwsJsonErrorBody {
 
 #[tokio::test]
 async fn health_and_status_endpoints_return_internal_json() {
-    let runtime =
-        runtime::RuntimeServer::spawn("tests-core-runtime-health").await;
+    let runtime = shared_runtime().await;
     let address = runtime.address();
 
     let health = tokio::task::spawn_blocking(move || {
@@ -136,14 +142,11 @@ async fn health_and_status_endpoints_return_internal_json() {
             .is_string()
     );
     assert!(runtime.state_directory().exists());
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn unknown_json_and_query_requests_return_protocol_shaped_errors() {
-    let runtime =
-        runtime::RuntimeServer::spawn("tests-core-runtime-errors").await;
+    let runtime = shared_runtime().await;
     let address = runtime.address();
 
     let json_response = tokio::task::spawn_blocking(move || {
@@ -188,14 +191,11 @@ async fn unknown_json_and_query_requests_return_protocol_shaped_errors() {
         query_response
             .contains("<Message>Unknown action UnknownAction.</Message>")
     );
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn smithy_cbor_requests_return_cbor_errors() {
-    let runtime =
-        runtime::RuntimeServer::spawn("tests-core-runtime-cbor").await;
+    let runtime = shared_runtime().await;
     let address = runtime.address();
 
     let response = tokio::task::spawn_blocking(move || {
@@ -224,6 +224,4 @@ async fn smithy_cbor_requests_return_cbor_errors() {
     .expect("CBOR Date header should use HTTP-date format");
     assert_eq!(body.error_type, "MissingParameter");
     assert!(body.message.contains("EndTime"));
-
-    runtime.shutdown().await;
 }

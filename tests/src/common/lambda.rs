@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -19,38 +18,31 @@ const PROVIDED_BOOTSTRAP_ZIP_BASE64: &str = "UEsDBBQAAAAAAAAAIQCEK9lNDgAAAA4AAAA
 const FAILING_BOOTSTRAP_ZIP_BASE64: &str = "UEsDBAoAAAAAACIseVyjt17aEQAAABEAAAAJABwAYm9vdHN0cmFwVVQJAAOPc8Npj3PDaXV4CwABBPUBAAAEFAAAACMhL2Jpbi9zaApleGl0IDEKUEsBAh4DCgAAAAAAIix5XKO3XtoRAAAAEQAAAAkAGAAAAAAAAQAAAKSBAAAAAGJvb3RzdHJhcFVUBQADj3PDaXV4CwABBPUBAAAEFAAAAFBLBQYAAAAAAQABAE8AAABUAAAAAAA=";
 const PROXY_BOOTSTRAP_ZIP_BASE64: &str = "UEsDBBQAAAAIAIm1eVwi/hYppwAAAMgAAAAJABwAYm9vdHN0cmFwVVQJAANBZcRpQWXEaXV4CwABBPUBAAAEFAAAAC2OwQrCMBBE7/2KuFaq0NAi4qHgRfEvvGybaCPtJiRbbKn9d6N4G2YeM7NeFbWhIrSJw6mzqE7ptkEWb1Fj0MdDFOyFVCK7UbZLnDfEd5HNEBh5CBerNFT7ssyh1ai0D1DN0FhiTSx5cjEFdK4zsdRYKp7BEuQwSnTm8ZJ+IDb9F+qwrxVK5+04wZJDbdUU7U2ItAnn35krNXFPQcV+0EsmIP2fhuQDUEsBAh4DFAAAAAgAibV5XCL+FimnAAAAyAAAAAkAGAAAAAAAAQAAAO2BAAAAAGJvb3RzdHJhcFVUBQADQWXEaXV4CwABBPUBAAAEFAAAAFBLBQYAAAAAAQABAE8AAADqAAAAAAA=";
 
-pub(crate) fn provided_bootstrap_zip_base64() -> &'static str {
-    PROVIDED_BOOTSTRAP_ZIP_BASE64
-}
-
-pub(crate) fn provided_bootstrap_zip() -> Vec<u8> {
+pub fn provided_bootstrap_zip() -> Vec<u8> {
     BASE64_STANDARD
         .decode(PROVIDED_BOOTSTRAP_ZIP_BASE64)
         .expect("lambda fixture ZIP should decode")
 }
 
-pub(crate) fn failing_bootstrap_zip() -> Vec<u8> {
+pub fn failing_bootstrap_zip() -> Vec<u8> {
     BASE64_STANDARD
         .decode(FAILING_BOOTSTRAP_ZIP_BASE64)
         .expect("failing lambda fixture ZIP should decode")
 }
 
-pub(crate) fn proxy_bootstrap_zip() -> Vec<u8> {
+pub fn proxy_bootstrap_zip() -> Vec<u8> {
     BASE64_STANDARD
         .decode(PROXY_BOOTSTRAP_ZIP_BASE64)
         .expect("proxy lambda fixture ZIP should decode")
 }
 
-pub(crate) fn unique_name(prefix: &str) -> String {
+pub fn unique_name(prefix: &str) -> String {
     static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
     format!("{prefix}-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
 
-pub(crate) async fn create_lambda_role(
-    iam: &IamClient,
-    role_name: &str,
-) -> String {
+pub async fn create_lambda_role(iam: &IamClient, role_name: &str) -> String {
     iam.create_role()
         .role_name(role_name)
         .assume_role_policy_document(

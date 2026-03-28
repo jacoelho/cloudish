@@ -8,18 +8,24 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_cognitoidentityprovider::Client as CognitoClient;
 use aws_sdk_cognitoidentityprovider::error::ProvideErrorMetadata;
 use aws_sdk_cognitoidentityprovider::types::{
     AttributeType, ExplicitAuthFlowsType,
 };
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("cognito_control");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -31,7 +37,7 @@ fn unique_name(prefix: &str) -> String {
 
 #[tokio::test]
 async fn cognito_control_pools_clients_and_admin_users_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-cognito-control").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -237,12 +243,11 @@ async fn cognito_control_pools_clients_and_admin_users_round_trip() {
         .expect("pool should delete");
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn cognito_control_reports_duplicate_users_and_missing_users() {
-    let runtime = RuntimeServer::spawn("sdk-cognito-control-errors").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -294,5 +299,4 @@ async fn cognito_control_reports_duplicate_users_and_missing_users() {
     assert_eq!(missing.code(), Some("UserNotFoundException"));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

@@ -8,16 +8,21 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_iam::Client;
 use aws_sdk_iam::error::ProvideErrorMetadata;
 use aws_sdk_iam::types::Tag;
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("iam_principals");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 fn trust_policy() -> &'static str {
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#
@@ -29,7 +34,7 @@ fn managed_policy_document() -> &'static str {
 
 #[tokio::test]
 async fn iam_principal_attachment_flow_round_trips() {
-    let runtime = RuntimeServer::spawn("sdk-iam-principals").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -123,12 +128,11 @@ async fn iam_principal_attachment_flow_round_trips() {
     assert_eq!(user_tags.tags()[0].value(), "dev");
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn iam_delete_user_with_attachment_returns_delete_conflict() {
-    let runtime = RuntimeServer::spawn("sdk-iam-delete-conflict").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -180,5 +184,4 @@ async fn iam_delete_user_with_attachment_returns_delete_conflict() {
     );
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

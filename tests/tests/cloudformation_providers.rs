@@ -8,10 +8,8 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_cloudformation::Client as CloudFormationClient;
 use aws_sdk_cloudformation::error::ProvideErrorMetadata;
@@ -26,8 +24,15 @@ use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_sns::Client as SnsClient;
 use aws_sdk_sqs::Client as SqsClient;
 use aws_sdk_ssm::Client as SsmClient;
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("cloudformation_providers");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 const COMPREHENSIVE_TEMPLATE: &str = r#"Resources:
   AppBucket:
@@ -202,8 +207,7 @@ async fn s3_client(target: &SdkSmokeTarget) -> S3Client {
 #[tokio::test]
 async fn cloudformation_providers_stack_lifecycle_provisions_supported_catalog()
  {
-    let runtime =
-        RuntimeServer::spawn("sdk-cloudformation-providers-stack").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -428,14 +432,11 @@ async fn cloudformation_providers_stack_lifecycle_provisions_supported_catalog()
         .await
         .expect_err("queue should be deleted");
     assert!(deleted_queue.code().is_some());
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn cloudformation_providers_change_set_execution_updates_resources() {
-    let runtime =
-        RuntimeServer::spawn("sdk-cloudformation-providers-change-set").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -493,14 +494,11 @@ async fn cloudformation_providers_change_set_execution_updates_resources() {
             .map(str::to_owned),
         Some("after".to_owned())
     );
-
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn cloudformation_providers_reject_unsupported_resource_types() {
-    let runtime =
-        RuntimeServer::spawn("sdk-cloudformation-providers-unsupported").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -520,6 +518,4 @@ async fn cloudformation_providers_reject_unsupported_resource_types() {
     assert!(error.message().is_some_and(|message| {
         message.contains("unsupported type AWS::CloudFormation::Stack")
     }));
-
-    runtime.shutdown().await;
 }

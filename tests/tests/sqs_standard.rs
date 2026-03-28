@@ -8,20 +8,25 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_sqs::Client;
 use aws_sdk_sqs::error::ProvideErrorMetadata;
 use aws_sdk_sqs::types::QueueAttributeName;
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("sqs_standard");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 #[tokio::test]
 async fn sqs_standard_queue_lifecycle_round_trips() {
-    let runtime = RuntimeServer::spawn("sdk-sqs-standard").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -192,12 +197,11 @@ async fn sqs_standard_queue_lifecycle_round_trips() {
     assert!(purged.messages().is_empty());
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn sqs_standard_invalid_receipt_handle_surfaces_explicit_error() {
-    let runtime = RuntimeServer::spawn("sdk-sqs-standard-invalid").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -227,5 +231,4 @@ async fn sqs_standard_invalid_receipt_handle_surfaces_explicit_error() {
         error.message().is_some_and(|message| message.contains("garbage"))
     );
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

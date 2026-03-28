@@ -8,24 +8,28 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/lambda.rs"]
-mod lambda_fixture;
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::lambda as lambda_fixture;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_iam::Client as IamClient;
 use aws_sdk_lambda::Client as LambdaClient;
 use aws_sdk_lambda::error::ProvideErrorMetadata;
 use aws_sdk_lambda::primitives::Blob;
 use aws_sdk_lambda::types::{FunctionCode, InvocationType, Runtime};
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("lambda_core");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 #[tokio::test]
 async fn lambda_core_function_lifecycle_and_invoke_modes_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-lambda-core").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -175,12 +179,11 @@ async fn lambda_core_function_lifecycle_and_invoke_modes_round_trip() {
     assert_eq!(missing.code(), Some("ResourceNotFoundException"));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn lambda_core_missing_qualifier_surfaces_explicit_error() {
-    let runtime = RuntimeServer::spawn("sdk-lambda-core-missing").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -224,5 +227,4 @@ async fn lambda_core_missing_qualifier_surfaces_explicit_error() {
     );
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

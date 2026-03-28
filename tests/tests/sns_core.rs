@@ -8,16 +8,22 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_sns::Client;
 use aws_sdk_sns::error::ProvideErrorMetadata;
 use aws_sdk_sns::types::Tag;
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("sns_core");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::mpsc;
@@ -92,7 +98,7 @@ impl CaptureHttpServer {
 
 #[tokio::test]
 async fn sns_core_topic_and_subscription_lifecycle_round_trips() {
-    let runtime = RuntimeServer::spawn("sdk-sns-core").await;
+    let runtime = shared_runtime().await;
     let callback = CaptureHttpServer::spawn();
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
@@ -236,12 +242,11 @@ async fn sns_core_topic_and_subscription_lifecycle_round_trips() {
 
     assert!(runtime.state_directory().exists());
     callback.join();
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn sns_core_missing_topic_publish_surfaces_explicit_error() {
-    let runtime = RuntimeServer::spawn("sdk-sns-core-missing").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -260,5 +265,4 @@ async fn sns_core_missing_topic_publish_surfaces_explicit_error() {
     assert_eq!(error.code(), Some("NotFound"));
     assert!(error.message().is_some_and(|message| message.contains("Topic")));
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

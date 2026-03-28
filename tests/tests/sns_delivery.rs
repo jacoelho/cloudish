@@ -8,12 +8,9 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/lambda.rs"]
-mod lambda_fixture;
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::lambda as lambda_fixture;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_iam::Client as IamClient;
 use aws_sdk_lambda::Client as LambdaClient;
@@ -27,8 +24,16 @@ use aws_sdk_sns::types::{
     PublishBatchRequestEntry,
 };
 use aws_sdk_sqs::Client as SqsClient;
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("sns_delivery");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::mpsc;
@@ -111,7 +116,7 @@ impl CaptureHttpServer {
 
 #[tokio::test]
 async fn sns_delivery_fanout_and_filter_policies_across_sqs_lambda_and_http() {
-    let runtime = RuntimeServer::spawn("sdk-sns-delivery").await;
+    let runtime = shared_runtime().await;
     let callback = CaptureHttpServer::spawn(2);
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
@@ -339,12 +344,11 @@ async fn sns_delivery_fanout_and_filter_policies_across_sqs_lambda_and_http() {
 
     assert!(runtime.state_directory().exists());
     callback.join();
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn sns_delivery_publish_batch_reports_partial_failure() {
-    let runtime = RuntimeServer::spawn("sdk-sns-delivery-batch").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -393,7 +397,6 @@ async fn sns_delivery_publish_batch_reports_partial_failure() {
     );
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 async fn wait_for_message(

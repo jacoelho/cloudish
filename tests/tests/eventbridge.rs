@@ -8,16 +8,22 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_eventbridge::Client as EventBridgeClient;
 use aws_sdk_eventbridge::types::{PutEventsRequestEntry, Target};
 use aws_sdk_sqs::Client as SqsClient;
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("eventbridge");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -30,7 +36,7 @@ fn unique_name(prefix: &str) -> String {
 
 #[tokio::test]
 async fn eventbridge_bus_rule_target_and_delivery_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-eventbridge-roundtrip").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -181,12 +187,11 @@ async fn eventbridge_bus_rule_target_and_delivery_round_trip() {
         .send()
         .await
         .expect("event bus should delete");
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn eventbridge_reports_explicit_batch_failures() {
-    let runtime = RuntimeServer::spawn("sdk-eventbridge-failures").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -223,6 +228,4 @@ async fn eventbridge_reports_explicit_batch_failures() {
         Some("ResourceNotFoundException")
     );
     assert!(output.entries()[1].event_id().is_some());
-
-    runtime.shutdown().await;
 }

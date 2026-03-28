@@ -8,16 +8,21 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_iam::Client;
 use aws_sdk_iam::error::ProvideErrorMetadata;
 use aws_sdk_iam::types::{StatusType, Tag};
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("iam_access_keys");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
 
 fn trust_policy() -> &'static str {
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#
@@ -25,7 +30,7 @@ fn trust_policy() -> &'static str {
 
 #[tokio::test]
 async fn iam_access_keys_and_instance_profiles_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-iam-access-keys").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -162,12 +167,11 @@ async fn iam_access_keys_and_instance_profiles_round_trip() {
     );
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn iam_access_keys_limit_and_instance_profile_quota_errors_surface() {
-    let runtime = RuntimeServer::spawn("sdk-iam-access-key-limits").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -242,5 +246,4 @@ async fn iam_access_keys_limit_and_instance_profile_quota_errors_surface() {
     assert_eq!(role_limit.code(), Some("LimitExceeded"));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

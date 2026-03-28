@@ -8,10 +8,8 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-#[path = "common/runtime.rs"]
-mod runtime;
-#[path = "common/sdk.rs"]
-mod sdk;
+use tests::common::runtime;
+use tests::common::sdk;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::ProvideErrorMetadata;
@@ -19,8 +17,16 @@ use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement,
     KeyType, ProvisionedThroughput, ReturnValue, ScalarAttributeType,
 };
-use runtime::RuntimeServer;
+use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+
+static SHARED_RUNTIME: runtime::SharedRuntime =
+    runtime::SharedRuntime::new("dynamodb_core");
+
+async fn shared_runtime() -> SharedRuntimeLease<'static> {
+    SHARED_RUNTIME.acquire().await
+}
+
 use std::collections::HashMap;
 
 fn string(value: &str) -> AttributeValue {
@@ -85,7 +91,7 @@ async fn create_orders_table(client: &Client) {
 
 #[tokio::test]
 async fn dynamodb_core_table_item_and_access_paths_round_trip() {
-    let runtime = RuntimeServer::spawn("sdk-dynamodb-core").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -197,13 +203,12 @@ async fn dynamodb_core_table_item_and_access_paths_round_trip() {
     assert_eq!(throughput.write_capacity_units(), Some(8));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn dynamodb_core_duplicate_table_and_conditional_put_surface_explicit_errors()
  {
-    let runtime = RuntimeServer::spawn("sdk-dynamodb-core-errors").await;
+    let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
         "eu-west-2",
@@ -267,5 +272,4 @@ async fn dynamodb_core_duplicate_table_and_conditional_put_surface_explicit_erro
     assert_eq!(stored.get("total"), Some(&number("10")));
 
     assert!(runtime.state_directory().exists());
-    runtime.shutdown().await;
 }

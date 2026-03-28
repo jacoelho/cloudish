@@ -15,7 +15,7 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder;
 use hyper::client::HttpConnector;
 
-pub(crate) struct SdkSmokeTarget {
+pub struct SdkSmokeTarget {
     access_key_id: String,
     endpoint_url: String,
     region: String,
@@ -23,9 +23,8 @@ pub(crate) struct SdkSmokeTarget {
     session_token: Option<String>,
 }
 
-#[allow(dead_code)]
 impl SdkSmokeTarget {
-    pub(crate) fn new(
+    pub fn new(
         endpoint_url: impl Into<String>,
         region: impl Into<String>,
     ) -> Self {
@@ -38,24 +37,23 @@ impl SdkSmokeTarget {
         }
     }
 
-    pub(crate) fn access_key_id(&self) -> &str {
+    pub fn access_key_id(&self) -> &str {
         &self.access_key_id
     }
 
-    pub(crate) fn endpoint_url(&self) -> &str {
+    pub fn endpoint_url(&self) -> &str {
         &self.endpoint_url
     }
 
-    pub(crate) fn region(&self) -> &str {
+    pub fn region(&self) -> &str {
         &self.region
     }
 
-    pub(crate) fn secret_access_key(&self) -> &str {
+    pub fn secret_access_key(&self) -> &str {
         &self.secret_access_key
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn with_credentials(
+    pub fn with_credentials(
         mut self,
         access_key_id: impl Into<String>,
         secret_access_key: impl Into<String>,
@@ -67,7 +65,7 @@ impl SdkSmokeTarget {
         self
     }
 
-    pub(crate) async fn load(&self) -> SdkConfig {
+    pub async fn load(&self) -> SdkConfig {
         let credentials = Credentials::new(
             self.access_key_id.clone(),
             self.secret_access_key.clone(),
