@@ -43,10 +43,12 @@ pub(crate) fn handle(
 
     let body = match action {
         "AssumeRole" => {
+            let caller =
+                require_authenticated_caller(action, caller.as_ref())?;
             let assumed = sts
                 .assume_role(
                     &scope,
-                    caller.as_ref(),
+                    caller,
                     AssumeRoleInput {
                         duration_seconds: parse_u32(
                             &params,
@@ -158,16 +160,18 @@ pub(crate) fn handle(
         }
         "GetCallerIdentity" => response_with_result(
             action,
-            &caller_identity_xml(
-                &sts.get_caller_identity(&scope, caller.as_ref())
-                    .map_err(|error| error.to_aws_error())?,
-            ),
+            &caller_identity_xml(&sts.get_caller_identity(
+                &scope,
+                require_authenticated_caller(action, caller.as_ref())?,
+            )),
         ),
         "GetFederationToken" => {
+            let caller =
+                require_authenticated_caller(action, caller.as_ref())?;
             let token = sts
                 .get_federation_token(
                     &scope,
-                    caller.as_ref(),
+                    caller,
                     GetFederationTokenInput {
                         duration_seconds: parse_u32(
                             &params,
@@ -190,10 +194,12 @@ pub(crate) fn handle(
             )
         }
         "GetSessionToken" => {
+            let caller =
+                require_authenticated_caller(action, caller.as_ref())?;
             let token = sts
                 .get_session_token(
                     &scope,
-                    caller.as_ref(),
+                    caller,
                     GetSessionTokenInput {
                         duration_seconds: parse_u32(
                             &params,
@@ -208,6 +214,13 @@ pub(crate) fn handle(
     };
 
     Ok(body)
+}
+
+fn require_authenticated_caller<'a>(
+    _action: &str,
+    caller: Option<&'a StsCaller>,
+) -> Result<&'a StsCaller, AwsError> {
+    caller.ok_or_else(missing_authentication_token_error)
 }
 
 fn verified_caller(verified_request: &VerifiedRequest) -> StsCaller {
@@ -370,6 +383,16 @@ fn invalid_action_error(action: &str) -> AwsError {
     )
 }
 
+fn missing_authentication_token_error() -> AwsError {
+    AwsError::trusted_custom(
+        AwsErrorFamily::AccessDenied,
+        "MissingAuthenticationToken",
+        "The request must contain either a valid (registered) AWS access key ID or X.509 certificate.",
+        403,
+        true,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::handle;
@@ -424,9 +447,7 @@ mod tests {
         .expect("context should build")
     }
 
-    #[test]
-    fn sts_query_assume_role_serializes_the_query_response() {
-        let (_, sts) = sts();
+    fn root_verified_request() -> (CallerIdentity, VerifiedRequest) {
         let caller_identity = CallerIdentity::try_new(
             "arn:aws:iam::000000000000:root"
                 .parse::<Arn>()
@@ -443,6 +464,14 @@ mod tests {
             ),
             None,
         );
+
+        (caller_identity, verified_request)
+    }
+
+    #[test]
+    fn sts_query_assume_role_serializes_the_query_response() {
+        let (_, sts) = sts();
+        let (caller_identity, verified_request) = root_verified_request();
 
         let response = handle(
             &sts,
@@ -511,11 +540,12 @@ mod tests {
     #[test]
     fn sts_query_rejects_invalid_role_arn_at_the_adapter_boundary() {
         let (_, sts) = sts();
+        let (caller_identity, verified_request) = root_verified_request();
         let error = handle(
             &sts,
             b"Action=AssumeRole&RoleArn=not-an-arn&RoleSessionName=demo-session",
-            &context("AssumeRole", None),
-            None,
+            &context("AssumeRole", Some(caller_identity)),
+            Some(&verified_request),
         )
         .expect_err("invalid role ARN should fail before reaching STS");
 
@@ -538,5 +568,36 @@ mod tests {
         assert!(response.contains(
             "<DecodedMessage>{&quot;allowed&quot;:false}</DecodedMessage>"
         ));
+    }
+
+    #[test]
+    fn sts_query_requires_authenticated_caller_for_caller_bound_actions() {
+        let (_, sts) = sts();
+
+        for (action, body) in [
+            (
+                "AssumeRole",
+                "Action=AssumeRole&RoleArn=arn%3Aaws%3Aiam%3A%3A000000000000%3Arole%2Fdemo&RoleSessionName=demo-session",
+            ),
+            ("GetCallerIdentity", "Action=GetCallerIdentity"),
+            ("GetSessionToken", "Action=GetSessionToken"),
+            (
+                "GetFederationToken",
+                "Action=GetFederationToken&Name=federated-user",
+            ),
+        ] {
+            let error =
+                handle(&sts, body.as_bytes(), &context(action, None), None)
+                    .expect_err(
+                        "unsigned caller-bound STS actions should fail",
+                    );
+
+            assert_eq!(error.code(), "MissingAuthenticationToken");
+            assert_eq!(error.status_code(), 403);
+            assert_eq!(
+                error.message(),
+                "The request must contain either a valid (registered) AWS access key ID or X.509 certificate."
+            );
+        }
     }
 }

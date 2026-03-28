@@ -1,6 +1,7 @@
 use crate::{StsError, caller::StsCaller, credentials::AssumedRoleUser};
 use aws::{AccountId, Arn, ArnResource, Partition, ServiceName};
 use iam::IamTag;
+use std::fmt::Display;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssumeRoleInput {
@@ -53,11 +54,17 @@ pub(crate) fn assumed_role_identity(
 }
 
 pub(crate) fn access_denied(caller: &StsCaller, role_arn: &Arn) -> StsError {
+    access_denied_for(caller.arn(), "sts:AssumeRole", role_arn)
+}
+
+pub(crate) fn access_denied_for(
+    principal: impl Display,
+    action: &str,
+    role_arn: &Arn,
+) -> StsError {
     StsError::AccessDenied {
         message: format!(
-            "User: {} is not authorized to perform: sts:AssumeRole on resource: {}",
-            caller.arn(),
-            role_arn
+            "User: {principal} is not authorized to perform: {action} on resource: {role_arn}",
         ),
     }
 }

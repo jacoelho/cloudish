@@ -1,7 +1,4 @@
-use crate::StsError;
-use aws::{
-    AccountId, Arn, ArnResource, CallerIdentity, Partition, ServiceName,
-};
+use aws::{AccountId, Arn, CallerIdentity};
 use iam::IamTag;
 use std::collections::BTreeSet;
 
@@ -21,36 +18,6 @@ pub struct StsCaller {
 }
 
 impl StsCaller {
-    pub(crate) fn try_root(account_id: AccountId) -> Result<Self, StsError> {
-        let identity = CallerIdentity::try_new(
-            Arn::new(
-                Partition::aws(),
-                ServiceName::Iam,
-                None,
-                Some(account_id.clone()),
-                ArnResource::Generic("root".to_owned()),
-            )
-            .map_err(|error| StsError::Validation {
-                message: format!(
-                    "failed to construct root caller identity: {error}"
-                ),
-            })?,
-            account_id.to_string(),
-        )
-        .map_err(|error| StsError::Validation {
-            message: format!(
-                "failed to construct root caller identity: {error}"
-            ),
-        })?;
-
-        Ok(Self {
-            identity,
-            account_id,
-            session_tags: Vec::new(),
-            transitive_tag_keys: BTreeSet::new(),
-        })
-    }
-
     pub fn new(
         account_id: AccountId,
         identity: CallerIdentity,

@@ -8,7 +8,9 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
-use crate::assume_role::{access_denied, assumed_role_identity};
+use crate::assume_role::{
+    access_denied, access_denied_for, assumed_role_identity,
+};
 use crate::credentials::{
     SessionIssueInput, StsWorld, find_session_credential, issue_session,
 };
@@ -16,7 +18,7 @@ use crate::federation::{
     default_web_identity_provider, extract_saml_role_session_name,
     federated_user_identity,
 };
-use crate::trust_policy::trust_policy_allows;
+use crate::trust_policy::{TrustAction, TrustPrincipal, trust_policy_allows};
 use crate::validation::{
     ASSUME_ROLE_DURATION, FEDERATION_TOKEN_DURATION, SESSION_TOKEN_DURATION,
     normalize_duration, parse_role_arn, session_state_for_assume_role,
@@ -75,15 +77,14 @@ impl StsService {
     pub fn assume_role(
         &self,
         scope: &IamScope,
-        caller: Option<&StsCaller>,
+        caller: &StsCaller,
         input: AssumeRoleInput,
     ) -> Result<AssumeRoleOutput, StsError> {
-        let caller = Self::caller_or_root(scope, caller)?;
         validate_session_name(&input.role_session_name)?;
         validate_session_tags(
             &input.tags,
             &input.transitive_tag_keys,
-            &caller,
+            caller,
         )?;
 
         let role_ref = parse_role_arn(&input.role_arn)?;
@@ -92,9 +93,13 @@ impl StsService {
         let role = self
             .iam
             .get_role(&role_scope, &role_ref.role_name)
-            .map_err(|_| access_denied(&caller, &input.role_arn))?;
-        if !trust_policy_allows(&role, &caller) {
-            return Err(access_denied(&caller, &input.role_arn));
+            .map_err(|_| access_denied(caller, &input.role_arn))?;
+        if !trust_policy_allows(
+            &role,
+            TrustAction::Role,
+            TrustPrincipal::Aws(caller),
+        ) {
+            return Err(access_denied(caller, &input.role_arn));
         }
 
         let duration_seconds = normalize_duration(
@@ -103,7 +108,7 @@ impl StsService {
         )?;
         let (session_tags, transitive_tag_keys) =
             session_state_for_assume_role(
-                &caller,
+                caller,
                 &input.tags,
                 &input.transitive_tag_keys,
             );
@@ -138,7 +143,8 @@ impl StsService {
     /// # Errors
     ///
     /// Returns `StsError` when the session name, token, role ARN, requested
-    /// duration, or synthetic session identity is invalid.
+    /// duration, trust relationship, or synthetic session identity is
+    /// invalid.
     pub fn assume_role_with_web_identity(
         &self,
         scope: &IamScope,
@@ -154,6 +160,7 @@ impl StsService {
         }
 
         let role_ref = parse_role_arn(&input.role_arn)?;
+        let provider = default_web_identity_provider(input.provider_id);
         let role_scope =
             IamScope::new(role_ref.account_id.clone(), scope.region().clone());
         let role = self
@@ -162,6 +169,20 @@ impl StsService {
             .map_err(|_| StsError::Validation {
                 message: format!("{} is invalid", input.role_arn),
             })?;
+        if !trust_policy_allows(
+            &role,
+            TrustAction::WebIdentity,
+            TrustPrincipal::WebIdentity {
+                provider: &provider,
+                account_id: &role_ref.account_id,
+            },
+        ) {
+            return Err(access_denied_for(
+                &provider,
+                "sts:AssumeRoleWithWebIdentity",
+                &input.role_arn,
+            ));
+        }
         let duration_seconds = normalize_duration(
             input.duration_seconds,
             ASSUME_ROLE_DURATION.with_max(role.max_session_duration),
@@ -190,7 +211,7 @@ impl StsService {
             audience: "sts.amazonaws.com".to_owned(),
             credentials,
             packed_policy_size: 0,
-            provider: default_web_identity_provider(input.provider_id),
+            provider,
             subject_from_web_identity_token: "web-identity-subject".to_owned(),
         })
     }
@@ -200,7 +221,8 @@ impl StsService {
     /// # Errors
     ///
     /// Returns `StsError` when the role ARN, SAML principal ARN, session
-    /// name, requested duration, or synthetic session identity is invalid.
+    /// name, requested duration, trust relationship, or synthetic session
+    /// identity is invalid.
     pub fn assume_role_with_saml(
         &self,
         scope: &IamScope,
@@ -221,6 +243,17 @@ impl StsService {
             .map_err(|_| StsError::Validation {
                 message: format!("{} is invalid", input.role_arn),
             })?;
+        if !trust_policy_allows(
+            &role,
+            TrustAction::Saml,
+            TrustPrincipal::Saml { principal_arn: &input.principal_arn },
+        ) {
+            return Err(access_denied_for(
+                &input.principal_arn,
+                "sts:AssumeRoleWithSAML",
+                &input.role_arn,
+            ));
+        }
         let duration_seconds = normalize_duration(
             input.duration_seconds,
             ASSUME_ROLE_DURATION.with_max(role.max_session_duration),
@@ -256,24 +289,17 @@ impl StsService {
         })
     }
 
-    /// Returns the current caller identity or a synthetic root identity when
-    /// the request is unsigned.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StsError` if Cloudish cannot construct the synthetic root
-    /// caller identity.
+    /// Returns the current authenticated caller identity.
     pub fn get_caller_identity(
         &self,
-        scope: &IamScope,
-        caller: Option<&StsCaller>,
-    ) -> Result<CallerIdentityOutput, StsError> {
-        let caller = Self::caller_or_root(scope, caller)?;
-        Ok(CallerIdentityOutput {
+        _scope: &IamScope,
+        caller: &StsCaller,
+    ) -> CallerIdentityOutput {
+        CallerIdentityOutput {
             account: caller.account_id().clone(),
             arn: caller.arn().clone(),
             user_id: caller.principal_id().to_owned(),
-        })
+        }
     }
 
     /// Issues temporary session credentials for the current caller.
@@ -284,11 +310,10 @@ impl StsService {
     /// session-token bounds or the current time source cannot be represented.
     pub fn get_session_token(
         &self,
-        scope: &IamScope,
-        caller: Option<&StsCaller>,
+        _scope: &IamScope,
+        caller: &StsCaller,
         input: GetSessionTokenInput,
     ) -> Result<SessionCredentials, StsError> {
-        let caller = Self::caller_or_root(scope, caller)?;
         let duration_seconds = normalize_duration(
             input.duration_seconds,
             SESSION_TOKEN_DURATION,
@@ -316,11 +341,10 @@ impl StsService {
     /// is invalid, or when the session expiration cannot be represented.
     pub fn get_federation_token(
         &self,
-        scope: &IamScope,
-        caller: Option<&StsCaller>,
+        _scope: &IamScope,
+        caller: &StsCaller,
         input: GetFederationTokenInput,
     ) -> Result<GetFederationTokenOutput, StsError> {
-        let caller = Self::caller_or_root(scope, caller)?;
         validate_federation_name(&input.name)?;
         let duration_seconds = normalize_duration(
             input.duration_seconds,
@@ -346,16 +370,6 @@ impl StsService {
             federated_user: federated_user.user,
             packed_policy_size: 0,
         })
-    }
-
-    fn caller_or_root(
-        scope: &IamScope,
-        caller: Option<&StsCaller>,
-    ) -> Result<StsCaller, StsError> {
-        caller
-            .cloned()
-            .map(Ok)
-            .unwrap_or_else(|| StsCaller::try_root(scope.account_id().clone()))
     }
 }
 

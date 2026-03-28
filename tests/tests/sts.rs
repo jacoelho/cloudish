@@ -17,6 +17,7 @@ use aws_sdk_sts::error::ProvideErrorMetadata;
 use aws_sdk_sts::types::Tag;
 use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+use test_support::send_http_request;
 
 static SHARED_RUNTIME: runtime::SharedRuntime =
     runtime::SharedRuntime::new("sts");
@@ -28,6 +29,20 @@ async fn shared_runtime() -> SharedRuntimeLease<'static> {
 fn assume_role_policy(account_id: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{account_id}"}},"Action":["sts:AssumeRole","sts:TagSession"]}}]}}"#
+    )
+}
+
+fn federated_role_policy(account_id: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"Version":"2012-10-17","Statement":["#,
+            r#"{{"Effect":"Allow","Principal":{{"AWS":"{account_id}"}},"Action":["sts:AssumeRole","sts:TagSession"]}},"#,
+            r#"{{"Effect":"Allow","Principal":{{"Federated":["accounts.google.com","arn:aws:iam::{account_id}:oidc-provider/accounts.google.com"]}},"#,
+            r#""Action":"sts:AssumeRoleWithWebIdentity"}},"#,
+            r#"{{"Effect":"Allow","Principal":{{"Federated":"arn:aws:iam::{account_id}:saml-provider/example"}},"Action":"sts:AssumeRoleWithSAML"}}"#,
+            r#"]}}"#
+        ),
+        account_id = account_id,
     )
 }
 
@@ -48,6 +63,34 @@ fn session_target(
         credentials.secret_access_key(),
         Some(credentials.session_token()),
     )
+}
+
+fn split_response(response: &str) -> (&str, Vec<(&str, &str)>, &str) {
+    let header_end = response
+        .find("\r\n\r\n")
+        .expect("response should contain header terminator");
+    let headers = &response[..header_end];
+    let mut lines = headers.split("\r\n");
+    let status = lines.next().expect("response should contain a status line");
+    let mut parsed_headers = Vec::new();
+
+    for line in lines {
+        let (name, value) =
+            line.split_once(':').expect("header should contain ':'");
+        parsed_headers.push((name, value.trim()));
+    }
+
+    (status, parsed_headers, &response[header_end + 4..])
+}
+
+fn header_value<'a>(
+    headers: &'a [(&'a str, &'a str)],
+    name: &str,
+) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| *value)
 }
 
 #[tokio::test]
@@ -195,7 +238,7 @@ async fn extended_query_paths_round_trip() {
 
     iam.create_role()
         .role_name("external")
-        .assume_role_policy_document(assume_role_policy("000000000000"))
+        .assume_role_policy_document(federated_role_policy("000000000000"))
         .send()
         .await
         .expect("role should be created");
@@ -265,6 +308,96 @@ async fn extended_query_paths_round_trip() {
         .await
         .expect("decode authorization message should succeed");
     assert_eq!(decoded.decoded_message(), Some(r#"{"reason":"denied"}"#));
+
+    assert!(runtime.state_directory().exists());
+}
+
+#[tokio::test]
+async fn unsigned_caller_bound_actions_require_authentication() {
+    let runtime = shared_runtime().await;
+    let address = runtime.address();
+
+    for body in [
+        "Action=AssumeRole&RoleArn=arn%3Aaws%3Aiam%3A%3A000000000000%3Arole%2Fmissing&RoleSessionName=demo-session",
+        "Action=GetCallerIdentity",
+        "Action=GetSessionToken",
+        "Action=GetFederationToken&Name=federated-demo",
+    ] {
+        let response = tokio::task::spawn_blocking(move || {
+            send_http_request(
+                address,
+                &format!(
+                    "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        })
+        .await
+        .expect("unsigned STS request task should complete")
+        .expect("unsigned STS request should return a response");
+
+        let (status, headers, response_body) = split_response(&response);
+
+        assert_eq!(status, "HTTP/1.1 403 Forbidden");
+        assert_eq!(header_value(&headers, "content-type"), Some("text/xml"));
+        assert!(
+            response_body.contains("<Code>MissingAuthenticationToken</Code>")
+        );
+        assert!(response_body.contains(
+            "<Message>The request must contain either a valid (registered) AWS access key ID or X.509 certificate.</Message>"
+        ));
+    }
+}
+
+#[tokio::test]
+async fn federated_trust_mismatches_fail_with_access_denied() {
+    let runtime = shared_runtime().await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let iam = IamClient::new(&config);
+    let sts = StsClient::new(&config);
+
+    iam.create_role()
+        .role_name("web-denied")
+        .assume_role_policy_document(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"Federated":"accounts.google.com"},"Action":"sts:AssumeRoleWithWebIdentity"}]}"#,
+        )
+        .send()
+        .await
+        .expect("web-denied role should be created");
+
+    iam.create_role()
+        .role_name("saml-mismatch")
+        .assume_role_policy_document(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::000000000000:saml-provider/other"},"Action":"sts:AssumeRoleWithSAML"}]}"#,
+        )
+        .send()
+        .await
+        .expect("saml-mismatch role should be created");
+
+    let web_error = sts
+        .assume_role_with_web_identity()
+        .role_arn("arn:aws:iam::000000000000:role/web-denied")
+        .role_session_name("web-session")
+        .provider_id("accounts.google.com")
+        .web_identity_token("opaque-token")
+        .send()
+        .await
+        .expect_err("denied web identity trust should fail");
+    assert_eq!(web_error.code(), Some("AccessDenied"));
+
+    let saml_error = sts
+        .assume_role_with_saml()
+        .role_arn("arn:aws:iam::000000000000:role/saml-mismatch")
+        .principal_arn("arn:aws:iam::000000000000:saml-provider/example")
+        .saml_assertion(saml_assertion("saml-session"))
+        .send()
+        .await
+        .expect_err("mismatched SAML trust should fail");
+    assert_eq!(saml_error.code(), Some("AccessDenied"));
 
     assert!(runtime.state_directory().exists());
 }
