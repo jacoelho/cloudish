@@ -23,12 +23,13 @@ use services::{
     CompleteMultipartUploadInput, CopyObjectInput, CreateBucketInput,
     CreateMultipartUploadInput, DeleteObjectInput, DeleteObjectOutput,
     GetBucketLocationOutput, GetObjectOutput, HeadObjectOutput,
-    ListBucketsOutput, ListMultipartUploadsOutput, ListObjectVersionsInput,
-    ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, ObjectLegalHoldOutput,
-    ObjectLockMode, ObjectRetention, ObjectTaggingOutput, PutObjectInput,
-    PutObjectLegalHoldInput, PutObjectRetentionInput, S3Error, S3Scope,
-    S3Service, SelectObjectContentOutput, StoredBucketAclInput, TaggingInput,
+    LegalHoldStatus, ListBucketsOutput, ListMultipartUploadsOutput,
+    ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput,
+    ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output,
+    ObjectLegalHoldOutput, ObjectLockMode, ObjectRetention,
+    ObjectTaggingOutput, PutObjectInput, PutObjectLegalHoldInput,
+    PutObjectRetentionInput, S3Error, S3Scope, S3Service,
+    SelectObjectContentOutput, StoredBucketAclInput, TaggingInput,
     UploadPartInput,
 };
 use std::collections::BTreeMap;
@@ -1486,17 +1487,27 @@ fn delete_object_response(output: &DeleteObjectOutput) -> EdgeResponse {
 }
 
 fn head_response(object: HeadObjectOutput) -> EdgeResponse {
-    let metadata = object.metadata.clone();
-    let mut response =
-        EdgeResponse::bytes(200, &object.content_type, Vec::new())
-            .set_header("Content-Length", object.size.to_string())
-            .set_header("ETag", object.etag.clone())
-            .set_header(
-                "Last-Modified",
-                http_timestamp(object.last_modified_epoch_seconds),
-            );
+    let HeadObjectOutput {
+        content_type,
+        etag,
+        last_modified_epoch_seconds,
+        metadata,
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_epoch_seconds,
+        size,
+        version_id,
+        ..
+    } = object;
+    let mut response = EdgeResponse::bytes(200, &content_type, Vec::new())
+        .set_header("Content-Length", size.to_string())
+        .set_header("ETag", etag)
+        .set_header(
+            "Last-Modified",
+            http_timestamp(last_modified_epoch_seconds),
+        );
 
-    if let Some(version_id) = object.version_id.clone() {
+    if let Some(version_id) = version_id {
         response = response.set_header("x-amz-version-id", version_id);
     }
 
@@ -1504,7 +1515,12 @@ fn head_response(object: HeadObjectOutput) -> EdgeResponse {
         response = response.set_header(format!("x-amz-meta-{name}"), value);
     }
 
-    apply_object_lock_headers(response, &object)
+    apply_object_lock_headers(
+        response,
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_epoch_seconds,
+    )
 }
 
 fn s3_edge_target_error(error: S3EdgeRequestTargetError) -> AwsError {
@@ -1641,25 +1657,40 @@ fn not_implemented_error() -> AwsError {
 }
 
 fn object_response(object: GetObjectOutput) -> EdgeResponse {
-    let head = object.head;
-    let mut response =
-        EdgeResponse::bytes(200, &head.content_type, object.body)
-            .set_header("Content-Length", head.size.to_string())
-            .set_header("ETag", head.etag.clone())
-            .set_header(
-                "Last-Modified",
-                http_timestamp(head.last_modified_epoch_seconds),
-            );
+    let HeadObjectOutput {
+        content_type,
+        etag,
+        last_modified_epoch_seconds,
+        metadata,
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_epoch_seconds,
+        size,
+        version_id,
+        ..
+    } = object.head;
+    let mut response = EdgeResponse::bytes(200, &content_type, object.body)
+        .set_header("Content-Length", size.to_string())
+        .set_header("ETag", etag)
+        .set_header(
+            "Last-Modified",
+            http_timestamp(last_modified_epoch_seconds),
+        );
 
-    if let Some(version_id) = head.version_id.clone() {
+    if let Some(version_id) = version_id {
         response = response.set_header("x-amz-version-id", version_id);
     }
 
-    for (name, value) in head.metadata.clone() {
+    for (name, value) in metadata {
         response = response.set_header(format!("x-amz-meta-{name}"), value);
     }
 
-    apply_object_lock_headers(response, &head)
+    apply_object_lock_headers(
+        response,
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_epoch_seconds,
+    )
 }
 
 fn object_xml(
@@ -1915,10 +1946,10 @@ fn parse_object_lock_mode_header(
 
 fn parse_object_lock_legal_hold_header(
     value: &str,
-) -> Result<services::LegalHoldStatus, AwsError> {
+) -> Result<LegalHoldStatus, AwsError> {
     match value.trim() {
-        "ON" => Ok(services::LegalHoldStatus::On),
-        "OFF" => Ok(services::LegalHoldStatus::Off),
+        "ON" => Ok(LegalHoldStatus::On),
+        "OFF" => Ok(LegalHoldStatus::Off),
         _ => Err(S3Error::InvalidArgument {
             code: "InvalidArgument",
             message: "The header `x-amz-object-lock-legal-hold` is not valid."
@@ -2027,18 +2058,20 @@ fn bool_text(value: bool) -> &'static str {
 
 fn apply_object_lock_headers(
     mut response: EdgeResponse,
-    object: &HeadObjectOutput,
+    object_lock_legal_hold_status: Option<LegalHoldStatus>,
+    object_lock_mode: Option<ObjectLockMode>,
+    object_lock_retain_until_epoch_seconds: Option<u64>,
 ) -> EdgeResponse {
-    if let Some(status) = object.object_lock_legal_hold_status {
+    if let Some(status) = object_lock_legal_hold_status {
         response = response
             .set_header("x-amz-object-lock-legal-hold", status.as_str());
     }
-    if let Some(mode) = object.object_lock_mode {
+    if let Some(mode) = object_lock_mode {
         response =
             response.set_header("x-amz-object-lock-mode", mode.as_str());
     }
     if let Some(retain_until_epoch_seconds) =
-        object.object_lock_retain_until_epoch_seconds
+        object_lock_retain_until_epoch_seconds
     {
         response = response.set_header(
             "x-amz-object-lock-retain-until-date",
