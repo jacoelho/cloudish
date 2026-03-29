@@ -998,6 +998,13 @@ impl AwsErrorShape for S3Error {
                 404,
                 true,
             ),
+            Self::WrongRegion { .. } => trusted_aws_error(
+                AwsErrorFamily::Validation,
+                "IncorrectEndpoint",
+                "The specified bucket exists in another Region. Direct requests to the correct endpoint.",
+                400,
+                true,
+            ),
             Self::Buckets(source)
             | Self::MultipartUploads(source)
             | Self::Objects(source)

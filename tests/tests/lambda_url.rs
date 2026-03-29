@@ -116,6 +116,7 @@ async fn lambda_url_control_plane_async_destinations_and_sqs_mapping_round_trip(
     assert_eq!(event["version"], "2.0");
     assert_eq!(event["rawQueryString"], "mode=test");
     assert_eq!(event["cookies"][0], "theme=light");
+    assert_eq!(event["requestContext"]["http"]["sourceIp"], "127.0.0.1");
 
     let failure_queue_name = lambda_fixture::unique_name("lambda-failure");
     let failure_queue = sqs

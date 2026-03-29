@@ -75,12 +75,16 @@ async fn serve_connection(
     router: EdgeRouter,
     max_request_bytes: usize,
 ) {
+    let source_ip =
+        stream.peer_addr().ok().map(|address| address.ip().to_string());
     let io = TokioIo::new(stream);
     let service = service_fn(move |request| {
         let router = router.clone();
+        let source_ip = source_ip.clone();
         async move {
             Ok::<_, Infallible>(
-                handle_request(router, request, max_request_bytes).await,
+                handle_request(router, request, max_request_bytes, source_ip)
+                    .await,
             )
         }
     });
@@ -95,6 +99,7 @@ async fn handle_request(
     router: EdgeRouter,
     request: Request<Incoming>,
     max_request_bytes: usize,
+    source_ip: Option<String>,
 ) -> Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
     let body = match collect_request_body(body, max_request_bytes).await {
@@ -117,7 +122,7 @@ async fn handle_request(
         }
     };
 
-    let request = match edge_request(parts, body) {
+    let request = match edge_request(parts, body, source_ip) {
         Ok(request) => request,
         Err(message) => {
             return json_response(
@@ -156,6 +161,7 @@ async fn collect_request_body(
 fn edge_request(
     parts: hyper::http::request::Parts,
     body: Vec<u8>,
+    source_ip: Option<String>,
 ) -> Result<EdgeRequest, &'static str> {
     let headers = parts
         .headers
@@ -177,7 +183,10 @@ fn edge_request(
         .unwrap_or_else(|| parts.uri.path())
         .to_owned();
 
-    Ok(EdgeRequest::new(parts.method.as_str(), path, headers, body))
+    let mut request =
+        EdgeRequest::new(parts.method.as_str(), path, headers, body);
+    request.set_source_ip(source_ip);
+    Ok(request)
 }
 
 fn edge_response(response: EdgeResponse) -> Response<Full<Bytes>> {

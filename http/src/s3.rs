@@ -10,7 +10,10 @@ use crate::s3_xml::{
 };
 use crate::xml::XmlBuilder;
 use auth::{AwsChunkedMode, VerifiedPayload, VerifiedSignature};
-use aws::{AwsError, AwsErrorFamily};
+use aws::{
+    AdvertisedEdge, AwsError, AwsErrorFamily, S3EdgeRequestTargetError,
+    parse_s3_edge_request_target,
+};
 use aws_smithy_eventstream::frame::write_message_to;
 use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
 use bytes::Bytes;
@@ -35,6 +38,29 @@ use time::format_description::well_known::Rfc3339;
 
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const REQUEST_ID: &str = "0000000000000000";
+
+#[derive(Debug)]
+enum S3RouteError {
+    Aws(AwsError),
+    Response(EdgeResponse),
+}
+
+impl From<AwsError> for S3RouteError {
+    fn from(error: AwsError) -> Self {
+        Self::Aws(error)
+    }
+}
+
+impl From<S3Error> for S3RouteError {
+    fn from(error: S3Error) -> Self {
+        match error {
+            S3Error::WrongRegion { region, .. } => {
+                Self::Response(wrong_region_response(&region))
+            }
+            other => Self::Aws(other.to_aws_error()),
+        }
+    }
+}
 
 pub(crate) fn is_rest_xml_request(request: &HttpRequest<'_>) -> bool {
     let path = request.path_without_query();
@@ -159,8 +185,22 @@ pub(crate) fn handle(
     request: &HttpRequest<'_>,
     scope: &S3Scope,
     s3: &S3Service,
+    advertised_edge: &AdvertisedEdge,
 ) -> Result<EdgeResponse, AwsError> {
-    let target = RequestTarget::parse(request)?;
+    match handle_inner(request, scope, s3, advertised_edge) {
+        Ok(response) => Ok(response),
+        Err(S3RouteError::Aws(error)) => Err(error),
+        Err(S3RouteError::Response(response)) => Ok(response),
+    }
+}
+
+fn handle_inner(
+    request: &HttpRequest<'_>,
+    scope: &S3Scope,
+    s3: &S3Service,
+    advertised_edge: &AdvertisedEdge,
+) -> Result<EdgeResponse, S3RouteError> {
+    let target = RequestTarget::parse(request, advertised_edge)?;
 
     if let Some(response) =
         handle_root_request(request.method(), &target, scope, s3)
@@ -178,7 +218,7 @@ pub(crate) fn handle(
         return Ok(response);
     }
 
-    Err(not_implemented_error())
+    Err(not_implemented_error().into())
 }
 
 fn handle_root_request(
@@ -199,7 +239,7 @@ fn handle_bucket_request(
     target: &RequestTarget,
     scope: &S3Scope,
     s3: &S3Service,
-) -> Result<Option<EdgeResponse>, AwsError> {
+) -> Result<Option<EdgeResponse>, S3RouteError> {
     let Some(bucket) = target.bucket.as_deref() else {
         return Ok(None);
     };
@@ -227,14 +267,13 @@ fn handle_bucket_request(
                         region,
                     },
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
 
             EdgeResponse::bytes(200, "application/xml", Vec::new())
                 .set_header("Location", format!("/{}", created.name))
         }
         "DELETE" => {
-            s3.delete_bucket(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+            s3.delete_bucket(scope, bucket).map_err(S3RouteError::from)?;
             EdgeResponse::bytes(204, "application/xml", Vec::new())
         }
         "GET" if target.query.optional("list-type") == Some("2") => {
@@ -256,7 +295,7 @@ fn handle_bucket_request(
                         ),
                     },
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             list_objects_v2_response(&output)
         }
         "GET" => {
@@ -271,7 +310,7 @@ fn handle_bucket_request(
                         prefix: optional_query(&target.query, "prefix"),
                     },
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             list_objects_response(&output)
         }
         _ => return Ok(None),
@@ -286,7 +325,7 @@ fn handle_bucket_subresource_request(
     scope: &S3Scope,
     s3: &S3Service,
     bucket: &str,
-) -> Result<Option<EdgeResponse>, AwsError> {
+) -> Result<Option<EdgeResponse>, S3RouteError> {
     if target.query.optional("versioning").is_some() {
         return handle_bucket_versioning_request(request, scope, s3, bucket)
             .map(Some);
@@ -328,7 +367,7 @@ fn handle_bucket_subresource_request(
             "GET" => {
                 let uploads = s3
                     .list_multipart_uploads(scope, bucket)
-                    .map_err(|error| error.to_aws_error())?;
+                    .map_err(S3RouteError::from)?;
                 Ok(Some(list_multipart_uploads_response(&uploads)))
             }
             _ => Ok(None),
@@ -349,7 +388,7 @@ fn handle_bucket_subresource_request(
                             prefix: optional_query(&target.query, "prefix"),
                         },
                     )
-                    .map_err(|error| error.to_aws_error())?;
+                    .map_err(S3RouteError::from)?;
                 Ok(Some(list_object_versions_response(&versions)))
             }
             _ => Ok(None),
@@ -360,7 +399,7 @@ fn handle_bucket_subresource_request(
             "GET" => {
                 let location = s3
                     .get_bucket_location(scope, bucket)
-                    .map_err(|error| error.to_aws_error())?;
+                    .map_err(S3RouteError::from)?;
                 Ok(Some(get_bucket_location_response(&location)))
             }
             _ => Ok(None),
@@ -375,7 +414,7 @@ fn handle_object_request(
     target: &RequestTarget,
     scope: &S3Scope,
     s3: &S3Service,
-) -> Result<Option<EdgeResponse>, AwsError> {
+) -> Result<Option<EdgeResponse>, S3RouteError> {
     let (Some(bucket), Some(key)) =
         (target.bucket.as_deref(), target.key.as_deref())
     else {
@@ -402,7 +441,7 @@ fn handle_object_request(
                     source_key,
                 },
             )
-            .map_err(|error| error.to_aws_error())?;
+            .map_err(S3RouteError::from)?;
         return Ok(Some(copy_object_response(
             &copied.etag,
             copied.last_modified_epoch_seconds,
@@ -427,7 +466,7 @@ fn handle_object_request(
                         tags: request_tags(request)?,
                     },
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             let mut response =
                 EdgeResponse::bytes(200, "application/xml", Vec::new())
                     .set_header("ETag", put.etag);
@@ -444,7 +483,7 @@ fn handle_object_request(
                     key,
                     optional_query(&target.query, "versionId").as_deref(),
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             object_response(object)
         }
         "HEAD" => {
@@ -455,7 +494,7 @@ fn handle_object_request(
                     key,
                     optional_query(&target.query, "versionId").as_deref(),
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             head_response(object)
         }
         "DELETE" => {
@@ -472,7 +511,7 @@ fn handle_object_request(
                         version_id: optional_query(&target.query, "versionId"),
                     },
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             delete_object_response(&deleted)
         }
         _ => return Ok(None),
@@ -488,7 +527,7 @@ fn handle_object_subresource_request(
     s3: &S3Service,
     bucket: &str,
     key: &str,
-) -> Result<Option<EdgeResponse>, AwsError> {
+) -> Result<Option<EdgeResponse>, S3RouteError> {
     if target.query.optional("uploads").is_some() {
         return match request.method() {
             "POST" => {
@@ -505,7 +544,7 @@ fn handle_object_subresource_request(
                             tags: request_tags(request)?,
                         },
                     )
-                    .map_err(|error| error.to_aws_error())?;
+                    .map_err(S3RouteError::from)?;
                 Ok(Some(create_multipart_upload_response(
                     bucket,
                     key,
@@ -524,7 +563,7 @@ fn handle_object_subresource_request(
                     key,
                     optional_query(&target.query, "versionId").as_deref(),
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
                 Ok(Some(empty_xml_response(202)))
             }
             _ => Ok(None),
@@ -543,8 +582,10 @@ fn handle_object_subresource_request(
                 )?;
                 let output = s3
                     .select_object_content(scope, input)
-                    .map_err(|error| error.to_aws_error())?;
-                select_object_content_response(&output).map(Some)
+                    .map_err(S3RouteError::from)?;
+                select_object_content_response(&output)
+                    .map(Some)
+                    .map_err(S3RouteError::from)
             }
             _ => Ok(None),
         };
@@ -582,23 +623,23 @@ fn handle_bucket_versioning_request(
     scope: &S3Scope,
     s3: &S3Service,
     bucket: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let status = parse_bucket_versioning(Bytes::copy_from_slice(
                 request.body(),
             ))?;
             s3.put_bucket_versioning(scope, bucket, status)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(200))
         }
         "GET" => {
             let output = s3
                 .get_bucket_versioning(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(bucket_versioning_response(&output))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -607,7 +648,7 @@ fn handle_bucket_notification_request(
     scope: &S3Scope,
     s3: &S3Service,
     bucket: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let configuration = parse_bucket_notification_configuration(
@@ -618,16 +659,16 @@ fn handle_bucket_notification_request(
                 bucket,
                 configuration,
             )
-            .map_err(|error| error.to_aws_error())?;
+            .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(200))
         }
         "GET" => {
             let output = s3
                 .get_bucket_notification_configuration(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(notification_configuration_response(&output))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -636,23 +677,23 @@ fn handle_bucket_object_lock_request(
     scope: &S3Scope,
     s3: &S3Service,
     bucket: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let configuration = parse_object_lock_configuration(
                 Bytes::copy_from_slice(request.body()),
             )?;
             s3.put_object_lock_configuration(scope, bucket, configuration)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(200))
         }
         "GET" => {
             let output = s3
                 .get_object_lock_configuration(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(object_lock_configuration_response(&output))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -661,26 +702,26 @@ fn handle_bucket_tagging_request(
     scope: &S3Scope,
     s3: &S3Service,
     bucket: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let tags = parse_tagging(Bytes::copy_from_slice(request.body()))?;
             s3.put_bucket_tagging(scope, bucket, tags)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(200))
         }
         "GET" => {
             let output = s3
                 .get_bucket_tagging(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(bucket_tagging_response(&output))
         }
         "DELETE" => {
             s3.delete_bucket_tagging(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(204))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -689,18 +730,18 @@ fn handle_bucket_policy_request(
     scope: &S3Scope,
     s3: &S3Service,
     bucket: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let policy = request_body_utf8(request)?;
             s3.put_bucket_policy(scope, bucket, policy)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(204))
         }
         "GET" => {
             let policy = s3
                 .get_bucket_policy(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(EdgeResponse::bytes(
                 200,
                 "application/json",
@@ -709,10 +750,10 @@ fn handle_bucket_policy_request(
         }
         "DELETE" => {
             s3.delete_bucket_policy(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(204))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -721,26 +762,26 @@ fn handle_bucket_cors_request(
     scope: &S3Scope,
     s3: &S3Service,
     bucket: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let body = request_body_utf8(request)?;
             s3.put_bucket_cors(scope, bucket, body)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(200))
         }
         "GET" => {
             let cors = s3
                 .get_bucket_cors(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(EdgeResponse::bytes(200, "application/xml", cors.into_bytes()))
         }
         "DELETE" => {
             s3.delete_bucket_cors(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(204))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -749,18 +790,18 @@ fn handle_bucket_lifecycle_request(
     scope: &S3Scope,
     s3: &S3Service,
     bucket: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let body = request_body_utf8(request)?;
             s3.put_bucket_lifecycle(scope, bucket, body)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(200))
         }
         "GET" => {
             let lifecycle = s3
                 .get_bucket_lifecycle(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(EdgeResponse::bytes(
                 200,
                 "application/xml",
@@ -769,10 +810,10 @@ fn handle_bucket_lifecycle_request(
         }
         "DELETE" => {
             s3.delete_bucket_lifecycle(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(204))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -781,18 +822,18 @@ fn handle_bucket_encryption_request(
     scope: &S3Scope,
     s3: &S3Service,
     bucket: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let body = request_body_utf8(request)?;
             s3.put_bucket_encryption(scope, bucket, body)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(200))
         }
         "GET" => {
             let encryption = s3
                 .get_bucket_encryption(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(EdgeResponse::bytes(
                 200,
                 "application/xml",
@@ -801,10 +842,10 @@ fn handle_bucket_encryption_request(
         }
         "DELETE" => {
             s3.delete_bucket_encryption(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(204))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -813,21 +854,21 @@ fn handle_bucket_acl_request(
     scope: &S3Scope,
     s3: &S3Service,
     bucket: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let acl = parse_bucket_acl(request)?;
             s3.put_bucket_acl(scope, bucket, acl)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(200))
         }
         "GET" => {
             let acl = s3
                 .get_bucket_acl(scope, bucket)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(EdgeResponse::bytes(200, "application/xml", acl.into_bytes()))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -838,7 +879,7 @@ fn handle_multipart_request(
     s3: &S3Service,
     bucket: &str,
     key: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     let upload_id = required_query(&target.query, "uploadId", "uploadId")?;
 
     match request.method() {
@@ -856,7 +897,7 @@ fn handle_multipart_request(
                         upload_id,
                     },
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(complete_multipart_upload_response(
                 bucket,
                 key,
@@ -878,16 +919,16 @@ fn handle_multipart_request(
                         upload_id,
                     },
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(EdgeResponse::bytes(200, "application/xml", Vec::new())
                 .set_header("ETag", uploaded.etag))
         }
         "DELETE" => {
             s3.abort_multipart_upload(scope, bucket, key, &upload_id)
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(204))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -898,7 +939,7 @@ fn handle_object_tagging_request(
     s3: &S3Service,
     bucket: &str,
     key: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let output = s3
@@ -913,7 +954,7 @@ fn handle_object_tagging_request(
                         version_id: optional_query(&target.query, "versionId"),
                     },
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(tagging_write_response(200, &output))
         }
         "GET" => {
@@ -924,7 +965,7 @@ fn handle_object_tagging_request(
                     key,
                     optional_query(&target.query, "versionId").as_deref(),
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(object_tagging_response(&output))
         }
         "DELETE" => {
@@ -935,10 +976,10 @@ fn handle_object_tagging_request(
                     key,
                     optional_query(&target.query, "versionId").as_deref(),
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(tagging_write_response(204, &output))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -949,7 +990,7 @@ fn handle_object_retention_request(
     s3: &S3Service,
     bucket: &str,
     key: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let retention = parse_object_retention(Bytes::copy_from_slice(
@@ -968,7 +1009,7 @@ fn handle_object_retention_request(
                     version_id: optional_query(&target.query, "versionId"),
                 },
             )
-            .map_err(|error| error.to_aws_error())?;
+            .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(200))
         }
         "GET" => {
@@ -979,10 +1020,10 @@ fn handle_object_retention_request(
                     key,
                     optional_query(&target.query, "versionId").as_deref(),
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(object_retention_response(&output))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -993,7 +1034,7 @@ fn handle_object_legal_hold_request(
     s3: &S3Service,
     bucket: &str,
     key: &str,
-) -> Result<EdgeResponse, AwsError> {
+) -> Result<EdgeResponse, S3RouteError> {
     match request.method() {
         "PUT" => {
             let status = parse_object_legal_hold(Bytes::copy_from_slice(
@@ -1008,7 +1049,7 @@ fn handle_object_legal_hold_request(
                     version_id: optional_query(&target.query, "versionId"),
                 },
             )
-            .map_err(|error| error.to_aws_error())?;
+            .map_err(S3RouteError::from)?;
             Ok(empty_xml_response(200))
         }
         "GET" => {
@@ -1019,10 +1060,10 @@ fn handle_object_legal_hold_request(
                     key,
                     optional_query(&target.query, "versionId").as_deref(),
                 )
-                .map_err(|error| error.to_aws_error())?;
+                .map_err(S3RouteError::from)?;
             Ok(object_legal_hold_response(&output))
         }
-        _ => Err(not_implemented_error()),
+        _ => Err(not_implemented_error().into()),
     }
 }
 
@@ -1039,6 +1080,23 @@ pub(crate) fn s3_error_response(error: &AwsError) -> EdgeResponse {
     EdgeResponse::bytes(error.status_code(), "application/xml", body)
 }
 
+fn wrong_region_response(region: &str) -> EdgeResponse {
+    let body = XmlBuilder::new()
+        .start("Error", Some(S3_XMLNS))
+        .elem("Code", "IncorrectEndpoint")
+        .elem(
+            "Message",
+            "The specified bucket exists in another Region. Direct requests to the correct endpoint.",
+        )
+        .elem("RequestId", REQUEST_ID)
+        .end("Error")
+        .build()
+        .into_bytes();
+
+    EdgeResponse::bytes(400, "application/xml", body)
+        .set_header("x-amz-bucket-region", region)
+}
+
 #[derive(Debug)]
 struct RequestTarget {
     bucket: Option<String>,
@@ -1047,41 +1105,25 @@ struct RequestTarget {
 }
 
 impl RequestTarget {
-    fn parse(request: &HttpRequest<'_>) -> Result<Self, AwsError> {
+    fn parse(
+        request: &HttpRequest<'_>,
+        advertised_edge: &AdvertisedEdge,
+    ) -> Result<Self, AwsError> {
         let query = QueryParameters::parse(
             request.query_string().unwrap_or_default().as_bytes(),
         )?;
-        let path = request.path_without_query();
-        let host_bucket =
-            host_bucket_name(request.header("host").unwrap_or_default());
+        let target = parse_s3_edge_request_target(
+            advertised_edge,
+            request.header("host").unwrap_or_default(),
+            request.path_without_query(),
+        )
+        .map_err(s3_edge_target_error)?;
 
-        if let Some(bucket) = host_bucket {
-            let key = path
-                .strip_prefix('/')
-                .unwrap_or(path)
-                .strip_prefix('/')
-                .unwrap_or(path.strip_prefix('/').unwrap_or(path));
-            let key = if key.is_empty() {
-                None
-            } else {
-                Some(percent_decode_path(key)?)
-            };
-
-            return Ok(Self { bucket: Some(bucket), key, query });
-        }
-
-        let path = path.strip_prefix('/').unwrap_or(path);
-        if path.is_empty() {
-            return Ok(Self { bucket: None, key: None, query });
-        }
-
-        let (bucket, key) = match path.split_once('/') {
-            Some((bucket, "")) => (bucket, None),
-            Some((bucket, key)) => (bucket, Some(percent_decode_path(key)?)),
-            None => (path, None),
-        };
-
-        Ok(Self { bucket: Some(percent_decode_path(bucket)?), key, query })
+        Ok(Self {
+            bucket: target.bucket().map(str::to_owned),
+            key: target.key().map(str::to_owned),
+            query,
+        })
     }
 }
 
@@ -1465,13 +1507,11 @@ fn head_response(object: HeadObjectOutput) -> EdgeResponse {
     apply_object_lock_headers(response, &object)
 }
 
-fn host_bucket_name(host: &str) -> Option<String> {
-    let host =
-        host.split_once(':').map(|(value, _)| value).unwrap_or(host).trim();
-
-    host.split_once(".s3.")
-        .map(|(bucket, _)| bucket.to_owned())
-        .filter(|bucket| !bucket.is_empty())
+fn s3_edge_target_error(error: S3EdgeRequestTargetError) -> AwsError {
+    match error {
+        S3EdgeRequestTargetError::InvalidPercentEncoding
+        | S3EdgeRequestTargetError::InvalidUtf8 => malformed_xml_error(),
+    }
 }
 
 fn http_timestamp(epoch_seconds: u64) -> String {
@@ -2134,15 +2174,18 @@ fn percent_decode_tag_component(value: &str) -> Result<String, AwsError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AwsChunkedMode, EdgeRequest, normalize_request};
+    use super::{
+        AwsChunkedMode, EdgeRequest, RequestTarget, normalize_request,
+        wrong_region_response,
+    };
     use auth::{
         AwsChunkedSigningContext, VerifiedPayload, VerifiedRequest,
         VerifiedSignature,
     };
     use aws::{
-        AccountId, Arn, ArnResource, AwsPrincipalType, CallerCredentialKind,
-        CallerIdentity, CredentialScope, Partition, ServiceName,
-        StableAwsPrincipal,
+        AccountId, AdvertisedEdge, Arn, ArnResource, AwsPrincipalType,
+        CallerCredentialKind, CallerIdentity, CredentialScope, Partition,
+        ServiceName, StableAwsPrincipal,
     };
 
     #[test]
@@ -2225,6 +2268,59 @@ mod tests {
             .expect_err("unsigned aws-chunked payloads must fail");
 
         assert_eq!(error.code(), "InvalidRequest");
+    }
+
+    #[test]
+    fn request_target_parse_resolves_path_style_public_host_requests() {
+        let request = EdgeRequest::new(
+            "GET",
+            "/demo/reports/data%20file.txt",
+            vec![("Host".to_owned(), "cloudish.test:4566".to_owned())],
+            Vec::new(),
+        );
+
+        let target = RequestTarget::parse(
+            &request,
+            &AdvertisedEdge::new("http", "cloudish.test", 4566),
+        )
+        .expect("path-style request should parse");
+
+        assert_eq!(target.bucket.as_deref(), Some("demo"));
+        assert_eq!(target.key.as_deref(), Some("reports/data file.txt"));
+    }
+
+    #[test]
+    fn request_target_parse_resolves_virtual_host_public_host_requests() {
+        let request = EdgeRequest::new(
+            "GET",
+            "/reports/data%20file.txt",
+            vec![("Host".to_owned(), "demo.cloudish.test:4566".to_owned())],
+            Vec::new(),
+        );
+
+        let target = RequestTarget::parse(
+            &request,
+            &AdvertisedEdge::new("http", "cloudish.test", 4566),
+        )
+        .expect("virtual-host request should parse");
+
+        assert_eq!(target.bucket.as_deref(), Some("demo"));
+        assert_eq!(target.key.as_deref(), Some("reports/data file.txt"));
+    }
+
+    #[test]
+    fn wrong_region_response_includes_region_header_and_xml_error_body() {
+        let response = wrong_region_response("eu-west-2");
+        let response_text = String::from_utf8(response.to_http_bytes())
+            .expect("response should be UTF-8");
+
+        assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(
+            response_text.contains("x-amz-bucket-region: eu-west-2")
+                || response_text.contains("X-Amz-Bucket-Region: eu-west-2")
+        );
+        assert!(response_text.contains("<Code>IncorrectEndpoint</Code>"));
+        assert!(response_text.contains("another Region"));
     }
 
     fn streaming_verified_signature(

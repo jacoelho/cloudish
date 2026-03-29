@@ -69,7 +69,7 @@ use ssm::{
 
 use aws::{
     AccountId, Arn, IamAccessKeyStatus, KmsAliasName, KmsKeyReference,
-    RegionId,
+    RegionId, parse_s3_edge_request_target,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -2238,19 +2238,22 @@ impl CloudFormationProviderEngine {
                     "TemplateURL {template_url} is not a valid S3 URL"
                 ))
             })?;
-        let (bucket, key) = if host.contains(".s3.") {
-            (
-                host.split('.').next().unwrap_or_default().to_owned(),
-                path.to_owned(),
-            )
-        } else {
-            let (bucket, key) = path.split_once('/').ok_or_else(|| {
-                template_validation_error(format!(
-                    "TemplateURL {template_url} must contain a bucket and object key"
-                ))
-            })?;
-            (bucket.to_owned(), key.to_owned())
-        };
+        let target = parse_s3_edge_request_target(
+            &self.dependencies.advertised_edge.current(),
+            host,
+            &format!("/{path}"),
+        )
+        .map_err(|_| {
+            template_validation_error(format!(
+                "TemplateURL {template_url} is not a valid S3 URL"
+            ))
+        })?;
+        let (bucket, key) = target.into_parts();
+        let (bucket, key) = bucket.zip(key).ok_or_else(|| {
+            template_validation_error(format!(
+                "TemplateURL {template_url} must contain a bucket and object key"
+            ))
+        })?;
         let object = s3
             .get_object(
                 &S3Scope::new(
@@ -2458,7 +2461,7 @@ impl CloudFormationService {
             StoredChangeSet {
                 changes: prepared.changes.clone(),
                 change_set_id: change_set_id.clone(),
-                change_set_name: input.change_set_name.clone(),
+                change_set_name: input.change_set_name,
                 change_set_type,
                 creation_time_epoch_seconds: now,
                 execution_status: "AVAILABLE".to_owned(),
@@ -3632,16 +3635,13 @@ impl CloudFormationProviderEngine {
                 ),
                 &queue_url,
             )?;
-            sqs.set_queue_attributes(&queue, attributes.clone())
+            sqs.set_queue_attributes(&queue, attributes)
                 .map_err(map_sqs_error)?;
             queue
         } else {
             sqs.create_queue(
                 &scope,
-                CreateQueueInput {
-                    attributes: attributes.clone(),
-                    queue_name: queue_name.clone(),
-                },
+                CreateQueueInput { attributes, queue_name },
             )
             .map_err(map_sqs_error)?
         };
@@ -3664,7 +3664,7 @@ impl CloudFormationProviderEngine {
             BTreeMap::from([
                 ("Arn".to_owned(), queue_arn),
                 ("QueueName".to_owned(), queue.queue_name().to_owned()),
-                ("QueueUrl".to_owned(), queue_url.clone()),
+                ("QueueUrl".to_owned(), queue_url),
             ]),
             Value::Object(properties.clone()),
             template_properties.clone(),
@@ -3701,7 +3701,7 @@ impl CloudFormationProviderEngine {
             "AWS::SQS::QueuePolicy",
             id.clone(),
             id.clone(),
-            BTreeMap::from([("Id".to_owned(), id.clone())]),
+            BTreeMap::from([("Id".to_owned(), id)]),
             Value::Object(properties.clone()),
             template_properties.clone(),
         ))
@@ -3817,7 +3817,7 @@ impl CloudFormationProviderEngine {
             "Arn".to_owned(),
             description.table_arn.clone(),
         )]);
-        if let Some(stream_arn) = description.latest_stream_arn.clone() {
+        if let Some(stream_arn) = description.latest_stream_arn {
             attributes.insert("StreamArn".to_owned(), stream_arn);
         }
         Ok(stored_resource(
@@ -4083,7 +4083,7 @@ impl CloudFormationProviderEngine {
                                 .cloned()
                                 .unwrap_or_default(),
                         ),
-                        ("UserName".to_owned(), user_name.clone()),
+                        ("UserName".to_owned(), user_name),
                     ]),
                     last_updated_timestamp_epoch_seconds: 0,
                     logical_resource_id: logical_id.to_owned(),
@@ -4383,7 +4383,7 @@ impl CloudFormationProviderEngine {
             logical_id,
             "AWS::SSM::Parameter",
             name.clone(),
-            name.clone(),
+            name,
             BTreeMap::from([
                 ("Type".to_owned(), parameter_type),
                 ("Value".to_owned(), value),
@@ -4488,7 +4488,7 @@ impl CloudFormationProviderEngine {
             alias_name.clone(),
             BTreeMap::from([
                 ("AliasArn".to_owned(), alias_arn),
-                ("AliasName".to_owned(), alias_name.clone()),
+                ("AliasName".to_owned(), alias_name),
                 ("TargetKeyId".to_owned(), target_key_id),
             ]),
             Value::Object(properties.clone()),
@@ -4606,7 +4606,7 @@ impl CloudFormationProviderEngine {
             arn.clone(),
             arn.clone(),
             BTreeMap::from([
-                ("Arn".to_owned(), arn.clone()),
+                ("Arn".to_owned(), arn),
                 ("Name".to_owned(), name),
             ]),
             Value::Object(properties.clone()),
@@ -6079,8 +6079,11 @@ mod tests {
         CloudFormationStackOperationInput, CloudFormationTemplateParameter,
         ValidateTemplateInput,
     };
-    use crate::CloudFormationSqsPort;
+    use crate::{CloudFormationS3Port, CloudFormationSqsPort};
     use aws::{AccountId, RegionId};
+    use s3::{
+        CreateBucketInput, GetObjectOutput, HeadObjectOutput, S3Error, S3Scope,
+    };
     use serde_json::json;
     use sqs::{
         CreateQueueInput, SqsError, SqsQueueIdentity, SqsScope, SqsService,
@@ -6106,6 +6109,107 @@ mod tests {
                 },
             ),
             sqs,
+        )
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeS3Port {
+        objects: BTreeMap<(String, String), Vec<u8>>,
+    }
+
+    impl FakeS3Port {
+        fn with_object(bucket: &str, key: &str, body: &[u8]) -> Self {
+            Self {
+                objects: BTreeMap::from([(
+                    (bucket.to_owned(), key.to_owned()),
+                    body.to_vec(),
+                )]),
+            }
+        }
+    }
+
+    impl CloudFormationS3Port for FakeS3Port {
+        fn get_object(
+            &self,
+            _scope: &S3Scope,
+            bucket: &str,
+            key: &str,
+            _version_id: Option<&str>,
+        ) -> Result<GetObjectOutput, S3Error> {
+            let body = self
+                .objects
+                .get(&(bucket.to_owned(), key.to_owned()))
+                .cloned()
+                .ok_or_else(|| S3Error::NoSuchKey { key: key.to_owned() })?;
+
+            Ok(GetObjectOutput {
+                body: body.clone(),
+                head: HeadObjectOutput {
+                    content_type: "text/yaml".to_owned(),
+                    delete_marker: false,
+                    etag: "etag".to_owned(),
+                    key: key.to_owned(),
+                    last_modified_epoch_seconds: 0,
+                    metadata: BTreeMap::new(),
+                    object_lock_legal_hold_status: None,
+                    object_lock_mode: None,
+                    object_lock_retain_until_epoch_seconds: None,
+                    size: body.len() as u64,
+                    version_id: None,
+                },
+            })
+        }
+
+        fn create_bucket(
+            &self,
+            _scope: &S3Scope,
+            _input: CreateBucketInput,
+        ) -> Result<(), S3Error> {
+            Ok(())
+        }
+
+        fn delete_bucket(
+            &self,
+            _scope: &S3Scope,
+            _bucket: &str,
+        ) -> Result<(), S3Error> {
+            Ok(())
+        }
+
+        fn put_bucket_policy(
+            &self,
+            _scope: &S3Scope,
+            _bucket: &str,
+            _policy: String,
+        ) -> Result<(), S3Error> {
+            Ok(())
+        }
+
+        fn delete_bucket_policy(
+            &self,
+            _scope: &S3Scope,
+            _bucket: &str,
+        ) -> Result<(), S3Error> {
+            Ok(())
+        }
+    }
+
+    fn s3_provider_service(
+        advertised_edge: aws::SharedAdvertisedEdge,
+    ) -> CloudFormationService {
+        let s3 = FakeS3Port::with_object(
+            "template-bucket",
+            "templates/demo.yaml",
+            b"Resources: {}",
+        );
+
+        CloudFormationService::with_dependencies(
+            Arc::new(std::time::SystemTime::now),
+            CloudFormationDependencies {
+                advertised_edge,
+                s3: Some(Arc::new(s3)),
+                ..CloudFormationDependencies::default()
+            },
         )
     }
 
@@ -6330,6 +6434,48 @@ Resources:
             .expect_err("unsupported intrinsic should fail");
 
         assert!(error.to_string().contains("unsupported intrinsic Fn::Split"));
+    }
+
+    #[test]
+    fn cloudformation_parser_validate_template_source_reads_path_style_urls_from_the_advertised_edge()
+     {
+        let service = s3_provider_service(aws::SharedAdvertisedEdge::new(
+            aws::AdvertisedEdge::new("http", "cloudish.test", 4566),
+        ));
+
+        let output = service
+            .validate_template_source(
+                &scope(),
+                None,
+                Some(
+                    "http://cloudish.test:4566/template-bucket/templates/demo.yaml"
+                        .to_owned(),
+                ),
+            )
+            .expect("TemplateURL should resolve through the advertised edge");
+
+        assert!(output.capabilities.is_empty());
+    }
+
+    #[test]
+    fn cloudformation_parser_validate_template_source_reads_legacy_s3_compatibility_hosts()
+     {
+        let service = s3_provider_service(aws::SharedAdvertisedEdge::new(
+            aws::AdvertisedEdge::new("http", "cloudish.test", 4566),
+        ));
+
+        let output = service
+            .validate_template_source(
+                &scope(),
+                None,
+                Some(
+                    "http://template-bucket.s3.localhost.localstack.cloud/templates/demo.yaml"
+                        .to_owned(),
+                ),
+            )
+            .expect("TemplateURL should resolve through compatibility hosts");
+
+        assert!(output.capabilities.is_empty());
     }
 
     #[test]

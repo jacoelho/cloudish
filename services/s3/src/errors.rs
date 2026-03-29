@@ -58,6 +58,8 @@ pub enum S3Error {
     NoSuchUpload { upload_id: String },
     #[error("version `{version_id}` does not exist")]
     NoSuchVersion { version_id: String },
+    #[error("bucket `{bucket}` is in region `{region}`")]
+    WrongRegion { bucket: String, region: String },
     #[error("multipart metadata store failed: {0}")]
     MultipartUploads(#[source] StorageError),
     #[error("object metadata store failed: {0}")]

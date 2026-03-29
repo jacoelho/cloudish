@@ -7,6 +7,32 @@ pub const AWS_PATH_PREFIX: &str = "/__aws";
 const EXECUTE_API_PREFIX: &str = "/__aws/execute-api/";
 const LAMBDA_URL_PREFIX: &str = "/__aws/lambda-url/";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3EdgeRequestTarget {
+    bucket: Option<String>,
+    key: Option<String>,
+}
+
+impl S3EdgeRequestTarget {
+    pub fn bucket(&self) -> Option<&str> {
+        self.bucket.as_deref()
+    }
+
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    pub fn into_parts(self) -> (Option<String>, Option<String>) {
+        (self.bucket, self.key)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3EdgeRequestTargetError {
+    InvalidPercentEncoding,
+    InvalidUtf8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdvertisedEdge {
     public_host: String,
@@ -251,6 +277,24 @@ pub fn parse_reserved_lambda_function_url_path(
     Some(ReservedLambdaFunctionUrlPath { region, request_path, url_id })
 }
 
+/// # Errors
+///
+/// Returns [`S3EdgeRequestTargetError`] when the request uses an invalid
+/// virtual-host-style key path or when the bucket or key cannot be
+/// percent-decoded into a valid UTF-8 string.
+pub fn parse_s3_edge_request_target(
+    advertised_edge: &AdvertisedEdge,
+    host: &str,
+    path: &str,
+) -> Result<S3EdgeRequestTarget, S3EdgeRequestTargetError> {
+    if let Some(bucket) = s3_virtual_host_bucket(advertised_edge, host) {
+        let key = virtual_host_key(path)?;
+        return Ok(S3EdgeRequestTarget { bucket: Some(bucket), key });
+    }
+
+    path_style_target(path)
+}
+
 fn split_route_identity(remainder: &str) -> (&str, String) {
     match remainder.split_once('/') {
         Some((identity, path)) if !path.is_empty() => {
@@ -269,12 +313,127 @@ fn format_host(host: &str) -> String {
     host.to_owned()
 }
 
+fn path_style_target(
+    path: &str,
+) -> Result<S3EdgeRequestTarget, S3EdgeRequestTargetError> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    if path.is_empty() {
+        return Ok(S3EdgeRequestTarget { bucket: None, key: None });
+    }
+
+    let (bucket, key) = match path.split_once('/') {
+        Some((bucket, "")) => (bucket, None),
+        Some((bucket, key)) => (bucket, Some(percent_decode_path(key)?)),
+        None => (path, None),
+    };
+
+    Ok(S3EdgeRequestTarget { bucket: Some(percent_decode_path(bucket)?), key })
+}
+
+fn virtual_host_key(
+    path: &str,
+) -> Result<Option<String>, S3EdgeRequestTargetError> {
+    let key = path
+        .strip_prefix('/')
+        .unwrap_or(path)
+        .strip_prefix('/')
+        .unwrap_or(path.strip_prefix('/').unwrap_or(path));
+    if key.is_empty() {
+        return Ok(None);
+    }
+
+    percent_decode_path(key).map(Some)
+}
+
+fn s3_virtual_host_bucket(
+    advertised_edge: &AdvertisedEdge,
+    host: &str,
+) -> Option<String> {
+    let normalized_host = normalize_host(host);
+    let public_host = normalize_host(advertised_edge.public_host());
+    let public_host_suffix = format!(".{public_host}");
+
+    normalized_host
+        .strip_suffix(&public_host_suffix)
+        .filter(|bucket| !bucket.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            normalized_host
+                .split_once(".s3.")
+                .map(|(bucket, _)| bucket.to_owned())
+                .filter(|bucket| !bucket.is_empty())
+        })
+}
+
+fn normalize_host(host: &str) -> String {
+    let host = host.trim();
+    if let Some(stripped) = host.strip_prefix('[')
+        && let Some((value, _)) = stripped.split_once(']')
+    {
+        return value.to_ascii_lowercase();
+    }
+
+    host.rsplit_once(':')
+        .filter(|(value, port)| {
+            !value.is_empty()
+                && !value.contains(':')
+                && port.parse::<u16>().is_ok()
+        })
+        .map(|(value, _)| value)
+        .unwrap_or(host)
+        .to_ascii_lowercase()
+}
+
+fn percent_decode_path(
+    value: &str,
+) -> Result<String, S3EdgeRequestTargetError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'%' => {
+                let Some(&high_byte) = bytes.get(index + 1) else {
+                    return Err(
+                        S3EdgeRequestTargetError::InvalidPercentEncoding,
+                    );
+                };
+                let Some(&low_byte) = bytes.get(index + 2) else {
+                    return Err(
+                        S3EdgeRequestTargetError::InvalidPercentEncoding,
+                    );
+                };
+                decoded
+                    .push((hex_value(high_byte)? << 4) | hex_value(low_byte)?);
+                index += 3;
+            }
+            other => {
+                decoded.push(other);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(decoded)
+        .map_err(|_| S3EdgeRequestTargetError::InvalidUtf8)
+}
+
+fn hex_value(byte: u8) -> Result<u8, S3EdgeRequestTargetError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(S3EdgeRequestTargetError::InvalidPercentEncoding),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AWS_PATH_PREFIX, AdvertisedEdge, AdvertisedEdgeTemplate,
         parse_reserved_execute_api_path,
-        parse_reserved_lambda_function_url_path,
+        parse_reserved_lambda_function_url_path, parse_s3_edge_request_target,
     };
 
     #[test]
@@ -338,5 +497,44 @@ mod tests {
     #[test]
     fn aws_path_prefix_is_reserved() {
         assert_eq!(AWS_PATH_PREFIX, "/__aws");
+    }
+
+    #[test]
+    fn parse_s3_edge_request_target_supports_public_host_path_style_urls() {
+        let target = parse_s3_edge_request_target(
+            &AdvertisedEdge::new("http", "cloudish.test", 4566),
+            "cloudish.test:4566",
+            "/demo/reports/data%20file.txt",
+        )
+        .expect("path-style target should parse");
+
+        assert_eq!(target.bucket(), Some("demo"));
+        assert_eq!(target.key(), Some("reports/data file.txt"));
+    }
+
+    #[test]
+    fn parse_s3_edge_request_target_supports_public_host_virtual_hosts() {
+        let target = parse_s3_edge_request_target(
+            &AdvertisedEdge::new("http", "cloudish.test", 4566),
+            "demo.cloudish.test:4566",
+            "/reports/data%20file.txt",
+        )
+        .expect("virtual-host target should parse");
+
+        assert_eq!(target.bucket(), Some("demo"));
+        assert_eq!(target.key(), Some("reports/data file.txt"));
+    }
+
+    #[test]
+    fn parse_s3_edge_request_target_supports_legacy_s3_compatibility_hosts() {
+        let target = parse_s3_edge_request_target(
+            &AdvertisedEdge::new("http", "cloudish.test", 4566),
+            "demo.s3.localhost.localstack.cloud:4566",
+            "/reports/data.txt",
+        )
+        .expect("compatibility target should parse");
+
+        assert_eq!(target.bucket(), Some("demo"));
+        assert_eq!(target.key(), Some("reports/data.txt"));
     }
 }

@@ -1051,7 +1051,7 @@ impl S3Service {
             None,
         )?;
         if source.delete_marker {
-            return Err(S3Error::NoSuchKey { key: input.source_key.clone() });
+            return Err(S3Error::NoSuchKey { key: input.source_key });
         }
 
         let body = self
@@ -1064,16 +1064,19 @@ impl S3Service {
                     input.source_bucket, input.source_key
                 ),
             })?;
+        let content_type = source.content_type;
+        let metadata = source.metadata;
+        let tags = source.tags;
         let copied = self.put_object_inner(
             scope,
             PutObjectInput {
                 body,
                 bucket: input.destination_bucket.clone(),
-                content_type: Some(source.content_type.clone()),
+                content_type: Some(content_type),
                 key: input.destination_key.clone(),
-                metadata: source.metadata.clone(),
+                metadata,
                 object_lock: None,
-                tags: source.tags.clone(),
+                tags,
             },
             None,
         )?;
@@ -2094,7 +2097,8 @@ impl S3Service {
                         input.bucket, input.key
                     ))?
                 );
-                version_id = Some(generated.clone());
+                let generated_version_id = Some(generated);
+                version_id = generated_version_id.clone();
                 let record = ObjectRecord {
                     bucket: input.bucket.clone(),
                     content_type,
@@ -2110,7 +2114,7 @@ impl S3Service {
                         .retain_until_epoch_seconds,
                     size: input.body.len() as u64,
                     tags,
-                    version_id: Some(generated.clone()),
+                    version_id: generated_version_id,
                 };
                 self.blob_store
                     .put(&record.blob_key(), &input.body)
@@ -2383,6 +2387,13 @@ impl S3Service {
                     bucket.name,
                     scope.account_id()
                 ),
+            });
+        }
+
+        if bucket.region != scope.region().as_str() {
+            return Err(S3Error::WrongRegion {
+                bucket: bucket.name,
+                region: bucket.region,
             });
         }
 
@@ -3961,9 +3972,13 @@ mod tests {
     }
 
     fn scope() -> S3Scope {
+        scope_in_region("eu-west-2")
+    }
+
+    fn scope_in_region(region: &str) -> S3Scope {
         S3Scope::new(
             "000000000000".parse::<AccountId>().expect("account should parse"),
-            "eu-west-2".parse::<RegionId>().expect("region should parse"),
+            region.parse::<RegionId>().expect("region should parse"),
         )
     }
 
@@ -4070,6 +4085,24 @@ mod tests {
 
         assert!(matches!(duplicate, S3Error::BucketAlreadyOwnedByYou { .. }));
         assert!(matches!(delete, S3Error::BucketNotEmpty { .. }));
+    }
+
+    #[test]
+    fn s3_core_rejects_bucket_access_from_the_wrong_region() {
+        let service = service(1_710_000_001);
+        let bucket_scope = scope();
+        let wrong_region_scope = scope_in_region("us-east-1");
+        create_bucket(&service, &bucket_scope, "demo");
+
+        let error = service
+            .get_bucket_location(&wrong_region_scope, "demo")
+            .expect_err("wrong-region bucket access should fail");
+
+        assert!(matches!(
+            error,
+            S3Error::WrongRegion { bucket, region }
+                if bucket == "demo" && region == "eu-west-2"
+        ));
     }
 
     #[test]
@@ -4378,10 +4411,10 @@ mod tests {
                     bucket: "demo".to_owned(),
                     key: "large.txt".to_owned(),
                     parts: vec![CompletedMultipartPart {
-                        etag: Some(part.etag.clone()),
+                        etag: Some(part.etag),
                         part_number: 1,
                     }],
-                    upload_id: upload.upload_id.clone(),
+                    upload_id: upload.upload_id,
                 },
             )
             .expect("multipart upload should complete");
@@ -4492,6 +4525,7 @@ mod tests {
             )
             .expect("second part should upload");
 
+        let upload_id = upload.upload_id;
         let wrong_part = service
             .complete_multipart_upload(
                 &scope,
@@ -4499,10 +4533,10 @@ mod tests {
                     bucket: "demo".to_owned(),
                     key: "invalid.txt".to_owned(),
                     parts: vec![CompletedMultipartPart {
-                        etag: Some(first.etag.clone()),
+                        etag: Some(first.etag),
                         part_number: 3,
                     }],
-                    upload_id: upload.upload_id.clone(),
+                    upload_id: upload_id.clone(),
                 },
             )
             .expect_err("missing part should fail");
@@ -4516,7 +4550,7 @@ mod tests {
                         CompletedMultipartPart { etag: None, part_number: 2 },
                         CompletedMultipartPart { etag: None, part_number: 1 },
                     ],
-                    upload_id: upload.upload_id,
+                    upload_id,
                 },
             )
             .expect_err("unordered parts should fail");

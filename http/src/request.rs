@@ -6,6 +6,7 @@ pub struct EdgeRequest {
     path: String,
     headers: Vec<Header>,
     body: Vec<u8>,
+    source_ip: Option<String>,
 }
 
 pub(crate) type HttpRequest<'a> = EdgeRequest;
@@ -25,6 +26,7 @@ impl EdgeRequest {
                 .map(|(name, value)| Header { name, value })
                 .collect(),
             body,
+            source_ip: None,
         }
     }
 
@@ -75,6 +77,7 @@ impl EdgeRequest {
             path: path.to_owned(),
             headers: parsed_headers,
             body: body.to_vec(),
+            source_ip: None,
         })
     }
 
@@ -105,8 +108,21 @@ impl EdgeRequest {
         &self.body
     }
 
+    pub fn source_ip(&self) -> Option<&str> {
+        self.source_ip.as_deref()
+    }
+
     pub fn set_body(&mut self, body: Vec<u8>) {
         self.body = body;
+    }
+
+    pub fn set_source_ip(&mut self, source_ip: Option<String>) {
+        self.source_ip = source_ip;
+    }
+
+    pub fn with_source_ip(mut self, source_ip: impl Into<String>) -> Self {
+        self.source_ip = Some(source_ip.into());
+        self
     }
 
     pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -275,5 +291,23 @@ mod tests {
         assert_eq!(request.header("content-encoding"), Some("gzip"));
         assert_eq!(request.header_values("x-amz-meta-trace"), vec!["abc123"]);
         assert_eq!(request.body(), b"decoded");
+    }
+
+    #[test]
+    fn edge_request_preserves_attached_source_ip_and_defaults_parsed_requests_to_none()
+     {
+        let attached = EdgeRequest::new(
+            "GET",
+            "/",
+            vec![("Host".to_owned(), "localhost".to_owned())],
+            Vec::new(),
+        )
+        .with_source_ip("203.0.113.10");
+        let parsed =
+            EdgeRequest::parse(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .expect("request should parse");
+
+        assert_eq!(attached.source_ip(), Some("203.0.113.10"));
+        assert_eq!(parsed.source_ip(), None);
     }
 }

@@ -177,6 +177,7 @@ async fn apigw_v1_runtime_lambda_proxy_round_trip() {
     assert_eq!(event["headers"]["x-test"], "true");
     assert_eq!(event["queryStringParameters"]["view"], "full");
     assert_eq!(event["requestContext"]["stage"], "dev");
+    assert_eq!(event["requestContext"]["identity"]["sourceIp"], "127.0.0.1");
 
     assert!(runtime.state_directory().exists());
 }

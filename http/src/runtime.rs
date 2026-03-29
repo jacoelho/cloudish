@@ -311,7 +311,7 @@ impl EdgeRouter {
                 path: request_path.to_owned(),
                 protocol: None,
                 query_string: request.query_string().map(str::to_owned),
-                source_ip: None,
+                source_ip: request.source_ip().map(str::to_owned),
                 domain_name: self
                     .advertised_edge
                     .current()
@@ -1197,7 +1197,12 @@ impl EdgeRouter {
                 .unwrap_or_else(|| self.defaults.default_region_id().clone()),
         );
 
-        match s3::handle(&request, &scope, self.runtime.s3()) {
+        match s3::handle(
+            &request,
+            &scope,
+            self.runtime.s3(),
+            &self.advertised_edge.current(),
+        ) {
             Ok(response) => response,
             Err(error) => s3::s3_error_response(&error),
         }
@@ -1523,21 +1528,21 @@ fn cognito_well_known_route(
     if let Some(pool_path) =
         path.strip_suffix("/.well-known/openid-configuration")
     {
-        return pool_path
-            .strip_prefix('/')
-            .filter(|pool_id| !pool_id.is_empty())
-            .map(|pool_id| {
-                (pool_id, CognitoWellKnownDocument::OpenIdConfiguration)
-            });
+        return cognito_pool_id_segment(pool_path).map(|pool_id| {
+            (pool_id, CognitoWellKnownDocument::OpenIdConfiguration)
+        });
     }
     if let Some(pool_path) = path.strip_suffix("/.well-known/jwks.json") {
-        return pool_path
-            .strip_prefix('/')
-            .filter(|pool_id| !pool_id.is_empty())
+        return cognito_pool_id_segment(pool_path)
             .map(|pool_id| (pool_id, CognitoWellKnownDocument::Jwks));
     }
 
     None
+}
+
+fn cognito_pool_id_segment(pool_path: &str) -> Option<&str> {
+    let pool_id = pool_path.strip_prefix('/')?;
+    (!pool_id.is_empty() && !pool_id.contains('/')).then_some(pool_id)
 }
 
 fn parse_function_url_host(host: &str) -> Option<FunctionUrlHost> {
@@ -1608,6 +1613,9 @@ fn build_execute_api_request(
     .with_protocol("HTTP/1.1");
     if let Some(query_string) = request.query_string() {
         execute_request = execute_request.with_query_string(query_string);
+    }
+    if let Some(source_ip) = request.source_ip() {
+        execute_request = execute_request.with_source_ip(source_ip);
     }
     for (name, value) in request.headers() {
         execute_request =
@@ -2133,7 +2141,10 @@ fn smithy_path(path: &str) -> Option<SmithyPath<'_>> {
 
 #[cfg(all(test, feature = "all-services"))]
 mod tests {
-    use super::{AwsJsonErrorBody, EdgeRouter};
+    use super::{
+        AwsJsonErrorBody, CognitoWellKnownDocument, EdgeRouter,
+        cognito_well_known_route,
+    };
     use crate::request::HttpRequest;
     use crate::supported_services;
     use crate::test_runtime;
@@ -4213,6 +4224,33 @@ mod tests {
     }
 
     #[test]
+    fn cognito_well_known_route_requires_exactly_one_leading_pool_id_segment()
+    {
+        assert!(matches!(
+            cognito_well_known_route(
+                "/pool-id/.well-known/openid-configuration"
+            ),
+            Some(("pool-id", CognitoWellKnownDocument::OpenIdConfiguration,))
+        ));
+        assert!(matches!(
+            cognito_well_known_route("/pool-id/.well-known/jwks.json"),
+            Some(("pool-id", CognitoWellKnownDocument::Jwks))
+        ));
+        assert_eq!(
+            cognito_well_known_route("/a/b/.well-known/jwks.json"),
+            None
+        );
+        assert_eq!(
+            cognito_well_known_route("//.well-known/openid-configuration"),
+            None
+        );
+        assert_eq!(
+            cognito_well_known_route("/orders/.well-known/not-cognito.json"),
+            None
+        );
+    }
+
+    #[test]
     fn s3_core_rest_xml_path_style_object_flow_round_trips() {
         let router = router();
 
@@ -4872,8 +4910,9 @@ mod tests {
             Some("2030-01-01T00:00:00Z")
         );
         assert_eq!(get_notification_status, "HTTP/1.1 200 OK");
-        assert!(get_notification_body.contains(&queue_arn.to_string()));
-        assert!(get_notification_body.contains(&topic_arn.to_string()));
+        let topic_arn_text = topic_arn.to_string();
+        assert!(get_notification_body.contains(queue_arn.as_str()));
+        assert!(get_notification_body.contains(&topic_arn_text));
         assert_eq!(get_retention_status, "HTTP/1.1 200 OK");
         assert!(get_retention_body.contains("<Mode>GOVERNANCE</Mode>"));
         assert!(get_retention_body.contains("2030-01-01T00:00:00Z"));

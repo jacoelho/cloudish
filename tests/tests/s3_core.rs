@@ -176,3 +176,47 @@ async fn s3_core_missing_key_and_non_empty_bucket_errors_are_shaped() {
     assert_eq!(missing.code(), Some("NoSuchKey"));
     assert_eq!(non_empty.code(), Some("BucketNotEmpty"));
 }
+
+#[tokio::test]
+async fn s3_core_bucket_requests_from_the_wrong_region_fail_cleanly() {
+    let runtime = shared_runtime().await;
+    let bucket_target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let wrong_region_target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "us-east-1",
+    );
+    let bucket_client = s3_client(&bucket_target).await;
+    let wrong_region_client = s3_client(&wrong_region_target).await;
+
+    bucket_client
+        .create_bucket()
+        .bucket("sdk-s3-wrong-region")
+        .create_bucket_configuration(
+            aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .location_constraint(
+                    aws_sdk_s3::types::BucketLocationConstraint::EuWest2,
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("bucket should be created in eu-west-2");
+
+    let error = wrong_region_client
+        .list_objects_v2()
+        .bucket("sdk-s3-wrong-region")
+        .send()
+        .await
+        .expect_err("wrong-region request should fail");
+
+    assert_eq!(error.code(), Some("IncorrectEndpoint"));
+    assert_eq!(
+        error.message(),
+        Some(
+            "The specified bucket exists in another Region. Direct requests to the correct endpoint."
+        )
+    );
+}
