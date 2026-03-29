@@ -5,7 +5,7 @@ use crate::{
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LockResult, Mutex, RwLock};
@@ -28,6 +28,13 @@ struct WalInner<K: StorageKey, V: StorageValue> {
     state: RwLock<BTreeMap<K, V>>,
     wal_path: PathBuf,
     wal_writer: Mutex<Option<File>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalRecovery {
+    last_valid_offset: u64,
+    replayed: bool,
+    truncated_tail: bool,
 }
 
 impl<K: StorageKey, V: StorageValue> WalStorage<K, V> {
@@ -199,16 +206,24 @@ impl<K: StorageKey, V: StorageValue> WalInner<K, V> {
     fn replay_wal(
         &self,
         state: &mut BTreeMap<K, V>,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<WalRecovery, StorageError> {
         if !self.wal_path.exists() {
-            return Ok(false);
+            return Ok(WalRecovery {
+                last_valid_offset: 0,
+                replayed: false,
+                truncated_tail: false,
+            });
         }
 
         let file = File::open(&self.wal_path).map_err(|source| {
             StorageError::ReadWal { path: self.wal_path.clone(), source }
         })?;
         let mut reader = BufReader::new(file);
-        let mut replayed = false;
+        let mut recovery = WalRecovery {
+            last_valid_offset: 0,
+            replayed: false,
+            truncated_tail: false,
+        };
 
         while let Some(opcode) = read_opcode(&mut reader, &self.wal_path)? {
             if opcode != OP_PUT && opcode != OP_DELETE {
@@ -219,12 +234,18 @@ impl<K: StorageKey, V: StorageValue> WalInner<K, V> {
             }
             let key_len = match read_be_u32(&mut reader, &self.wal_path)? {
                 Some(length) => length as usize,
-                None => break,
+                None => {
+                    recovery.truncated_tail = true;
+                    break;
+                }
             };
             let key_bytes =
                 match read_bytes(&mut reader, &self.wal_path, key_len)? {
                     Some(bytes) => bytes,
-                    None => break,
+                    None => {
+                        recovery.truncated_tail = true;
+                        break;
+                    }
                 };
             let key = decode_cbor(&self.wal_path, &key_bytes)?;
 
@@ -233,7 +254,10 @@ impl<K: StorageKey, V: StorageValue> WalInner<K, V> {
                     let value_len =
                         match read_be_u32(&mut reader, &self.wal_path)? {
                             Some(length) => length as usize,
-                            None => break,
+                            None => {
+                                recovery.truncated_tail = true;
+                                break;
+                            }
                         };
                     let value_bytes = match read_bytes(
                         &mut reader,
@@ -241,15 +265,18 @@ impl<K: StorageKey, V: StorageValue> WalInner<K, V> {
                         value_len,
                     )? {
                         Some(bytes) => bytes,
-                        None => break,
+                        None => {
+                            recovery.truncated_tail = true;
+                            break;
+                        }
                     };
                     let value = decode_cbor(&self.wal_path, &value_bytes)?;
                     state.insert(key, value);
-                    replayed = true;
+                    recovery.replayed = true;
                 }
                 OP_DELETE => {
                     state.remove(&key);
-                    replayed = true;
+                    recovery.replayed = true;
                 }
                 _ => {
                     return Err(StorageError::UnknownWalOp {
@@ -258,9 +285,31 @@ impl<K: StorageKey, V: StorageValue> WalInner<K, V> {
                     });
                 }
             }
+
+            recovery.last_valid_offset =
+                reader.stream_position().map_err(|source| {
+                    StorageError::ReadWal {
+                        path: self.wal_path.clone(),
+                        source,
+                    }
+                })?;
         }
 
-        Ok(replayed)
+        Ok(recovery)
+    }
+
+    fn truncate_wal(&self, length: u64) -> Result<(), StorageError> {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&self.wal_path)
+            .map_err(|source| StorageError::OpenWal {
+                path: self.wal_path.clone(),
+                source,
+            })?;
+        file.set_len(length).map_err(|source| StorageError::TruncateWal {
+            path: self.wal_path.clone(),
+            source,
+        })
     }
 }
 
@@ -312,11 +361,14 @@ impl<K: StorageKey, V: StorageValue> StorageBackend<K, V>
         self.inner.close_writer();
 
         let mut snapshot = load_snapshot(&self.inner.snapshot_path)?;
-        let replayed = self.inner.replay_wal(&mut snapshot)?;
+        let recovery = self.inner.replay_wal(&mut snapshot)?;
+        if recovery.truncated_tail {
+            self.inner.truncate_wal(recovery.last_valid_offset)?;
+        }
         *recover(self.inner.state.write()) = snapshot;
         self.inner
             .current_version
-            .store(u64::from(replayed), Ordering::SeqCst);
+            .store(u64::from(recovery.replayed), Ordering::SeqCst);
         self.inner.compacted_version.store(0, Ordering::SeqCst);
         Ok(())
     }
@@ -328,7 +380,14 @@ impl<K: StorageKey, V: StorageValue> StorageBackend<K, V>
             &BTreeMap::<K, V>::new(),
         )?;
         self.inner.close_writer();
-        let _ = fs::remove_file(&self.inner.wal_path);
+        if let Err(source) = fs::remove_file(&self.inner.wal_path)
+            && source.kind() != io::ErrorKind::NotFound
+        {
+            return Err(StorageError::DeleteWal {
+                path: self.inner.wal_path.clone(),
+                source,
+            });
+        }
         recover(self.inner.state.write()).clear();
         self.inner.current_version.store(0, Ordering::SeqCst);
         self.inner.compacted_version.store(0, Ordering::SeqCst);
@@ -486,6 +545,7 @@ mod tests {
         storage
             .put("good".to_owned(), "entry".to_owned())
             .expect("put should succeed");
+        let good_len = fs::metadata(&wal).expect("wal should exist").len();
         storage
             .put("partial".to_owned(), "entry".to_owned())
             .expect("put should succeed");
@@ -504,6 +564,8 @@ mod tests {
         reloaded.load().expect("load should stop safely");
 
         assert_eq!(reloaded.get(&"good".to_owned()), Some("entry".to_owned()));
+        assert_eq!(fs::metadata(&wal).expect("wal metadata").len(), good_len);
+        assert!(good_len < wal_len);
     }
 
     #[test]
@@ -552,6 +614,39 @@ mod tests {
         );
         reloaded.load().expect("load should succeed");
         assert_eq!(reloaded.get(&"key".to_owned()), Some("value".to_owned()));
+    }
+
+    #[test]
+    fn wal_clear_ignores_missing_wal_files() {
+        let directory = temporary_directory("wal-clear-missing");
+        let snapshot = directory.join("state-snapshot.json");
+        let wal = directory.join("state.wal");
+        let storage = WalStorage::<String, String>::new(
+            &snapshot,
+            &wal,
+            Duration::from_secs(30),
+        );
+
+        storage.clear().expect("clear without a WAL should succeed");
+        assert!(!wal.exists());
+    }
+
+    #[test]
+    fn wal_clear_surfaces_delete_failures() {
+        let directory = temporary_directory("wal-clear-error");
+        let snapshot = directory.join("state-snapshot.json");
+        let wal = directory.join("state.wal");
+        fs::create_dir_all(&wal).expect("wal path should be a directory");
+        let storage = WalStorage::<String, String>::new(
+            &snapshot,
+            &wal,
+            Duration::from_secs(30),
+        );
+
+        let error =
+            storage.clear().expect_err("directory WAL path should fail");
+
+        assert!(matches!(error, StorageError::DeleteWal { .. }));
     }
 
     #[test]

@@ -150,4 +150,84 @@ fn wal_truncation_preserves_prior_state() {
         reloaded.get(&"good".to_owned()),
         Some(StoredRecord { payload: "value".to_owned() })
     );
+    assert_eq!(reloaded.get(&"partial".to_owned()), None);
+    reloaded
+        .put("after".to_owned(), StoredRecord { payload: "next".to_owned() })
+        .expect("post-recovery writes should succeed");
+
+    let final_reload = WalStorage::<String, StoredRecord>::new(
+        &snapshot,
+        &wal,
+        Duration::from_secs(30),
+    );
+    final_reload.load().expect("reload after recovery should succeed");
+    assert_eq!(
+        final_reload.get(&"good".to_owned()),
+        Some(StoredRecord { payload: "value".to_owned() })
+    );
+    assert_eq!(final_reload.get(&"partial".to_owned()), None);
+    assert_eq!(
+        final_reload.get(&"after".to_owned()),
+        Some(StoredRecord { payload: "next".to_owned() })
+    );
+}
+
+#[test]
+fn durable_backends_remain_empty_after_restart_immediately_following_clear() {
+    let directory = temporary_directory("tests-storage-clear-restart");
+    let scheduler = Arc::new(ManualScheduler::new());
+    let persistent_path = directory.join("persistent.json");
+    let hybrid_path = directory.join("hybrid.json");
+    let wal_snapshot = directory.join("wal-snapshot.json");
+    let wal_path = directory.join("state.wal");
+
+    let persistent =
+        PersistentStorage::<String, StoredRecord>::new(&persistent_path);
+    persistent.load().expect("persistent load should succeed");
+    persistent
+        .put("alpha".to_owned(), StoredRecord { payload: "one".to_owned() })
+        .expect("persistent put should succeed");
+    persistent.clear().expect("persistent clear should succeed");
+
+    let hybrid = HybridStorage::<String, StoredRecord>::with_scheduler(
+        &hybrid_path,
+        Duration::from_secs(1),
+        scheduler.clone(),
+    );
+    hybrid.load().expect("hybrid load should succeed");
+    hybrid
+        .put("alpha".to_owned(), StoredRecord { payload: "one".to_owned() })
+        .expect("hybrid put should succeed");
+    hybrid.clear().expect("hybrid clear should succeed");
+
+    let wal = WalStorage::<String, StoredRecord>::with_scheduler(
+        &wal_snapshot,
+        &wal_path,
+        Duration::from_secs(1),
+        scheduler,
+    );
+    wal.load().expect("wal load should succeed");
+    wal.put("alpha".to_owned(), StoredRecord { payload: "one".to_owned() })
+        .expect("wal put should succeed");
+    wal.clear().expect("wal clear should succeed");
+
+    let persistent_reloaded =
+        PersistentStorage::<String, StoredRecord>::new(&persistent_path);
+    persistent_reloaded.load().expect("persistent reload should succeed");
+    assert!(persistent_reloaded.keys().is_empty());
+
+    let hybrid_reloaded = HybridStorage::<String, StoredRecord>::new(
+        &hybrid_path,
+        Duration::from_secs(1),
+    );
+    hybrid_reloaded.load().expect("hybrid reload should succeed");
+    assert!(hybrid_reloaded.keys().is_empty());
+
+    let wal_reloaded = WalStorage::<String, StoredRecord>::new(
+        &wal_snapshot,
+        &wal_path,
+        Duration::from_secs(1),
+    );
+    wal_reloaded.load().expect("wal reload should succeed");
+    assert!(wal_reloaded.keys().is_empty());
 }

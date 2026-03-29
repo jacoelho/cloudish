@@ -149,8 +149,14 @@ impl<K: StorageKey, V: StorageValue> StorageBackend<K, V>
     }
 
     fn clear(&self) -> Result<(), StorageError> {
+        let _flush_guard = recover(self.inner.flush_lock.lock());
+        write_snapshot_atomic(
+            &self.inner.snapshot_path,
+            &BTreeMap::<K, V>::new(),
+        )?;
         recover(self.inner.state.write()).clear();
-        self.mark_mutated();
+        self.inner.current_version.store(0, Ordering::SeqCst);
+        self.inner.persisted_version.store(0, Ordering::SeqCst);
         Ok(())
     }
 
@@ -223,6 +229,31 @@ mod tests {
         );
         reloaded.load().expect("load should succeed");
         assert_eq!(reloaded.get(&"key".to_owned()), Some("value".to_owned()));
+    }
+
+    #[test]
+    fn hybrid_clear_is_restart_safe_without_an_extra_flush() {
+        let directory = temporary_directory("hybrid-clear");
+        let scheduler = Arc::new(ManualScheduler::new());
+        let path = directory.join("store.json");
+        let storage = HybridStorage::<String, String>::with_scheduler(
+            &path,
+            Duration::from_secs(1),
+            scheduler,
+        );
+        storage.load().expect("load should succeed");
+        storage
+            .put("key".to_owned(), "value".to_owned())
+            .expect("put should succeed");
+
+        storage.clear().expect("clear should persist an empty snapshot");
+
+        let reloaded = HybridStorage::<String, String>::new(
+            &path,
+            Duration::from_secs(1),
+        );
+        reloaded.load().expect("load should succeed");
+        assert!(reloaded.keys().is_empty());
     }
 
     #[test]

@@ -1,6 +1,10 @@
 use aws::{RuntimeDefaults, ServiceName};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use storage::StorageError;
+
+type StorageShutdownHook =
+    Arc<dyn Fn() -> Result<(), StorageError> + Send + Sync>;
 
 #[cfg(feature = "apigateway")]
 pub use apigateway::{
@@ -561,6 +565,7 @@ pub struct RuntimeServices {
     sqs: SqsService,
     #[cfg(feature = "ssm")]
     ssm: SsmService,
+    storage_shutdown: Option<StorageShutdownHook>,
     sts: StsService,
     #[cfg(feature = "step-functions")]
     step_functions: StepFunctionsService,
@@ -602,6 +607,7 @@ pub struct RuntimeServicesBuilder {
     pub sqs: SqsService,
     #[cfg(feature = "ssm")]
     pub ssm: SsmService,
+    pub storage_shutdown: Option<StorageShutdownHook>,
     pub sts: StsService,
     #[cfg(feature = "step-functions")]
     pub step_functions: StepFunctionsService,
@@ -651,6 +657,7 @@ impl RuntimeServices {
             sqs: dependencies.sqs,
             #[cfg(feature = "ssm")]
             ssm: dependencies.ssm,
+            storage_shutdown: dependencies.storage_shutdown,
             sts: dependencies.sts,
             #[cfg(feature = "step-functions")]
             step_functions: dependencies.step_functions,
@@ -664,6 +671,9 @@ impl RuntimeServices {
         let _ = self.rds.shutdown();
         #[cfg(feature = "elasticache")]
         let _ = self.elasticache.shutdown();
+        if let Some(storage_shutdown) = &self.storage_shutdown {
+            let _ = storage_shutdown();
+        }
     }
 
     #[cfg(feature = "apigateway")]
@@ -778,6 +788,7 @@ mod tests {
     use aws::ServiceName;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn enabled_services_all_matches_supported_services() {
@@ -836,6 +847,7 @@ mod tests {
             sns: runtime.sns().clone(),
             sqs: runtime.sqs().clone(),
             ssm: runtime.ssm().clone(),
+            storage_shutdown: None,
             sts: runtime.sts().clone(),
             step_functions: runtime.step_functions().clone(),
         }
@@ -892,5 +904,52 @@ mod tests {
             .expect(
                 "eventbridge should accept events through rebuilt runtime",
             );
+    }
+
+    #[test]
+    fn runtime_services_shutdown_runs_storage_hook_once() {
+        let (_, runtime, _) =
+            TestRuntimeBuilder::new("runtime-services-storage-shutdown")
+                .build()
+                .expect("test runtime should build")
+                .into_parts();
+        let shutdown_calls = Arc::new(AtomicUsize::new(0));
+        let shutdown_calls_for_hook = Arc::clone(&shutdown_calls);
+        let rebuilt = RuntimeServicesBuilder {
+            apigateway: runtime.apigateway().clone(),
+            execute_api_executor: Arc::new(
+                ApiGatewayIntegrationExecutor::new(
+                    runtime.lambda().clone(),
+                    None,
+                ),
+            ),
+            cloudformation: runtime.cloudformation().clone(),
+            cloudwatch: runtime.cloudwatch().clone(),
+            cognito: runtime.cognito().clone(),
+            dynamodb: runtime.dynamodb().clone(),
+            elasticache: runtime.elasticache().clone(),
+            eventbridge: runtime.eventbridge().clone(),
+            iam: runtime.iam().clone(),
+            kinesis: runtime.kinesis().clone(),
+            kms: runtime.kms().clone(),
+            lambda: runtime.lambda().clone(),
+            rds: runtime.rds().clone(),
+            s3: runtime.s3().clone(),
+            secrets_manager: runtime.secrets_manager().clone(),
+            sns: runtime.sns().clone(),
+            sqs: runtime.sqs().clone(),
+            ssm: runtime.ssm().clone(),
+            storage_shutdown: Some(Arc::new(move || {
+                shutdown_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), storage::StorageError>(())
+            })),
+            sts: runtime.sts().clone(),
+            step_functions: runtime.step_functions().clone(),
+        }
+        .build();
+
+        rebuilt.shutdown();
+
+        assert_eq!(shutdown_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -50,6 +50,18 @@ pub enum StorageError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to truncate WAL `{path}`: {source}")]
+    TruncateWal {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to delete WAL `{path}`: {source}")]
+    DeleteWal {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("failed to encode WAL entry for `{path}`: {details}")]
     EncodeWal { path: PathBuf, details: String },
     #[error("failed to decode WAL entry from `{path}`: {details}")]

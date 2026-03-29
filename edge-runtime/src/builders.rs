@@ -196,10 +196,10 @@ impl LocalRuntimeBuilder {
         let authenticator = self.authenticator;
         let iam = IamService::new();
         let sts = StsService::new(iam.clone());
-        let factory = StorageFactory::new(StorageConfig::new(
+        let factory = Arc::new(StorageFactory::new(StorageConfig::new(
             defaults.state_directory().join("metadata"),
             StorageMode::Wal,
-        ));
+        )));
 
         #[cfg(feature = "s3")]
         let s3 = S3Service::new(
@@ -344,7 +344,7 @@ impl LocalRuntimeBuilder {
         let cloudformation = CloudFormationService::with_dependencies(
             Arc::new(SystemTime::now),
             CloudFormationDependencies {
-                advertised_edge: advertised_edge.clone(),
+                advertised_edge,
                 dynamodb: Some(Arc::new(dynamodb.clone())),
                 iam: Some(Arc::new(iam.clone())),
                 kms: Some(Arc::new(kms.clone())),
@@ -357,6 +357,10 @@ impl LocalRuntimeBuilder {
             },
         );
         factory.load_all().map_err(RuntimeBuildError::StorageLoad)?;
+        let storage_shutdown_factory = Arc::clone(&factory);
+        let storage_shutdown =
+            Some(Arc::new(move || storage_shutdown_factory.shutdown_all())
+                as Arc<dyn Fn() -> Result<(), StorageError> + Send + Sync>);
         #[cfg(feature = "lambda")]
         let background_tasks = start_lambda_background_tasks(
             lambda.clone(),
@@ -421,6 +425,7 @@ impl LocalRuntimeBuilder {
                 sqs,
                 #[cfg(feature = "ssm")]
                 ssm,
+                storage_shutdown,
                 sts,
                 #[cfg(feature = "step-functions")]
                 step_functions,
@@ -655,7 +660,7 @@ impl TestRuntimeBuilder {
         let cloudformation = CloudFormationService::with_dependencies(
             Arc::new(|| UNIX_EPOCH),
             CloudFormationDependencies {
-                advertised_edge: advertised_edge.clone(),
+                advertised_edge,
                 dynamodb: Some(Arc::new(dynamodb.clone())),
                 iam: Some(Arc::new(iam.clone())),
                 kms: Some(Arc::new(kms.clone())),
@@ -713,6 +718,7 @@ impl TestRuntimeBuilder {
                 sqs,
                 #[cfg(feature = "ssm")]
                 ssm,
+                storage_shutdown: None,
                 sts,
                 #[cfg(feature = "step-functions")]
                 step_functions,
@@ -1101,7 +1107,7 @@ fn hex_value(byte: u8) -> Result<u8, String> {
 #[cfg(all(test, feature = "all-services"))]
 mod tests {
     use super::{LocalRuntimeBuilder, TestRuntimeBuilder};
-    use crate::{EventBridgeScope, S3Scope};
+    use crate::{CreateBucketInput, EventBridgeScope, S3Scope};
     use auth::Authenticator;
     use aws::{RuntimeDefaults, ServiceName};
     use std::fs;
@@ -1203,7 +1209,72 @@ mod tests {
             1
         );
 
+        runtime_services.shutdown();
         drop(background_tasks);
+        fs::remove_dir_all(&state_dir)
+            .expect("state directory should be removable");
+    }
+
+    #[test]
+    fn local_runtime_builder_shutdown_flushes_runtime_owned_storage() {
+        let label = unique_label("local-runtime-builder-shutdown");
+        let state_dir = std::env::temp_dir().join(&label);
+        let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&state_dir)
+            .expect("state directory should be creatable");
+        let defaults = RuntimeDefaults::try_new(
+            Some("000000000000".to_owned()),
+            Some("eu-west-2".to_owned()),
+            Some(state_dir.to_string_lossy().into_owned()),
+        )
+        .expect("runtime defaults should build");
+        let s3_scope = S3Scope::new(
+            "000000000000".parse().expect("account id should parse"),
+            "eu-west-2".parse().expect("region should parse"),
+        );
+        let bucket_name = "runtime-shutdown-bucket";
+        let (_, runtime_services, background_tasks) =
+            LocalRuntimeBuilder::new(
+                defaults.clone(),
+                Authenticator::new(defaults.clone()),
+            )
+            .with_enabled_services([ServiceName::S3])
+            .build()
+            .expect("local runtime should build")
+            .into_parts();
+
+        runtime_services
+            .s3()
+            .create_bucket(
+                &s3_scope,
+                CreateBucketInput {
+                    name: bucket_name.to_owned(),
+                    object_lock_enabled: false,
+                    region: s3_scope.region().clone(),
+                },
+            )
+            .expect("bucket should be created");
+        runtime_services.shutdown();
+        drop(background_tasks);
+
+        let (_, reloaded_runtime, reloaded_background_tasks) =
+            LocalRuntimeBuilder::new(
+                defaults.clone(),
+                Authenticator::new(defaults),
+            )
+            .with_enabled_services([ServiceName::S3])
+            .build()
+            .expect("local runtime should rebuild")
+            .into_parts();
+
+        let buckets = reloaded_runtime.s3().list_buckets(&s3_scope).buckets;
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].name, bucket_name);
+        assert_eq!(buckets[0].owner_account_id, "000000000000");
+        assert_eq!(buckets[0].region, "eu-west-2");
+
+        reloaded_runtime.shutdown();
+        drop(reloaded_background_tasks);
         fs::remove_dir_all(&state_dir)
             .expect("state directory should be removable");
     }
