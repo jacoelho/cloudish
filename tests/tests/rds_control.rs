@@ -17,6 +17,7 @@ use aws_sdk_rds::error::ProvideErrorMetadata;
 use aws_sdk_rds::types::{ApplyMethod, Parameter};
 use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+use test_support::temporary_directory;
 
 static SHARED_RUNTIME: runtime::SharedRuntime =
     runtime::SharedRuntime::new("rds_control");
@@ -261,6 +262,102 @@ async fn clusters_reject_invalid_delete_state() {
         .await
         .expect("cluster should delete");
     rds::wait_for_port_closed(host, port).await;
+}
+
+#[tokio::test]
+async fn runtimes_restore_persisted_rds_instances_after_restart() {
+    let state_directory =
+        temporary_directory("rds-runtime-restore").join("state");
+    let runtime = runtime::RuntimeServer::spawn_with_state_directory(
+        state_directory.clone(),
+    )
+    .await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let client = RdsClient::new(&config);
+    let instance_identifier = rds::unique_name("sdk-rds-restart");
+    let master_password = "PgPassword123!";
+
+    let created = client
+        .create_db_instance()
+        .db_instance_identifier(&instance_identifier)
+        .engine("postgres")
+        .master_username("postgres")
+        .master_user_password(master_password)
+        .db_name("app")
+        .enable_iam_database_authentication(true)
+        .send()
+        .await
+        .expect("instance should create");
+    let endpoint = created
+        .db_instance()
+        .and_then(|instance| instance.endpoint())
+        .expect("created instance should expose an endpoint");
+    let host = endpoint
+        .address()
+        .expect("endpoint should include an address")
+        .to_owned();
+    let port = endpoint.port().expect("endpoint should include a port") as u16;
+
+    assert_eq!(
+        rds::postgres_query_eventually(
+            &host,
+            port,
+            "postgres",
+            master_password,
+            Some("app"),
+        )
+        .await,
+        "1"
+    );
+    assert!(runtime.state_directory().exists());
+    runtime.shutdown().await;
+    rds::wait_for_port_closed(&host, port).await;
+
+    let restored_runtime =
+        runtime::RuntimeServer::spawn_with_state_directory(state_directory)
+            .await;
+    let restored_target = SdkSmokeTarget::new(
+        format!("http://{}", restored_runtime.address()),
+        "eu-west-2",
+    );
+    let restored_config = restored_target.load().await;
+    let restored_client = RdsClient::new(&restored_config);
+    let described = restored_client
+        .describe_db_instances()
+        .db_instance_identifier(&instance_identifier)
+        .send()
+        .await
+        .expect("restored instance should describe");
+    let restored_endpoint = described.db_instances()[0]
+        .endpoint()
+        .expect("restored instance should expose an endpoint");
+
+    assert_eq!(restored_endpoint.address(), Some(host.as_str()));
+    assert_eq!(restored_endpoint.port(), Some(i32::from(port)));
+    assert_eq!(
+        rds::postgres_query_eventually(
+            &host,
+            port,
+            "postgres",
+            master_password,
+            Some("app"),
+        )
+        .await,
+        "1"
+    );
+
+    restored_client
+        .delete_db_instance()
+        .db_instance_identifier(&instance_identifier)
+        .send()
+        .await
+        .expect("restored instance should delete");
+    rds::wait_for_port_closed(&host, port).await;
+    restored_runtime.shutdown().await;
 }
 
 #[tokio::test]

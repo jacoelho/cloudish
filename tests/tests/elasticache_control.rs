@@ -19,6 +19,7 @@ use aws_sdk_elasticache::types::{
 };
 use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+use test_support::temporary_directory;
 
 static SHARED_RUNTIME: runtime::SharedRuntime =
     runtime::SharedRuntime::new("elasticache_control");
@@ -285,4 +286,102 @@ async fn iam_proxy_and_topology_failures_are_explicit() {
         .await
         .expect("replication group should delete");
     elasticache::wait_for_port_closed(&host, port).await;
+}
+
+#[tokio::test]
+async fn runtimes_restore_persisted_elasticache_groups_after_restart() {
+    let state_directory =
+        temporary_directory("elasticache-runtime-restore").join("state");
+    let runtime = runtime::RuntimeServer::spawn_with_state_directory(
+        state_directory.clone(),
+    )
+    .await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let client = ElastiCacheClient::new(&config);
+    let replication_group_id = elasticache::unique_name("sdk-restore-rg");
+    let password = "GroupPass123!";
+
+    let created = client
+        .create_replication_group()
+        .replication_group_id(&replication_group_id)
+        .replication_group_description("demo")
+        .engine("redis")
+        .auth_token(password)
+        .send()
+        .await
+        .expect("replication group should create");
+    let endpoint = created
+        .replication_group()
+        .and_then(|group| group.configuration_endpoint())
+        .expect("replication group should expose an endpoint");
+    let host = endpoint
+        .address()
+        .expect("endpoint should include an address")
+        .to_owned();
+    let port = endpoint.port().expect("endpoint should include a port") as u16;
+
+    assert_eq!(
+        elasticache::redis_set_get(
+            &host,
+            port,
+            None,
+            Some(password),
+            "sdk-restore-key",
+            "sdk-restore-value",
+        )
+        .await
+        .expect("password auth should work before restart"),
+        "sdk-restore-value"
+    );
+    assert!(runtime.state_directory().exists());
+    runtime.shutdown().await;
+    elasticache::wait_for_port_closed(&host, port).await;
+
+    let restored_runtime =
+        runtime::RuntimeServer::spawn_with_state_directory(state_directory)
+            .await;
+    let restored_target = SdkSmokeTarget::new(
+        format!("http://{}", restored_runtime.address()),
+        "eu-west-2",
+    );
+    let restored_config = restored_target.load().await;
+    let restored_client = ElastiCacheClient::new(&restored_config);
+    let described = restored_client
+        .describe_replication_groups()
+        .replication_group_id(&replication_group_id)
+        .send()
+        .await
+        .expect("restored replication group should describe");
+    let restored_endpoint = described.replication_groups()[0]
+        .configuration_endpoint()
+        .expect("restored replication group should expose an endpoint");
+
+    assert_eq!(restored_endpoint.address(), Some(host.as_str()));
+    assert_eq!(restored_endpoint.port(), Some(i32::from(port)));
+    assert_eq!(
+        elasticache::redis_set_get(
+            &host,
+            port,
+            None,
+            Some(password),
+            "sdk-restore-key",
+            "sdk-restore-value-2",
+        )
+        .await
+        .expect("password auth should work after restart"),
+        "sdk-restore-value-2"
+    );
+
+    restored_client
+        .delete_replication_group()
+        .replication_group_id(&replication_group_id)
+        .send()
+        .await
+        .expect("restored replication group should delete");
+    elasticache::wait_for_port_closed(&host, port).await;
+    restored_runtime.shutdown().await;
 }

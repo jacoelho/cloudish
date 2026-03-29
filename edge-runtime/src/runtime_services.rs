@@ -657,6 +657,15 @@ impl RuntimeServices {
         }
     }
 
+    pub fn shutdown(&self) {
+        #[cfg(feature = "eventbridge")]
+        let _ = self.eventbridge.shutdown();
+        #[cfg(feature = "rds")]
+        let _ = self.rds.shutdown();
+        #[cfg(feature = "elasticache")]
+        let _ = self.elasticache.shutdown();
+    }
+
     #[cfg(feature = "apigateway")]
     pub fn apigateway(&self) -> &ApiGatewayService {
         &self.apigateway

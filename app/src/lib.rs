@@ -22,8 +22,12 @@ use aws::{
 };
 #[cfg(feature = "dynamodb")]
 use edge_runtime::DynamoDbInitError;
+#[cfg(feature = "elasticache")]
+use edge_runtime::ElastiCacheError;
 #[cfg(feature = "eventbridge")]
 use edge_runtime::EventBridgeError;
+#[cfg(feature = "rds")]
+use edge_runtime::RdsError;
 #[cfg(feature = "s3")]
 use edge_runtime::S3InitError;
 #[cfg(feature = "lambda")]
@@ -41,7 +45,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use storage::StorageRuntime;
+use storage::{StorageError, StorageRuntime};
 use tokio::net::TcpListener;
 
 pub use hosting::{
@@ -281,14 +285,19 @@ pub enum StartupError {
     },
     #[cfg(feature = "dynamodb")]
     DynamoDbState(DynamoDbInitError),
+    #[cfg(feature = "elasticache")]
+    ElastiCacheRestore(ElastiCacheError),
     #[cfg(feature = "eventbridge")]
-    EventBridgeState(EventBridgeError),
+    EventBridgeRestore(EventBridgeError),
     #[cfg(feature = "lambda")]
     LambdaRuntime(InfrastructureError),
     #[cfg(feature = "lambda")]
     LambdaState(LambdaInitError),
+    #[cfg(feature = "rds")]
+    RdsRestore(RdsError),
     #[cfg(feature = "s3")]
     S3State(S3InitError),
+    StorageLoad(StorageError),
     StateDirectory {
         path: PathBuf,
         source: io::Error,
@@ -324,10 +333,15 @@ impl fmt::Display for StartupError {
             Self::DynamoDbState(source) => {
                 write!(formatter, "failed to load DynamoDB state: {source}")
             }
-            #[cfg(feature = "eventbridge")]
-            Self::EventBridgeState(source) => write!(
+            #[cfg(feature = "elasticache")]
+            Self::ElastiCacheRestore(source) => write!(
                 formatter,
-                "failed to initialize EventBridge runtime: {source}"
+                "failed to restore ElastiCache runtimes: {source}"
+            ),
+            #[cfg(feature = "eventbridge")]
+            Self::EventBridgeRestore(source) => write!(
+                formatter,
+                "failed to restore EventBridge schedules: {source}"
             ),
             #[cfg(feature = "lambda")]
             Self::LambdaRuntime(source) => write!(
@@ -338,10 +352,18 @@ impl fmt::Display for StartupError {
             Self::LambdaState(source) => {
                 write!(formatter, "failed to load Lambda state: {source}")
             }
+            #[cfg(feature = "rds")]
+            Self::RdsRestore(source) => {
+                write!(formatter, "failed to restore RDS runtimes: {source}")
+            }
             #[cfg(feature = "s3")]
             Self::S3State(source) => {
                 write!(formatter, "failed to load S3 state: {source}")
             }
+            Self::StorageLoad(source) => write!(
+                formatter,
+                "failed to load persistent runtime state: {source}"
+            ),
             Self::StateDirectory { path, source } => write!(
                 formatter,
                 "failed to create state directory `{}`: {source}",
@@ -361,13 +383,18 @@ impl Error for StartupError {
             #[cfg(feature = "dynamodb")]
             Self::DynamoDbState(source) => Some(source),
             #[cfg(feature = "eventbridge")]
-            Self::EventBridgeState(source) => Some(source),
+            Self::EventBridgeRestore(source) => Some(source),
+            #[cfg(feature = "elasticache")]
+            Self::ElastiCacheRestore(source) => Some(source),
             #[cfg(feature = "lambda")]
             Self::LambdaRuntime(source) => Some(source),
             #[cfg(feature = "lambda")]
             Self::LambdaState(source) => Some(source),
+            #[cfg(feature = "rds")]
+            Self::RdsRestore(source) => Some(source),
             #[cfg(feature = "s3")]
             Self::S3State(source) => Some(source),
+            Self::StorageLoad(source) => Some(source),
             Self::BuildConfiguration(_) => None,
             Self::Config(source) => Some(source),
             Self::HostingConfig(source) => Some(source),
@@ -385,9 +412,13 @@ impl From<RuntimeBuildError> for StartupError {
             RuntimeBuildError::DynamoDbState(source) => {
                 Self::DynamoDbState(source)
             }
+            #[cfg(feature = "elasticache")]
+            RuntimeBuildError::ElastiCacheRestore(source) => {
+                Self::ElastiCacheRestore(source)
+            }
             #[cfg(feature = "eventbridge")]
-            RuntimeBuildError::EventBridgeState(source) => {
-                Self::EventBridgeState(source)
+            RuntimeBuildError::EventBridgeRestore(source) => {
+                Self::EventBridgeRestore(source)
             }
             #[cfg(feature = "lambda")]
             RuntimeBuildError::LambdaRuntime(source) => {
@@ -397,8 +428,13 @@ impl From<RuntimeBuildError> for StartupError {
             RuntimeBuildError::LambdaState(source) => {
                 Self::LambdaState(source)
             }
+            #[cfg(feature = "rds")]
+            RuntimeBuildError::RdsRestore(source) => Self::RdsRestore(source),
             #[cfg(feature = "s3")]
             RuntimeBuildError::S3State(source) => Self::S3State(source),
+            RuntimeBuildError::StorageLoad(source) => {
+                Self::StorageLoad(source)
+            }
         }
     }
 }

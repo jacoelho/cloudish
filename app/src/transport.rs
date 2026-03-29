@@ -33,11 +33,17 @@ where
             () = &mut shutdown => {
                 connections.abort_all();
                 drain_connection_tasks(&mut connections).await;
+                router.shutdown();
                 return Ok(());
             }
             accepted = listener.accept() => {
-                let (stream, _) =
-                    accepted.map_err(|source| StartupError::Accept { source })?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(source) => {
+                        router.shutdown();
+                        return Err(StartupError::Accept { source });
+                    }
+                };
                 let router = router.clone();
                 connections.spawn(async move {
                     serve_connection(stream, router, max_request_bytes).await;

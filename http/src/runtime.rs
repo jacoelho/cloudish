@@ -114,6 +114,10 @@ impl EdgeRouter {
         Self { advertised_edge, defaults, authenticator, runtime, services }
     }
 
+    pub fn shutdown(&self) {
+        self.runtime.shutdown();
+    }
+
     pub fn handle_bytes(&self, request: &[u8]) -> EdgeResponse {
         match EdgeRequest::parse(request) {
             Ok(request) => self.handle_request(request),

@@ -79,17 +79,12 @@ pub struct EventBridgeServiceDependencies {
 }
 
 impl EventBridgeService {
-    /// Creates a storage-backed `EventBridge` service and restores any persisted
-    /// scheduled rules into the supplied background scheduler.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when persisted scheduled rules cannot be restored.
+    /// Creates a storage-backed `EventBridge` service.
     pub fn new(
         factory: &StorageFactory,
         dependencies: EventBridgeServiceDependencies,
-    ) -> Result<Self, EventBridgeError> {
-        let service = Self {
+    ) -> Self {
+        Self {
             bus_store: factory.create("eventbridge", "buses"),
             clock: dependencies.clock,
             dispatcher: dispatcher(dependencies.dispatcher),
@@ -98,10 +93,45 @@ impl EventBridgeService {
             rule_store: factory.create("eventbridge", "rules"),
             scheduled_rules: Arc::default(),
             scheduler: dependencies.scheduler,
-        };
-        service.restore_schedules()?;
+        }
+    }
 
-        Ok(service)
+    /// Restores persisted scheduled rules into the configured background
+    /// scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persisted scheduled rules cannot be restored.
+    pub fn restore_schedules(&self) -> Result<(), EventBridgeError> {
+        for key in self.rule_store.keys() {
+            let Some(rule) = self.rule_store.get(&key) else {
+                continue;
+            };
+            self.sync_rule_schedule(&key, &rule)?;
+        }
+
+        Ok(())
+    }
+
+    /// Cancels any active scheduled-rule handles owned by this service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a scheduled-rule handle cannot be cancelled.
+    pub fn shutdown(&self) -> Result<(), EventBridgeError> {
+        let rule_arns = self
+            .scheduled_rules
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for rule_arn in rule_arns {
+            self.cancel_rule_schedule(&rule_arn)?;
+        }
+
+        Ok(())
     }
 
     /// # Errors
@@ -652,17 +682,6 @@ impl EventBridgeService {
         })
     }
 
-    fn restore_schedules(&self) -> Result<(), EventBridgeError> {
-        for key in self.rule_store.keys() {
-            let Some(rule) = self.rule_store.get(&key) else {
-                continue;
-            };
-            self.sync_rule_schedule(&key, &rule)?;
-        }
-
-        Ok(())
-    }
-
     fn sync_rule_schedule(
         &self,
         key: &EventBridgeRuleKey,
@@ -824,9 +843,12 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use storage::{StorageConfig, StorageFactory, StorageMode};
+
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug, Default)]
     struct FixedClock;
@@ -888,10 +910,19 @@ mod tests {
 
     #[derive(Default)]
     struct ManualScheduler {
-        tasks: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
+        tasks: Mutex<Vec<ScheduledTask>>,
     }
 
     impl ManualScheduler {
+        fn active_task_count(&self) -> usize {
+            self.tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|task| task.active.load(Ordering::Relaxed))
+                .count()
+        }
+
         fn run_pending(&self) {
             let tasks = self
                 .tasks
@@ -899,7 +930,9 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
             for task in tasks {
-                task();
+                if task.active.load(Ordering::Relaxed) {
+                    (task.run)();
+                }
             }
         }
     }
@@ -912,18 +945,28 @@ mod tests {
             task: Arc<dyn Fn() + Send + Sync>,
         ) -> Result<Box<dyn ScheduledTaskHandle>, InfrastructureError>
         {
+            let active = Arc::new(AtomicBool::new(true));
             self.tasks
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(task);
-            Ok(Box::new(NoopHandle))
+                .push(ScheduledTask { active: active.clone(), run: task });
+            Ok(Box::new(NoopHandle { active }))
         }
     }
 
-    struct NoopHandle;
+    #[derive(Clone)]
+    struct ScheduledTask {
+        active: Arc<AtomicBool>,
+        run: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    struct NoopHandle {
+        active: Arc<AtomicBool>,
+    }
 
     impl ScheduledTaskHandle for NoopHandle {
         fn cancel(&self) -> Result<(), InfrastructureError> {
+            self.active.store(false, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -942,6 +985,17 @@ mod tests {
         ))
     }
 
+    fn persistent_factory(path: &std::path::Path) -> StorageFactory {
+        std::fs::create_dir_all(path)
+            .expect("persistent EventBridge state directory should exist");
+        StorageFactory::new(StorageConfig::new(path, StorageMode::Persistent))
+    }
+
+    fn unique_label(prefix: &str) -> String {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{id}")
+    }
+
     fn service(
         label: &str,
     ) -> (EventBridgeService, Arc<RecordingDispatcher>, Arc<ManualScheduler>)
@@ -955,8 +1009,7 @@ mod tests {
                 dispatcher: dispatcher.clone(),
                 scheduler: scheduler.clone(),
             },
-        )
-        .expect("service should build");
+        );
 
         (service, dispatcher, scheduler)
     }
@@ -1148,6 +1201,80 @@ mod tests {
         assert_eq!(dispatcher.delivery_count(), 1);
         assert_eq!(
             dispatcher.run_payloads(),
+            vec!["{\"kind\":\"scheduled\"}"]
+        );
+    }
+
+    #[test]
+    fn restore_schedules_replays_persisted_rules_without_duplicate_tasks() {
+        let root =
+            std::env::temp_dir().join(unique_label("eventbridge-restore"));
+        let dispatcher = Arc::new(RecordingDispatcher::default());
+        let first_scheduler = Arc::new(ManualScheduler::default());
+        let first_service = EventBridgeService::new(
+            &persistent_factory(&root),
+            EventBridgeServiceDependencies {
+                clock: Arc::new(FixedClock),
+                dispatcher: dispatcher.clone(),
+                scheduler: first_scheduler,
+            },
+        );
+        let scope = scope();
+
+        first_service
+            .put_rule(
+                &scope,
+                PutRuleInput {
+                    description: None,
+                    event_bus_name: None,
+                    event_pattern: None,
+                    name: "nightly".to_owned(),
+                    role_arn: None,
+                    schedule_expression: Some("rate(1 minute)".to_owned()),
+                    state: None,
+                },
+            )
+            .expect("scheduled rule should create");
+        first_service
+            .put_targets(
+                &scope,
+                PutTargetsInput {
+                    event_bus_name: None,
+                    rule: "nightly".to_owned(),
+                    targets: vec![EventBridgeTarget {
+                        input: Some("{\"kind\":\"scheduled\"}".to_owned()),
+                        ..lambda_target("processor")
+                    }],
+                },
+            )
+            .expect("target should store");
+
+        let restored_dispatcher = Arc::new(RecordingDispatcher::default());
+        let restored_scheduler = Arc::new(ManualScheduler::default());
+        let restored_service = EventBridgeService::new(
+            &persistent_factory(&root),
+            EventBridgeServiceDependencies {
+                clock: Arc::new(FixedClock),
+                dispatcher: restored_dispatcher.clone(),
+                scheduler: restored_scheduler.clone(),
+            },
+        );
+        restored_service.rule_store.load().expect("rule state should load");
+
+        restored_service
+            .restore_schedules()
+            .expect("schedule restore should succeed");
+        restored_service
+            .restore_schedules()
+            .expect("schedule restore should remain idempotent");
+
+        assert_eq!(restored_scheduler.active_task_count(), 1);
+
+        restored_scheduler.run_pending();
+
+        assert_eq!(restored_dispatcher.delivery_count(), 1);
+        assert_eq!(
+            restored_dispatcher.run_payloads(),
             vec!["{\"kind\":\"scheduled\"}"]
         );
     }

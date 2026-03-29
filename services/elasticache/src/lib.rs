@@ -90,6 +90,61 @@ impl ElastiCacheService {
         }
     }
 
+    /// Restores persisted backend and proxy runtimes for every loaded
+    /// replication group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a persisted backend or proxy cannot be restarted.
+    pub fn restore_runtimes(&self) -> Result<(), ElastiCacheError> {
+        let mut restored_groups = Vec::new();
+
+        for state_key in self.state_store.keys() {
+            let scope = ElastiCacheScope::new(
+                state_key.account_id.clone(),
+                state_key.region.clone(),
+            );
+            let state = self.load_state(&scope);
+            match self.restore_scope_runtimes(&scope, &state) {
+                Ok(groups) => restored_groups.extend(groups),
+                Err(error) => {
+                    self.stop_restored_runtimes(restored_groups);
+                    return Err(error);
+                }
+            }
+        }
+
+        let mut runtime = self.lock_runtime();
+        if !runtime.groups.is_empty() {
+            drop(runtime);
+            self.stop_restored_runtimes(restored_groups);
+            return Err(ElastiCacheError::internal(
+                "ElastiCache runtime restore requires an empty runtime state.",
+            ));
+        }
+        runtime.groups.extend(restored_groups);
+
+        Ok(())
+    }
+
+    /// Stops every active backend and proxy owned by this service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a backend or proxy cannot be stopped cleanly.
+    pub fn shutdown(&self) -> Result<(), ElastiCacheError> {
+        let groups = {
+            let mut runtime = self.lock_runtime();
+            std::mem::take(&mut runtime.groups)
+        };
+
+        for (_, runtime) in groups {
+            runtime.stop()?;
+        }
+
+        Ok(())
+    }
+
     /// # Errors
     ///
     /// Returns validation, conflict, runtime-start, or persistence errors when
@@ -144,6 +199,7 @@ impl ElastiCacheService {
             &replication_group_id,
             engine,
             auth_mode,
+            None,
             Arc::new(self.clone()),
         )?;
         let group = StoredReplicationGroup {
@@ -404,6 +460,57 @@ impl ElastiCacheService {
     ) -> std::sync::MutexGuard<'_, ElastiCacheRuntimeState> {
         recover(self.runtime_state.lock())
     }
+
+    fn restore_scope_runtimes(
+        &self,
+        scope: &ElastiCacheScope,
+        state: &StoredElastiCacheState,
+    ) -> Result<
+        Vec<(ReplicationGroupRuntimeKey, ReplicationGroupRuntime)>,
+        ElastiCacheError,
+    > {
+        let mut restored_groups = Vec::new();
+
+        for group in state.groups.values().cloned() {
+            let started = match start_runtime(
+                &self.node_runtime,
+                &self.proxy_runtime,
+                scope,
+                &group.replication_group_id,
+                group.engine,
+                group.auth_mode,
+                Some(group.endpoint.port),
+                Arc::new(self.clone()),
+            ) {
+                Ok(started) => started,
+                Err(error) => {
+                    self.stop_restored_runtimes(restored_groups);
+                    return Err(error);
+                }
+            };
+            restored_groups.push((
+                ReplicationGroupRuntimeKey::new(
+                    scope,
+                    &group.replication_group_id,
+                ),
+                ReplicationGroupRuntime::new(started.backend, started.proxy),
+            ));
+        }
+
+        Ok(restored_groups)
+    }
+
+    fn stop_restored_runtimes(
+        &self,
+        restored_groups: Vec<(
+            ReplicationGroupRuntimeKey,
+            ReplicationGroupRuntime,
+        )>,
+    ) {
+        for (_, runtime) in restored_groups {
+            let _ = runtime.stop();
+        }
+    }
 }
 
 impl ElastiCacheConnectionAuthenticator for ElastiCacheService {
@@ -627,7 +734,11 @@ mod tests {
                     io::Error::other("boom"),
                 ));
             }
-            let port = self.next_port.fetch_add(1, Ordering::Relaxed);
+            let port = if spec.listen_endpoint().port() == 0 {
+                self.next_port.fetch_add(1, Ordering::Relaxed)
+            } else {
+                spec.listen_endpoint().port()
+            };
             recover(self.started.lock()).push((
                 spec.replication_group_id().to_owned(),
                 port,
@@ -813,6 +924,32 @@ mod tests {
                     now: UNIX_EPOCH + Duration::from_secs(42),
                 }),
                 iam_token_validator,
+                node_runtime,
+                proxy_runtime,
+            },
+        )
+    }
+
+    fn persistent_service(
+        directory: std::path::PathBuf,
+        node_runtime: Arc<dyn ElastiCacheNodeRuntime + Send + Sync>,
+        proxy_runtime: Arc<dyn ElastiCacheProxyRuntime + Send + Sync>,
+    ) -> ElastiCacheService {
+        std::fs::create_dir_all(&directory)
+            .expect("persistent ElastiCache state directory should exist");
+
+        ElastiCacheService::new(
+            &StorageFactory::new(StorageConfig::new(
+                directory,
+                StorageMode::Persistent,
+            )),
+            ElastiCacheServiceDependencies {
+                clock: Arc::new(StaticClock {
+                    now: UNIX_EPOCH + Duration::from_secs(42),
+                }),
+                iam_token_validator: Arc::new(
+                    RejectAllElastiCacheIamTokenValidator,
+                ),
                 node_runtime,
                 proxy_runtime,
             },
@@ -1118,6 +1255,81 @@ mod tests {
             .expect_err("missing groups should fail");
         assert_eq!(not_found.code(), "ReplicationGroupNotFoundFault");
         assert_eq!(not_found.status_code(), 404);
+
+        let persistent_directory = std::env::temp_dir().join(format!(
+            "cloudish-elasticache-restore-{}",
+            std::process::id()
+        ));
+        if persistent_directory.exists() {
+            let _ = std::fs::remove_dir_all(&persistent_directory);
+        }
+        let created_service = persistent_service(
+            persistent_directory.clone(),
+            Arc::new(FakeNodeRuntime::with_port(7_100)),
+            Arc::new(FakeProxyRuntime::with_port(8_100)),
+        );
+        let created_group = created_service
+            .create_replication_group(
+                &scope(),
+                CreateReplicationGroupInput {
+                    auth_token: Some("secret".to_owned()),
+                    cluster_mode: None,
+                    engine: Some("redis".to_owned()),
+                    engine_version: None,
+                    multi_az_enabled: None,
+                    num_cache_clusters: None,
+                    num_node_groups: None,
+                    replicas_per_node_group: None,
+                    replication_group_description: "demo".to_owned(),
+                    replication_group_id: replication_group_id(
+                        "cache-restore",
+                    ),
+                    transit_encryption_enabled: None,
+                    has_node_group_configuration: false,
+                },
+            )
+            .expect("replication group should create");
+        let restored_node_runtime =
+            Arc::new(FakeNodeRuntime::with_port(7_200));
+        let restored_proxy_runtime =
+            Arc::new(FakeProxyRuntime::with_port(8_200));
+        let restored_service = persistent_service(
+            persistent_directory,
+            restored_node_runtime.clone(),
+            restored_proxy_runtime.clone(),
+        );
+        restored_service
+            .state_store
+            .load()
+            .expect("ElastiCache state should load");
+        restored_service
+            .restore_runtimes()
+            .expect("ElastiCache runtimes should restore");
+        assert_eq!(
+            restored_service
+                .describe_replication_groups(
+                    &scope(),
+                    Some(&replication_group_id("cache-restore")),
+                )
+                .expect("replication group should describe")[0]
+                .configuration_endpoint
+                .port,
+            created_group.configuration_endpoint.port
+        );
+        assert_eq!(
+            recover(restored_node_runtime.started.lock()).clone(),
+            vec![(replication_group_id("cache-restore"), 7_200)]
+        );
+        assert_eq!(
+            recover(restored_proxy_runtime.started.lock()).clone(),
+            vec![(
+                replication_group_id("cache-restore"),
+                created_group.configuration_endpoint.port,
+                7_200,
+                ElastiCacheAuthenticationType::Password,
+            )]
+        );
+
         let delete_missing = list_service
             .delete_replication_group(
                 &scope(),

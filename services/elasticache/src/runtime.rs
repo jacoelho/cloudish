@@ -247,6 +247,7 @@ pub(crate) fn start_runtime(
     replication_group_id: &ElastiCacheReplicationGroupId,
     engine: ElastiCacheEngine,
     auth_mode: ElastiCacheAuthenticationType,
+    listen_port: Option<u16>,
     authenticator: Arc<dyn ElastiCacheConnectionAuthenticator + Send + Sync>,
 ) -> Result<StartedRuntime, ElastiCacheError> {
     let backend = node_runtime
@@ -263,7 +264,7 @@ pub(crate) fn start_runtime(
         scope.clone(),
         replication_group_id.clone(),
         auth_mode,
-        Endpoint::localhost(0),
+        Endpoint::localhost(listen_port.unwrap_or(0)),
         upstream,
         authenticator,
     )) {

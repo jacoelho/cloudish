@@ -56,7 +56,7 @@ use crate::{CreateRoleInput, StsService};
 use crate::{DynamoDbInitError, DynamoDbService};
 #[cfg(feature = "elasticache")]
 use crate::{
-    ElastiCacheIamTokenValidator, ElastiCacheService,
+    ElastiCacheError, ElastiCacheIamTokenValidator, ElastiCacheService,
     ElastiCacheServiceDependencies,
 };
 use crate::{EnabledServices, RuntimeServices, RuntimeServicesBuilder};
@@ -66,7 +66,9 @@ use crate::{IamScope, IamService};
 #[cfg(feature = "lambda")]
 use crate::{LambdaInitError, LambdaService, LambdaServiceDependencies};
 #[cfg(feature = "rds")]
-use crate::{RdsIamTokenValidator, RdsService, RdsServiceDependencies};
+use crate::{
+    RdsError, RdsIamTokenValidator, RdsService, RdsServiceDependencies,
+};
 #[cfg(feature = "s3")]
 use crate::{S3InitError, S3Service};
 #[cfg(feature = "step-functions")]
@@ -81,7 +83,7 @@ use aws::{
 use elasticache::ElastiCacheReplicationGroupId;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use storage::{StorageConfig, StorageFactory, StorageMode};
+use storage::{StorageConfig, StorageError, StorageFactory, StorageMode};
 use thiserror::Error;
 
 pub struct RuntimeAssembly {
@@ -122,8 +124,11 @@ pub enum RuntimeBuildError {
     #[error("failed to load DynamoDB state: {0}")]
     DynamoDbState(#[source] DynamoDbInitError),
     #[cfg(feature = "eventbridge")]
-    #[error("failed to initialize EventBridge runtime: {0}")]
-    EventBridgeState(#[source] EventBridgeError),
+    #[error("failed to restore EventBridge schedules: {0}")]
+    EventBridgeRestore(#[source] EventBridgeError),
+    #[cfg(feature = "elasticache")]
+    #[error("failed to restore ElastiCache runtimes: {0}")]
+    ElastiCacheRestore(#[source] ElastiCacheError),
     #[cfg(feature = "lambda")]
     #[error("failed to start Lambda background runtime: {0}")]
     LambdaRuntime(#[source] InfrastructureError),
@@ -133,6 +138,11 @@ pub enum RuntimeBuildError {
     #[cfg(feature = "s3")]
     #[error("failed to load S3 state: {0}")]
     S3State(#[source] S3InitError),
+    #[cfg(feature = "rds")]
+    #[error("failed to restore RDS runtimes: {0}")]
+    RdsRestore(#[source] RdsError),
+    #[error("failed to load persistent runtime state: {0}")]
+    StorageLoad(#[source] StorageError),
 }
 
 pub struct LocalRuntimeBuilder {
@@ -247,14 +257,6 @@ impl LocalRuntimeBuilder {
             },
         )
         .map_err(RuntimeBuildError::LambdaState)?;
-        #[cfg(feature = "lambda")]
-        let background_tasks = start_lambda_background_tasks(
-            lambda.clone(),
-            Arc::new(ThreadBackgroundScheduler::new()),
-        )
-        .map_err(RuntimeBuildError::LambdaRuntime)?;
-        #[cfg(not(feature = "lambda"))]
-        let background_tasks = ManagedBackgroundTasks::empty();
         #[cfg(any(feature = "apigateway", feature = "sns"))]
         let http_forwarder: Option<
             Arc<dyn crate::HttpForwarder + Send + Sync>,
@@ -289,8 +291,7 @@ impl LocalRuntimeBuilder {
                 ),
                 scheduler: Arc::new(ThreadBackgroundScheduler::new()),
             },
-        )
-        .map_err(RuntimeBuildError::EventBridgeState)?;
+        );
         #[cfg(feature = "s3")]
         s3.set_notification_transport(Arc::new(S3NotificationDispatcher {
             sns: Some(sns.clone()),
@@ -355,6 +356,25 @@ impl LocalRuntimeBuilder {
             },
         );
         #[cfg(feature = "apigateway")]
+        factory.load_all().map_err(RuntimeBuildError::StorageLoad)?;
+        #[cfg(feature = "lambda")]
+        let background_tasks = start_lambda_background_tasks(
+            lambda.clone(),
+            Arc::new(ThreadBackgroundScheduler::new()),
+        )
+        .map_err(RuntimeBuildError::LambdaRuntime)?;
+        #[cfg(not(feature = "lambda"))]
+        let background_tasks = ManagedBackgroundTasks::empty();
+        #[cfg(feature = "eventbridge")]
+        eventbridge
+            .restore_schedules()
+            .map_err(RuntimeBuildError::EventBridgeRestore)?;
+        #[cfg(feature = "rds")]
+        rds.restore_runtimes().map_err(RuntimeBuildError::RdsRestore)?;
+        #[cfg(feature = "elasticache")]
+        elasticache
+            .restore_runtimes()
+            .map_err(RuntimeBuildError::ElastiCacheRestore)?;
         let execute_api_executor: Arc<
             dyn ExecuteApiIntegrationExecutor + Send + Sync,
         > = Arc::new(ApiGatewayIntegrationExecutor::new(
@@ -585,8 +605,7 @@ impl TestRuntimeBuilder {
                 ),
                 scheduler: Arc::new(crate::ManualBackgroundScheduler::new()),
             },
-        )
-        .map_err(RuntimeBuildError::EventBridgeState)?;
+        );
         #[cfg(feature = "s3")]
         s3.set_notification_transport(Arc::new(S3NotificationDispatcher {
             sns: Some(sns.clone()),

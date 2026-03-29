@@ -85,6 +85,75 @@ impl RdsService {
         }
     }
 
+    /// Restores persisted backend and proxy runtimes for every loaded RDS
+    /// scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a persisted backend or proxy cannot be restarted.
+    pub fn restore_runtimes(&self) -> Result<(), RdsError> {
+        let mut restored_clusters = Vec::new();
+        let mut restored_instances = Vec::new();
+
+        for state_key in self.state_store.keys() {
+            let scope = RdsScope::new(
+                state_key.account_id.clone(),
+                state_key.region.clone(),
+            );
+            let state = self.load_state(&scope);
+            match self.restore_scope_runtimes(&scope, &state) {
+                Ok((clusters, instances)) => {
+                    restored_clusters.extend(clusters);
+                    restored_instances.extend(instances);
+                }
+                Err(error) => {
+                    self.stop_restored_runtimes(
+                        restored_instances,
+                        restored_clusters,
+                    );
+                    return Err(error);
+                }
+            }
+        }
+
+        let mut runtime = self.lock_runtime();
+        if !runtime.clusters.is_empty() || !runtime.instances.is_empty() {
+            drop(runtime);
+            self.stop_restored_runtimes(restored_instances, restored_clusters);
+            return Err(RdsError::internal(
+                "RDS runtime restore requires an empty runtime state.",
+            ));
+        }
+        runtime.clusters.extend(restored_clusters);
+        runtime.instances.extend(restored_instances);
+
+        Ok(())
+    }
+
+    /// Stops every active backend and proxy owned by this service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a backend or proxy cannot be stopped cleanly.
+    pub fn shutdown(&self) -> Result<(), RdsError> {
+        let (instances, clusters) = {
+            let mut runtime = self.lock_runtime();
+            (
+                std::mem::take(&mut runtime.instances),
+                std::mem::take(&mut runtime.clusters),
+            )
+        };
+
+        for (_, runtime) in instances {
+            runtime.stop()?;
+        }
+        for (_, runtime) in clusters {
+            runtime.stop()?;
+        }
+
+        Ok(())
+    }
+
     /// # Errors
     ///
     /// Returns validation, conflict, runtime, or persistence errors when the
@@ -934,6 +1003,142 @@ impl RdsService {
         recover(self.runtime_state.lock())
     }
 
+    fn restore_scope_runtimes(
+        &self,
+        scope: &RdsScope,
+        state: &StoredRdsState,
+    ) -> Result<
+        (
+            Vec<(ClusterRuntimeKey, ClusterRuntime)>,
+            Vec<(InstanceRuntimeKey, InstanceRuntime)>,
+        ),
+        RdsError,
+    > {
+        let mut restored_clusters = Vec::new();
+        let mut restored_instances = Vec::new();
+        let mut cluster_upstreams = BTreeMap::new();
+
+        for cluster in sorted_clusters(state) {
+            let started = match self.start_backend_and_proxy(
+                cluster.engine,
+                cluster.master_username.clone(),
+                cluster.master_password.clone(),
+                cluster.database_name.clone(),
+                cluster.iam_database_authentication_enabled,
+                Some(cluster.endpoint.port),
+            ) {
+                Ok(started) => started,
+                Err(error) => {
+                    self.stop_restored_runtimes(
+                        restored_instances,
+                        restored_clusters,
+                    );
+                    return Err(error);
+                }
+            };
+            let upstream = started.backend.listen_endpoint();
+            let auth_endpoints = started.auth_endpoints.clone();
+            cluster_upstreams.insert(
+                cluster.db_cluster_identifier.clone(),
+                (upstream, auth_endpoints.clone()),
+            );
+            restored_clusters.push((
+                ClusterRuntimeKey::new(scope, &cluster.db_cluster_identifier),
+                ClusterRuntime::new(
+                    auth_endpoints,
+                    started.backend,
+                    started.proxy,
+                ),
+            ));
+        }
+
+        for instance in sorted_instances(state)
+            .into_iter()
+            .filter(|instance| instance.db_cluster_identifier.is_none())
+        {
+            let started = match self.start_backend_and_proxy(
+                instance.engine,
+                instance.master_username.clone(),
+                instance.master_password.clone(),
+                instance.db_name.clone(),
+                instance.iam_database_authentication_enabled,
+                Some(instance.endpoint.port),
+            ) {
+                Ok(started) => started,
+                Err(error) => {
+                    self.stop_restored_runtimes(
+                        restored_instances,
+                        restored_clusters,
+                    );
+                    return Err(error);
+                }
+            };
+            restored_instances.push((
+                InstanceRuntimeKey::new(
+                    scope,
+                    &instance.db_instance_identifier,
+                ),
+                InstanceRuntime::standalone(started),
+            ));
+        }
+
+        for instance in sorted_instances(state)
+            .into_iter()
+            .filter(|instance| instance.db_cluster_identifier.is_some())
+        {
+            let cluster_identifier =
+                instance.db_cluster_identifier.as_ref().expect(
+                    "filtered cluster-backed instance should have a cluster",
+                );
+            let Some((upstream, auth_endpoints)) =
+                cluster_upstreams.get(cluster_identifier).cloned()
+            else {
+                self.stop_restored_runtimes(
+                    restored_instances,
+                    restored_clusters,
+                );
+                return Err(RdsError::internal(format!(
+                    "Missing persisted runtime for DB cluster {cluster_identifier}."
+                )));
+            };
+            let proxy = match self
+                .start_proxy(&upstream, Some(instance.endpoint.port))
+            {
+                Ok(proxy) => proxy,
+                Err(error) => {
+                    self.stop_restored_runtimes(
+                        restored_instances,
+                        restored_clusters,
+                    );
+                    return Err(error);
+                }
+            };
+            auth_endpoints.add_endpoint(proxy.listen_endpoint());
+            restored_instances.push((
+                InstanceRuntimeKey::new(
+                    scope,
+                    &instance.db_instance_identifier,
+                ),
+                InstanceRuntime::cluster_member(proxy),
+            ));
+        }
+
+        Ok((restored_clusters, restored_instances))
+    }
+
+    fn stop_restored_runtimes(
+        &self,
+        restored_instances: Vec<(InstanceRuntimeKey, InstanceRuntime)>,
+        restored_clusters: Vec<(ClusterRuntimeKey, ClusterRuntime)>,
+    ) {
+        for (_, runtime) in restored_instances {
+            let _ = runtime.stop();
+        }
+        for (_, runtime) in restored_clusters {
+            let _ = runtime.stop();
+        }
+    }
+
     fn start_backend_and_proxy(
         &self,
         engine: RdsEngine,
@@ -1355,6 +1560,28 @@ mod tests {
         )
     }
 
+    fn persistent_service(
+        directory: PathBuf,
+        backend_runtime: Arc<FakeBackendRuntime>,
+        proxy_runtime: Arc<FakeProxyRuntime>,
+    ) -> RdsService {
+        std::fs::create_dir_all(&directory)
+            .expect("persistent RDS state directory should exist");
+
+        RdsService::new(
+            &StorageFactory::new(StorageConfig::new(
+                directory,
+                StorageMode::Persistent,
+            )),
+            RdsServiceDependencies {
+                backend_runtime,
+                clock: Arc::new(FixedClock),
+                iam_token_validator: Arc::new(FakeTokenValidator),
+                proxy_runtime,
+            },
+        )
+    }
+
     fn scope() -> RdsScope {
         RdsScope::new(
             "000000000000".parse().expect("account should parse"),
@@ -1515,6 +1742,144 @@ mod tests {
             1
         );
         assert_eq!(proxy.starts.lock().expect("starts should lock").len(), 2);
+    }
+
+    #[test]
+    fn rds_restore_runtimes_rehydrates_persisted_proxy_ports() {
+        let directory = temporary_directory("rds-runtime-restore");
+        let scope = scope();
+        let backend = Arc::new(FakeBackendRuntime::new());
+        let proxy = Arc::new(FakeProxyRuntime::new());
+        let service = persistent_service(directory.clone(), backend, proxy);
+
+        let cluster = service
+            .create_db_cluster(
+                &scope,
+                CreateDbClusterInput {
+                    database_name: Some("clusterdb".to_owned()),
+                    db_cluster_identifier: db_cluster_identifier(
+                        "cluster-demo",
+                    ),
+                    db_cluster_parameter_group_name: None,
+                    engine: "aurora-postgresql".to_owned(),
+                    engine_version: None,
+                    enable_iam_database_authentication: Some(true),
+                    master_user_password: "cluster-secret".to_owned(),
+                    master_username: "postgres".to_owned(),
+                },
+            )
+            .expect("cluster should create");
+        let standalone = service
+            .create_db_instance(
+                &scope,
+                CreateDbInstanceInput {
+                    allocated_storage: Some(20),
+                    db_cluster_identifier: None,
+                    db_instance_class: None,
+                    db_instance_identifier: db_instance_identifier("solo"),
+                    db_name: Some("app".to_owned()),
+                    db_parameter_group_name: None,
+                    engine: Some("postgres".to_owned()),
+                    engine_version: None,
+                    enable_iam_database_authentication: Some(true),
+                    master_user_password: Some("secret123".to_owned()),
+                    master_username: Some("postgres".to_owned()),
+                },
+            )
+            .expect("standalone instance should create");
+        let member = service
+            .create_db_instance(
+                &scope,
+                CreateDbInstanceInput {
+                    allocated_storage: None,
+                    db_cluster_identifier: Some(db_cluster_identifier(
+                        "cluster-demo",
+                    )),
+                    db_instance_class: None,
+                    db_instance_identifier: db_instance_identifier("member"),
+                    db_name: None,
+                    db_parameter_group_name: None,
+                    engine: Some("aurora-postgresql".to_owned()),
+                    engine_version: None,
+                    enable_iam_database_authentication: Some(true),
+                    master_user_password: Some("cluster-secret".to_owned()),
+                    master_username: Some("postgres".to_owned()),
+                },
+            )
+            .expect("cluster member should create");
+
+        let restored_backend = Arc::new(FakeBackendRuntime::new());
+        let restored_proxy = Arc::new(FakeProxyRuntime::new());
+        let restored_service = persistent_service(
+            directory,
+            restored_backend.clone(),
+            restored_proxy.clone(),
+        );
+        restored_service.state_store.load().expect("RDS state should load");
+        restored_service
+            .restore_runtimes()
+            .expect("RDS runtimes should restore");
+
+        assert_eq!(
+            restored_service
+                .describe_db_clusters(
+                    &scope,
+                    Some(&db_cluster_identifier("cluster-demo")),
+                )
+                .expect("cluster should describe")[0]
+                .endpoint
+                .port,
+            cluster.endpoint.port
+        );
+        assert_eq!(
+            restored_service
+                .describe_db_instances(
+                    &scope,
+                    Some(&db_instance_identifier("solo"))
+                )
+                .expect("standalone instance should describe")[0]
+                .endpoint
+                .port,
+            standalone.endpoint.port
+        );
+        assert_eq!(
+            restored_service
+                .describe_db_instances(
+                    &scope,
+                    Some(&db_instance_identifier("member")),
+                )
+                .expect("cluster member should describe")[0]
+                .endpoint
+                .port,
+            member.endpoint.port
+        );
+        assert_eq!(
+            restored_backend
+                .starts
+                .lock()
+                .expect("starts should lock")
+                .clone(),
+            vec![RdsEngine::AuroraPostgresql, RdsEngine::Postgres]
+        );
+
+        let started_proxies =
+            restored_proxy.starts.lock().expect("starts should lock").clone();
+        let cluster_start = started_proxies
+            .iter()
+            .find(|(listen_port, _)| *listen_port == cluster.endpoint.port)
+            .expect("cluster proxy should restart");
+        let standalone_start = started_proxies
+            .iter()
+            .find(|(listen_port, _)| *listen_port == standalone.endpoint.port)
+            .expect("standalone proxy should restart");
+        let member_start = started_proxies
+            .iter()
+            .find(|(listen_port, _)| *listen_port == member.endpoint.port)
+            .expect("member proxy should restart");
+
+        assert_eq!(cluster_start.1, 6_101);
+        assert_eq!(standalone_start.1, 6_102);
+        assert_eq!(member_start.1, 6_101);
     }
 
     #[test]

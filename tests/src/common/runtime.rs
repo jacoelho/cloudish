@@ -28,6 +28,19 @@ pub struct RuntimeServer {
 impl RuntimeServer {
     pub async fn spawn(label: &str) -> Self {
         let (defaults, state_directory) = runtime_defaults(label);
+        Self::spawn_with_defaults(defaults, state_directory).await
+    }
+
+    pub async fn spawn_with_state_directory(state_directory: PathBuf) -> Self {
+        let (defaults, state_directory) =
+            runtime_defaults_for_state_directory(state_directory);
+        Self::spawn_with_defaults(defaults, state_directory).await
+    }
+
+    async fn spawn_with_defaults(
+        defaults: aws::RuntimeDefaults,
+        state_directory: PathBuf,
+    ) -> Self {
         let server = CloudishApp::from_runtime_defaults(defaults)
             .expect("app bootstrap should succeed");
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -133,6 +146,12 @@ impl Deref for SharedRuntimeLease<'_> {
 
 fn runtime_defaults(label: &str) -> (aws::RuntimeDefaults, PathBuf) {
     let state_directory = temporary_directory(label).join("state");
+    runtime_defaults_for_state_directory(state_directory)
+}
+
+fn runtime_defaults_for_state_directory(
+    state_directory: PathBuf,
+) -> (aws::RuntimeDefaults, PathBuf) {
     let defaults = aws::RuntimeDefaults::try_new(
         Some("000000000000".to_owned()),
         Some("eu-west-2".to_owned()),
