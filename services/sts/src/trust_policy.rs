@@ -218,8 +218,9 @@ fn effect(statement: &Value) -> Option<StatementEffect> {
 }
 
 fn action_matches(statement: &Value, expected_action: TrustAction) -> bool {
-    string_or_array_values(statement.get("Action"))
-        .any(|action| action_matches_value(action, expected_action))
+    optional_string_or_array_matches(statement.get("Action"), |action| {
+        action_matches_value(action, expected_action)
+    })
 }
 
 fn action_matches_value(action: &str, expected_action: TrustAction) -> bool {
@@ -275,13 +276,15 @@ fn aws_principal_matches(
     presented_principal_arn: &Arn,
 ) -> bool {
     let root_arn = format!("arn:aws:iam::{account_id}:root");
+    let canonical_principal_arn = canonical_principal_arn.to_string();
+    let presented_principal_arn = presented_principal_arn.to_string();
 
-    principal_values(value).into_iter().any(|candidate| {
+    string_or_array_matches(value, |candidate| {
         candidate == "*"
             || candidate == account_id.as_str()
-            || candidate == root_arn
-            || candidate == canonical_principal_arn.to_string()
-            || candidate == presented_principal_arn.to_string()
+            || candidate == root_arn.as_str()
+            || candidate == canonical_principal_arn.as_str()
+            || candidate == presented_principal_arn.as_str()
     })
 }
 
@@ -289,21 +292,31 @@ fn federated_principal_matches(
     value: &Value,
     expected_values: &[String],
 ) -> bool {
-    principal_values(value).into_iter().any(|candidate| {
+    string_or_array_matches(value, |candidate| {
         candidate == "*"
-            || expected_values.iter().any(|expected| expected == &candidate)
+            || expected_values
+                .iter()
+                .any(|expected| expected.as_str() == candidate)
     })
 }
 
-fn principal_values(value: &Value) -> Vec<String> {
+fn optional_string_or_array_matches(
+    value: Option<&Value>,
+    predicate: impl FnMut(&str) -> bool,
+) -> bool {
+    value.is_some_and(|value| string_or_array_matches(value, predicate))
+}
+
+fn string_or_array_matches(
+    value: &Value,
+    mut predicate: impl FnMut(&str) -> bool,
+) -> bool {
     match value {
-        Value::String(value) => vec![value.clone()],
-        Value::Array(values) => values
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect(),
-        _ => Vec::new(),
+        Value::String(value) => predicate(value),
+        Value::Array(values) => {
+            values.iter().filter_map(Value::as_str).any(predicate)
+        }
+        _ => false,
     }
 }
 
@@ -369,38 +382,58 @@ fn condition_clause_matches(
     }
 }
 
-fn string_condition_values(expected: &Value) -> Result<Vec<String>, ()> {
+fn required_string_or_array_matches(
+    expected: &Value,
+    mut predicate: impl FnMut(&str) -> bool,
+) -> Result<bool, ()> {
     match expected {
-        Value::String(expected) => Ok(vec![expected.clone()]),
-        Value::Array(values) => values
-            .iter()
-            .map(Value::as_str)
-            .collect::<Option<Vec<_>>>()
-            .map(|values| values.into_iter().map(str::to_owned).collect())
-            .ok_or(()),
+        Value::String(expected) => Ok(predicate(expected)),
+        Value::Array(values) => {
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    return Err(());
+                };
+                if predicate(value) {
+                    return Ok(true);
+                }
+            }
+
+            Ok(false)
+        }
         _ => Err(()),
     }
 }
 
 fn any_value_matches(
     actual: &[String],
-    expected: &[String],
+    expected: &Value,
     matcher: impl Fn(&str, &str) -> bool,
-) -> bool {
-    !actual.is_empty()
-        && actual.iter().any(|actual| {
-            expected.iter().any(|expected| matcher(actual, expected))
-        })
+) -> Result<bool, ()> {
+    for actual in actual {
+        if required_string_or_array_matches(expected, |expected| {
+            matcher(actual, expected)
+        })? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn all_value_matches(
     actual: &[String],
-    expected: &[String],
+    expected: &Value,
     matcher: impl Fn(&str, &str) -> bool,
-) -> bool {
-    actual.iter().all(|actual| {
-        expected.iter().any(|expected| matcher(actual, expected))
-    })
+) -> Result<bool, ()> {
+    for actual in actual {
+        if !required_string_or_array_matches(expected, |expected| {
+            matcher(actual, expected)
+        })? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 fn evaluate_any_string_condition(
@@ -408,8 +441,7 @@ fn evaluate_any_string_condition(
     expected: &Value,
     matcher: impl Fn(&str, &str) -> bool,
 ) -> Result<bool, ()> {
-    let expected = string_condition_values(expected)?;
-    Ok(any_value_matches(actual, &expected, matcher))
+    any_value_matches(actual, expected, matcher)
 }
 
 fn evaluate_all_string_condition(
@@ -417,8 +449,7 @@ fn evaluate_all_string_condition(
     expected: &Value,
     matcher: impl Fn(&str, &str) -> bool,
 ) -> Result<bool, ()> {
-    let expected = string_condition_values(expected)?;
-    Ok(all_value_matches(actual, &expected, matcher))
+    all_value_matches(actual, expected, matcher)
 }
 
 fn string_equals(actual: &str, expected: &str) -> bool {
@@ -443,18 +474,6 @@ fn is_supported_web_identity_condition_key(
         && key
             .split_once(':')
             .is_some_and(|(_, suffix)| matches!(suffix, "aud" | "sub" | "amr"))
-}
-
-fn string_or_array_values(
-    value: Option<&Value>,
-) -> impl Iterator<Item = &str> {
-    value.into_iter().flat_map(|value| match value {
-        Value::String(value) => vec![value.as_str()],
-        Value::Array(values) => {
-            values.iter().filter_map(Value::as_str).collect::<Vec<_>>()
-        }
-        _ => Vec::new(),
-    })
 }
 
 fn glob_matches(actual: &str, pattern: &str) -> bool {
