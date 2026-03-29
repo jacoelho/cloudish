@@ -280,6 +280,89 @@ async fn query_get_requests_route_to_sts_and_missing_version_fails_before_mutati
 }
 
 #[tokio::test]
+async fn query_wrong_version_and_json_markers_fail_with_the_expected_protocol()
+{
+    let runtime = shared_runtime().await;
+    let address = runtime.address();
+    let wrong_version_body =
+        "Action=CreateQueue&QueueName=demo&Version=2011-06-15";
+
+    let wrong_version_response = tokio::task::spawn_blocking(move || {
+        send_http_request(
+            address,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{wrong_version_body}",
+                wrong_version_body.len()
+            ),
+        )
+    })
+    .await
+    .expect("wrong-version request task should complete")
+    .expect("wrong-version request should succeed");
+    let list_queues_body = "Action=ListQueues&Version=2012-11-05";
+    let list_queues_response = tokio::task::spawn_blocking(move || {
+        send_http_request(
+            address,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{list_queues_body}",
+                list_queues_body.len()
+            ),
+        )
+    })
+    .await
+    .expect("list queues request task should complete")
+    .expect("list queues request should succeed");
+    let json_like_body = "Action=GetCallerIdentity&Version=2011-06-15";
+    let json_like_response = tokio::task::spawn_blocking(move || {
+        send_http_request(
+            address,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nContent-Type: application/x-amz-json-1.1\r\nContent-Length: {}\r\n\r\n{json_like_body}",
+                json_like_body.len()
+            ),
+        )
+    })
+    .await
+    .expect("JSON-marker request task should complete")
+    .expect("JSON-marker request should succeed");
+
+    let (wrong_version_status, wrong_version_headers, wrong_version_body) =
+        split_response(wrong_version_response.as_bytes());
+    let wrong_version_body = std::str::from_utf8(wrong_version_body)
+        .expect("wrong-version body should be UTF-8");
+    let (list_status, list_headers, list_body) =
+        split_response(list_queues_response.as_bytes());
+    let list_body = std::str::from_utf8(list_body)
+        .expect("list queues body should be UTF-8");
+    let (json_status, json_headers, json_body) =
+        split_response(json_like_response.as_bytes());
+    let json_body: AwsJsonErrorBody =
+        serde_json::from_slice(json_body).expect("JSON body should decode");
+
+    assert_eq!(wrong_version_status, "HTTP/1.1 400 Bad Request");
+    assert_eq!(
+        header_value(&wrong_version_headers, "content-type"),
+        Some("text/xml")
+    );
+    assert!(wrong_version_body.contains("<Code>InvalidAction</Code>"));
+    assert!(wrong_version_body.contains(
+        "<Message>Could not find operation CreateQueue for version 2011-06-15.</Message>"
+    ));
+
+    assert_eq!(list_status, "HTTP/1.1 200 OK");
+    assert_eq!(header_value(&list_headers, "content-type"), Some("text/xml"));
+    assert!(list_body.contains("<ListQueuesResult"));
+    assert!(!list_body.contains("demo"));
+
+    assert_eq!(json_status, "HTTP/1.1 400 Bad Request");
+    assert_eq!(
+        header_value(&json_headers, "content-type"),
+        Some("application/x-amz-json-1.1")
+    );
+    assert_eq!(json_body.error_type, "ValidationException");
+}
+
+#[tokio::test]
 async fn smithy_cbor_requests_return_cbor_errors() {
     let runtime = shared_runtime().await;
     let address = runtime.address();

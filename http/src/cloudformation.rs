@@ -22,6 +22,7 @@ use time::format_description::well_known::Rfc3339;
 const CLOUDFORMATION_XMLNS: &str =
     "http://cloudformation.amazonaws.com/doc/2010-05-15/";
 const REQUEST_ID: &str = "0000000000000000";
+pub(crate) const CLOUDFORMATION_QUERY_VERSION: &str = "2010-05-15";
 
 pub(crate) fn is_cloudformation_action(action: &str) -> bool {
     matches!(

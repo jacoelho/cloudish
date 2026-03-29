@@ -21,6 +21,7 @@ use time::format_description::well_known::Rfc3339;
 
 const RDS_XMLNS: &str = "http://rds.amazonaws.com/doc/2014-10-31/";
 const REQUEST_ID: &str = "0000000000000000";
+pub(crate) const RDS_QUERY_VERSION: &str = "2014-10-31";
 
 pub(crate) fn is_rds_action(action: &str) -> bool {
     matches!(

@@ -371,6 +371,7 @@ impl Authenticator {
                 "The request signature we calculated does not match the signature you provided.",
             ));
         }
+        payload.validate_request_payload_hash(request)?;
 
         let payload = payload.verified_payload(
             &material.secret_access_key,
@@ -792,6 +793,26 @@ impl CanonicalPayloadMode<'_> {
                     seed_signature,
                     mode,
                 ))
+            }
+        }
+    }
+
+    fn validate_request_payload_hash(
+        &self,
+        request: &RequestAuth<'_>,
+    ) -> Result<(), AwsError> {
+        match self {
+            Self::HeaderValue("UNSIGNED-PAYLOAD")
+            | Self::SignedBody
+            | Self::AwsChunked(_) => Ok(()),
+            Self::HeaderValue(value) => {
+                if *value == request.body_hash() {
+                    Ok(())
+                } else {
+                    Err(signature_does_not_match_error(
+                        "The request signature we calculated does not match the signature you provided.",
+                    ))
+                }
             }
         }
     }
@@ -1468,7 +1489,6 @@ mod tests {
         headers: &[&str],
         body: &[u8],
     ) -> String {
-        let signed_headers = headers.join(";");
         let request = RequestAuth::new(
             "POST",
             "/",
@@ -1492,12 +1512,33 @@ mod tests {
                 .collect(),
             body,
         );
-        let canonical = super::build_canonical_request(
-            &request,
+        authorization_header_for_request(
+            access_key_id,
+            secret_access_key,
+            date,
+            request_timestamp,
+            service,
             &headers
                 .iter()
                 .map(|header| (*header).to_owned())
                 .collect::<Vec<_>>(),
+            &request,
+        )
+    }
+
+    fn authorization_header_for_request(
+        access_key_id: &str,
+        secret_access_key: &str,
+        date: &str,
+        request_timestamp: &str,
+        service: &str,
+        signed_headers: &[String],
+        request: &RequestAuth<'_>,
+    ) -> String {
+        let signed_headers_value = signed_headers.join(";");
+        let canonical = super::build_canonical_request(
+            request,
+            signed_headers,
             &super::canonical_payload_mode(
                 request.header("x-amz-content-sha256"),
             )
@@ -1514,7 +1555,7 @@ mod tests {
         );
 
         format!(
-            "AWS4-HMAC-SHA256 Credential={access_key_id}/{date}/eu-west-2/{service}/aws4_request, SignedHeaders={signed_headers}, Signature={signature}"
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/{date}/eu-west-2/{service}/aws4_request, SignedHeaders={signed_headers_value}, Signature={signature}"
         )
     }
 
@@ -1846,6 +1887,73 @@ mod tests {
                 &SessionLookup::default(),
             )
             .expect_err("bad signature should fail");
+
+        assert_eq!(error.code(), "SignatureDoesNotMatch");
+        assert_eq!(error.status_code(), 403);
+    }
+
+    #[test]
+    fn auth_rejects_signed_requests_when_header_hash_does_not_match_body() {
+        let body = b"Action=GetCallerIdentity&Version=2011-06-15";
+        let request_timestamp = "20260325T120000Z";
+        let mismatched_hash = super::hash_hex(b"different-body");
+        let request = RequestAuth::new(
+            "POST",
+            "/",
+            vec![
+                RequestHeader::new("Host", "localhost"),
+                RequestHeader::new(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded",
+                ),
+                RequestHeader::new("X-Amz-Date", request_timestamp),
+                RequestHeader::new(
+                    "X-Amz-Content-Sha256",
+                    mismatched_hash.as_str(),
+                ),
+            ],
+            body,
+        );
+        let authorization = authorization_header_for_request(
+            BOOTSTRAP_ACCESS_KEY_ID,
+            BOOTSTRAP_SECRET_ACCESS_KEY,
+            "20260325",
+            request_timestamp,
+            "sts",
+            &[
+                "content-type".to_owned(),
+                "host".to_owned(),
+                "x-amz-content-sha256".to_owned(),
+                "x-amz-date".to_owned(),
+            ],
+            &request,
+        );
+        let request = RequestAuth::new(
+            "POST",
+            "/",
+            vec![
+                RequestHeader::new("Host", "localhost"),
+                RequestHeader::new(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded",
+                ),
+                RequestHeader::new("X-Amz-Date", request_timestamp),
+                RequestHeader::new(
+                    "X-Amz-Content-Sha256",
+                    mismatched_hash.as_str(),
+                ),
+                RequestHeader::new("Authorization", &authorization),
+            ],
+            body,
+        );
+
+        let error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
+            .verify(
+                &request,
+                &AccessKeyLookup::default(),
+                &SessionLookup::default(),
+            )
+            .expect_err("mismatched payload hash should fail");
 
         assert_eq!(error.code(), "SignatureDoesNotMatch");
         assert_eq!(error.status_code(), 403);

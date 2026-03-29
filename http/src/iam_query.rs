@@ -12,6 +12,7 @@ use services::{
 
 const IAM_XMLNS: &str = "https://iam.amazonaws.com/doc/2010-05-08/";
 const REQUEST_ID: &str = "0000000000000000";
+pub(crate) const IAM_QUERY_VERSION: &str = "2010-05-08";
 
 pub(crate) fn is_iam_action(action: &str) -> bool {
     matches!(

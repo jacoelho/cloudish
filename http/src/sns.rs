@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const REQUEST_ID: &str = "0000000000000000";
 const SNS_XMLNS: &str = "https://sns.amazonaws.com/doc/2010-03-31/";
+pub(crate) const SNS_QUERY_VERSION: &str = "2010-03-31";
 
 pub(crate) fn is_sns_action(action: &str) -> bool {
     matches!(

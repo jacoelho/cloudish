@@ -109,10 +109,10 @@ pub(crate) fn missing_parameter_error(name: &str) -> AwsError {
 fn query_parameter_source<'a>(
     request: &'a HttpRequest<'_>,
 ) -> Option<&'a [u8]> {
+    let content_type = request.header("content-type");
+
     if request.method() == "POST"
-        && content_type_is_form_urlencoded(
-            request.header("content-type").unwrap_or_default(),
-        )
+        && content_type_is_form_urlencoded(content_type.unwrap_or_default())
         && !request.body().is_empty()
     {
         return Some(request.body());
@@ -125,6 +125,7 @@ fn query_parameter_source<'a>(
     }
 
     if request.method() == "POST"
+        && content_type.is_none()
         && looks_like_query_parameters(request.body())
     {
         return Some(request.body());
@@ -295,5 +296,48 @@ mod tests {
             .expect_err("malformed URI query should fail");
 
         assert_eq!(error, malformed_query_error());
+    }
+
+    #[test]
+    fn query_request_parser_accepts_post_body_without_content_type() {
+        let request = EdgeRequest::new(
+            "POST",
+            "/",
+            Vec::new(),
+            b"Action=GetCallerIdentity&Version=2011-06-15".to_vec(),
+        );
+        let parsed = parse_request(&request)
+            .expect("POST query parameters should parse")
+            .expect("POST request should be recognized as Query");
+
+        assert!(is_query_request(&request));
+        assert_eq!(parsed.parameters().action(), Some("GetCallerIdentity"));
+        assert_eq!(
+            parsed
+                .parameters()
+                .required("Version")
+                .expect("Version should exist"),
+            "2011-06-15"
+        );
+    }
+
+    #[test]
+    fn query_request_parser_rejects_json_post_bodies_that_look_like_query() {
+        let request = EdgeRequest::new(
+            "POST",
+            "/",
+            vec![(
+                "Content-Type".to_owned(),
+                "application/x-amz-json-1.1".to_owned(),
+            )],
+            b"Action=GetCallerIdentity&Version=2011-06-15".to_vec(),
+        );
+
+        assert!(!is_query_request(&request));
+        assert!(
+            parse_request(&request)
+                .expect("request parse should succeed")
+                .is_none()
+        );
     }
 }

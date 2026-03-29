@@ -633,6 +633,10 @@ impl EdgeRouter {
                 }
             },
         };
+        if !query_action_matches_version(service, &action, version) {
+            let error = invalid_query_version_error(&action, version);
+            return EdgeResponse::aws(ProtocolFamily::Query, &error);
+        }
 
         if !self.services.is_enabled(service) {
             return EdgeResponse::aws(
@@ -1475,24 +1479,18 @@ fn detect_generic_protocol(
         return Some(ProtocolFamily::RestJson);
     }
 
-    if is_query_request(request) {
-        return Some(ProtocolFamily::Query);
-    }
-
-    if s3_candidate && path != "/" {
-        return None;
-    }
-
     if content_type.contains("application/x-amz-json-1.0") {
+        if s3_candidate && path != "/" {
+            return None;
+        }
         return Some(ProtocolFamily::AwsJson10);
     }
 
     if content_type.contains("application/x-amz-json-1.1") {
+        if s3_candidate && path != "/" {
+            return None;
+        }
         return Some(ProtocolFamily::AwsJson11);
-    }
-
-    if content_type.contains("application/x-www-form-urlencoded") {
-        return Some(ProtocolFamily::Query);
     }
 
     if let Some(target) = target {
@@ -1502,6 +1500,18 @@ fn detect_generic_protocol(
         if json_target(ProtocolFamily::AwsJson11, target).is_some() {
             return Some(ProtocolFamily::AwsJson11);
         }
+    }
+
+    if is_query_request(request) {
+        return Some(ProtocolFamily::Query);
+    }
+
+    if s3_candidate && path != "/" {
+        return None;
+    }
+
+    if content_type.contains("application/x-www-form-urlencoded") {
+        return Some(ProtocolFamily::Query);
     }
 
     None
@@ -1897,6 +1907,46 @@ fn invalid_query_action_error(
     )
 }
 
+fn invalid_query_version_error(action: &str, version: &str) -> AwsError {
+    AwsError::trusted_custom(
+        AwsErrorFamily::Validation,
+        "InvalidAction",
+        format!("Could not find operation {action} for version {version}."),
+        400,
+        true,
+    )
+}
+
+fn query_action_matches_version(
+    service: ServiceName,
+    action: &str,
+    version: &str,
+) -> bool {
+    match service {
+        ServiceName::Iam => version == iam_query::IAM_QUERY_VERSION,
+        #[cfg(feature = "sns")]
+        ServiceName::Sns => version == sns::SNS_QUERY_VERSION,
+        #[cfg(feature = "sqs")]
+        ServiceName::Sqs => version == sqs::SQS_QUERY_VERSION,
+        #[cfg(feature = "cloudformation")]
+        ServiceName::CloudFormation => {
+            version == cloudformation::CLOUDFORMATION_QUERY_VERSION
+        }
+        ServiceName::Sts => version == sts_query::STS_QUERY_VERSION,
+        #[cfg(feature = "cloudwatch")]
+        ServiceName::CloudWatch => {
+            version == cloudwatch::CLOUDWATCH_QUERY_VERSION
+        }
+        #[cfg(feature = "rds")]
+        ServiceName::Rds => version == rds::RDS_QUERY_VERSION,
+        #[cfg(feature = "elasticache")]
+        ServiceName::ElastiCache => {
+            elasticache::action_matches_version(action, Some(version))
+        }
+        _ => true,
+    }
+}
+
 fn unknown_query_error(context: &RequestContext) -> AwsError {
     AwsError::trusted_custom(
         AwsErrorFamily::Validation,
@@ -2087,6 +2137,7 @@ mod tests {
     use crate::request::HttpRequest;
     use crate::supported_services;
     use crate::test_runtime;
+    use crate::{iam_query, sts_query};
     use auth::VerifiedRequest;
     use aws::{
         Arn, AwsPrincipalType, CallerCredentialKind, CallerIdentity,
@@ -5071,6 +5122,69 @@ mod tests {
         );
         assert!(list_body.contains("<ListQueuesResult"));
         assert!(!list_body.contains("demo"));
+    }
+
+    #[test]
+    fn runtime_known_query_actions_reject_unsupported_versions() {
+        #[cfg(feature = "sqs")]
+        let cases = [
+            ("GetCallerIdentity", iam_query::IAM_QUERY_VERSION),
+            ("ListUsers", sts_query::STS_QUERY_VERSION),
+            ("ListQueues", sts_query::STS_QUERY_VERSION),
+        ];
+        #[cfg(not(feature = "sqs"))]
+        let cases = [
+            ("GetCallerIdentity", iam_query::IAM_QUERY_VERSION),
+            ("ListUsers", sts_query::STS_QUERY_VERSION),
+        ];
+
+        for (action, version) in cases {
+            let body = format!("Action={action}&Version={version}");
+            let response = router().handle_bytes(
+                format!(
+                    "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let response_bytes = response.to_http_bytes();
+            let (status, headers, body) = split_response(&response_bytes);
+            let body =
+                std::str::from_utf8(body).expect("query body should be UTF-8");
+
+            assert_eq!(status, "HTTP/1.1 400 Bad Request");
+            assert_eq!(
+                header_value(&headers, "content-type"),
+                Some("text/xml")
+            );
+            assert!(body.contains("<Code>InvalidAction</Code>"));
+            assert!(body.contains(&format!(
+                "<Message>Could not find operation {action} for version {version}.</Message>"
+            )));
+        }
+    }
+
+    #[test]
+    fn runtime_json_markers_win_over_query_heuristics() {
+        let body = "Action=GetCallerIdentity&Version=2011-06-15";
+        let response = router().handle_bytes(
+            format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nContent-Type: application/x-amz-json-1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+        let body: AwsJsonErrorBody = serde_json::from_slice(body)
+            .expect("body should be a JSON AWS error");
+
+        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        assert_eq!(
+            header_value(&headers, "content-type"),
+            Some("application/x-amz-json-1.1")
+        );
+        assert_eq!(body.error_type, "ValidationException");
     }
 
     #[test]

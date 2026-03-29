@@ -30,6 +30,7 @@ use time::format_description::well_known::Rfc3339;
 const CLOUDWATCH_QUERY_XMLNS: &str =
     "http://monitoring.amazonaws.com/doc/2010-08-01/";
 const REQUEST_ID: &str = "0000000000000000";
+pub(crate) const CLOUDWATCH_QUERY_VERSION: &str = "2010-08-01";
 
 enum MetricsResponse {
     DescribeAlarms(DescribeAlarmsOutput),

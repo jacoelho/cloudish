@@ -11,6 +11,7 @@ use services::{
 
 const REQUEST_ID: &str = "0000000000000000";
 const STS_XMLNS: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
+pub(crate) const STS_QUERY_VERSION: &str = "2011-06-15";
 
 pub(crate) fn is_sts_action(action: &str) -> bool {
     matches!(

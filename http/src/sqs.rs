@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 
 const REQUEST_ID: &str = "0000000000000000";
 const SQS_XMLNS: &str = "http://queue.amazonaws.com/doc/2012-11-05/";
+pub(crate) const SQS_QUERY_VERSION: &str = "2012-11-05";
 
 pub(crate) fn is_sqs_action(action: &str) -> bool {
     matches!(
