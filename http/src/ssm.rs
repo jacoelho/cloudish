@@ -1153,7 +1153,7 @@ mod tests {
         assert!(
             json_response(&get_parameters_by_path_response(
                 &services::SsmGetParametersByPathOutput {
-                    parameters: vec![parameter.clone()],
+                    parameters: vec![parameter],
                 },
             ))
             .expect("path response should serialize")

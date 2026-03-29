@@ -1215,7 +1215,7 @@ mod tests {
             &persistent_factory(&root),
             EventBridgeServiceDependencies {
                 clock: Arc::new(FixedClock),
-                dispatcher: dispatcher.clone(),
+                dispatcher,
                 scheduler: first_scheduler,
             },
         );

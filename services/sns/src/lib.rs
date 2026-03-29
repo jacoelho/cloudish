@@ -567,7 +567,6 @@ mod tests {
                 subscription
                     .state
                     .listed_subscription_arn(&subscription.subscription_arn)
-                    .clone()
             })
             .collect()
     }
@@ -775,7 +774,7 @@ mod tests {
                     .to_owned(),
                 protocol: "sqs".to_owned(),
                 return_subscription_arn: false,
-                topic_arn: topic_arn.clone(),
+                topic_arn,
             })
             .expect("sqs subscription should auto confirm");
 
@@ -827,7 +826,7 @@ mod tests {
                 endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
                 protocol: "http".to_owned(),
                 return_subscription_arn: true,
-                topic_arn: topic_arn.clone(),
+                topic_arn,
             })
             .expect("subscription should be created");
         let token = transport.confirmations()[0].token.clone();
@@ -1376,7 +1375,7 @@ mod tests {
                 endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
                 protocol: "http".to_owned(),
                 return_subscription_arn: false,
-                topic_arn: topic_arn.clone(),
+                topic_arn,
             })
             .expect("failing forwarder should not fail subscribe");
         let bad_topic = service

@@ -2122,7 +2122,7 @@ fn build_http_api_lambda_event(
         "rawPath": matched.request_path(),
         "rawQueryString": request.query_string().unwrap_or_default(),
         "cookies": extract_cookies(request.headers()),
-        "headers": Value::Object(single_headers.clone()),
+        "headers": Value::Object(single_headers),
         "queryStringParameters": if query_string_parameters.is_empty() {
             Value::Null
         } else {
@@ -2794,7 +2794,7 @@ mod tests {
             .expect("second page should list");
         assert_eq!(second_page.items.len(), 1);
 
-        let api_id = first_api.api_id.clone();
+        let api_id = first_api.api_id;
         let fetched_api =
             service.get_http_api(scope, &api_id).expect("api should fetch");
         assert_eq!(fetched_api.name, "first");
@@ -2850,7 +2850,6 @@ mod tests {
             .expect("proxy integration should create");
         let proxy_integration_id = proxy_integration
             .integration_id
-            .clone()
             .expect("proxy integration id should exist");
         let lambda_integration = service
             .create_http_api_integration(
@@ -2876,7 +2875,6 @@ mod tests {
             .expect("lambda integration should create");
         let lambda_integration_id = lambda_integration
             .integration_id
-            .clone()
             .expect("lambda integration id should exist");
 
         let listed_integrations = service
@@ -2963,10 +2961,8 @@ mod tests {
                 },
             )
             .expect("authorizer should create");
-        let authorizer_id = authorizer
-            .authorizer_id
-            .clone()
-            .expect("authorizer id should exist");
+        let authorizer_id =
+            authorizer.authorizer_id.expect("authorizer id should exist");
 
         let fetched_authorizer = service
             .get_http_api_authorizer(scope, api_id, &authorizer_id)
@@ -3051,7 +3047,7 @@ mod tests {
                 },
             )
             .expect("default route should create");
-        let route_id = primary_route.route_id.clone();
+        let route_id = primary_route.route_id;
 
         let listed_routes = service
             .get_http_api_routes(scope, api_id, None, Some(1))
@@ -3122,7 +3118,7 @@ mod tests {
                 },
             )
             .expect("deployment should create");
-        let deployment_id = deployment.deployment_id.clone();
+        let deployment_id = deployment.deployment_id;
         let fetched_deployment = service
             .get_http_api_deployment(scope, api_id, &deployment_id)
             .expect("deployment should fetch");
@@ -3787,7 +3783,7 @@ mod tests {
                 },
             )
             .expect("api should create");
-        let api_id = api.api_id.clone();
+        let api_id = api.api_id;
         let lambda_integration = service
             .create_http_api_integration(
                 scope,
@@ -4262,7 +4258,7 @@ mod tests {
                 },
             )
             .expect("http api should create");
-        let api_id = api.api_id.clone();
+        let api_id = api.api_id;
 
         let integration = service
             .create_http_api_integration(
@@ -4324,7 +4320,7 @@ mod tests {
                 },
             )
             .expect("route should create");
-        let route_id = route.route_id.clone();
+        let route_id = route.route_id;
 
         let deployment = service
             .create_http_api_deployment(
@@ -4336,7 +4332,7 @@ mod tests {
                 },
             )
             .expect("deployment should create");
-        let deployment_id = deployment.deployment_id.clone();
+        let deployment_id = deployment.deployment_id;
 
         let stage = service
             .create_http_api_stage(

@@ -225,6 +225,37 @@ pub(crate) struct StartedRuntime {
     pub proxy: Box<dyn RunningElastiCacheProxy>,
 }
 
+pub(crate) struct RuntimeStartInput {
+    auth_mode: ElastiCacheAuthenticationType,
+    authenticator: Arc<dyn ElastiCacheConnectionAuthenticator + Send + Sync>,
+    engine: ElastiCacheEngine,
+    listen_port: Option<u16>,
+    replication_group_id: ElastiCacheReplicationGroupId,
+    scope: ElastiCacheScope,
+}
+
+impl RuntimeStartInput {
+    pub(crate) fn new(
+        scope: ElastiCacheScope,
+        replication_group_id: ElastiCacheReplicationGroupId,
+        engine: ElastiCacheEngine,
+        auth_mode: ElastiCacheAuthenticationType,
+        listen_port: Option<u16>,
+        authenticator: Arc<
+            dyn ElastiCacheConnectionAuthenticator + Send + Sync,
+        >,
+    ) -> Self {
+        Self {
+            auth_mode,
+            authenticator,
+            engine,
+            listen_port,
+            replication_group_id,
+            scope,
+        }
+    }
+}
+
 impl StartedRuntime {
     pub(crate) fn proxy_port(&self) -> u16 {
         self.proxy.listen_endpoint().port()
@@ -243,13 +274,16 @@ impl StartedRuntime {
 pub(crate) fn start_runtime(
     node_runtime: &Arc<dyn ElastiCacheNodeRuntime + Send + Sync>,
     proxy_runtime: &Arc<dyn ElastiCacheProxyRuntime + Send + Sync>,
-    scope: &ElastiCacheScope,
-    replication_group_id: &ElastiCacheReplicationGroupId,
-    engine: ElastiCacheEngine,
-    auth_mode: ElastiCacheAuthenticationType,
-    listen_port: Option<u16>,
-    authenticator: Arc<dyn ElastiCacheConnectionAuthenticator + Send + Sync>,
+    input: RuntimeStartInput,
 ) -> Result<StartedRuntime, ElastiCacheError> {
+    let RuntimeStartInput {
+        auth_mode,
+        authenticator,
+        engine,
+        listen_port,
+        replication_group_id,
+        scope,
+    } = input;
     let backend = node_runtime
         .start(&ElastiCacheNodeSpec::new(
             replication_group_id.clone(),
@@ -261,8 +295,8 @@ pub(crate) fn start_runtime(
         })?;
     let upstream = backend.listen_endpoint();
     let proxy = match proxy_runtime.start(&ElastiCacheProxySpec::new(
-        scope.clone(),
-        replication_group_id.clone(),
+        scope,
+        replication_group_id,
         auth_mode,
         Endpoint::localhost(listen_port.unwrap_or(0)),
         upstream,

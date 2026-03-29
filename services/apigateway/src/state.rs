@@ -777,7 +777,6 @@ impl ApiGatewayService {
         let resources = api
             .resources
             .values()
-            .cloned()
             .map(|resource| resource.to_resource())
             .collect::<Vec<_>>();
 
@@ -1248,7 +1247,7 @@ impl ApiGatewayService {
                 stage_name.clone(),
                 StoredStage {
                     created_date: created,
-                    deployment_id: Some(deployment_id.clone()),
+                    deployment_id: Some(deployment_id),
                     description,
                     last_updated_date: created_date,
                     stage_name,
@@ -2046,13 +2045,13 @@ impl ApiGatewayService {
             });
         }
         let key = StoredUsagePlanKey {
-            id: api_key.id.clone(),
-            name: api_key.name.clone(),
+            id: api_key.id,
+            name: api_key.name,
             type_: input.key_type,
-            value: api_key.value.clone(),
+            value: api_key.value,
         };
         let response = key.to_usage_plan_key();
-        usage_plan.usage_plan_keys.insert(api_key.id.clone(), key);
+        usage_plan.usage_plan_keys.insert(key.id.clone(), key);
         self.save_state(scope, state)?;
 
         Ok(response)
@@ -4418,7 +4417,7 @@ mod tests {
                 &scope,
                 &usage_plan.id,
                 CreateUsagePlanKeyInput {
-                    key_id: api_key.id.clone(),
+                    key_id: api_key.id,
                     key_type: "API_KEY".to_owned(),
                 },
             )
@@ -4450,7 +4449,7 @@ mod tests {
                 &domain.domain_name,
                 CreateBasePathMappingInput {
                     base_path: Some("v1".to_owned()),
-                    rest_api_id: api.id.clone(),
+                    rest_api_id: api.id,
                     stage: "dev".to_owned(),
                 },
             )

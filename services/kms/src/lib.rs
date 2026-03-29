@@ -876,7 +876,7 @@ mod tests {
             .re_encrypt(
                 &scope,
                 super::KmsReEncryptInput {
-                    ciphertext_blob: encrypt.ciphertext_blob.clone(),
+                    ciphertext_blob: encrypt.ciphertext_blob,
                     destination_key_id: key_ref_from_id(
                         &encrypt_key.key_metadata.key_id,
                     ),
@@ -946,7 +946,7 @@ mod tests {
                     message_type: Some(
                         KmsMessageType::Raw.as_str().to_owned(),
                     ),
-                    signature: signature.signature.clone(),
+                    signature: signature.signature,
                     signing_algorithm: "RSASSA_PSS_SHA_256".to_owned(),
                 },
             )

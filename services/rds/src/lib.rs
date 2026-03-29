@@ -53,6 +53,11 @@ use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 use storage::{StorageFactory, StorageHandle};
 
+type RestoredClusterRuntimes = Vec<(ClusterRuntimeKey, ClusterRuntime)>;
+type RestoredInstanceRuntimes = Vec<(InstanceRuntimeKey, InstanceRuntime)>;
+type RestoredScopeRuntimes =
+    (RestoredClusterRuntimes, RestoredInstanceRuntimes);
+
 #[derive(Clone)]
 pub struct RdsService {
     backend_runtime: Arc<dyn RdsBackendRuntime + Send + Sync>,
@@ -292,7 +297,7 @@ impl RdsService {
                 db_name: cluster.database_name.clone(),
                 db_parameter_group_name: parameter_group_name,
                 dbi_resource_id: state.next_instance_resource_id(),
-                endpoint: public_endpoint.clone(),
+                endpoint: public_endpoint,
                 engine,
                 engine_version: input
                     .engine_version
@@ -302,7 +307,7 @@ impl RdsService {
                 instance_create_time_epoch_seconds: self
                     .current_epoch_seconds(),
                 master_password: cluster.master_password.clone(),
-                master_username: cluster.master_username.clone(),
+                master_username: cluster.master_username,
             };
 
             let runtime_key = InstanceRuntimeKey::new(scope, &identifier);
@@ -313,7 +318,7 @@ impl RdsService {
                     is_cluster_writer: false,
                 });
             }
-            state.instances.insert(identifier.clone(), instance);
+            state.instances.insert(identifier, instance);
             if let Err(error) = self.save_state(scope, state) {
                 let _ = proxy.stop();
                 return Err(error);
@@ -402,7 +407,7 @@ impl RdsService {
         };
         let output = instance.to_output(scope);
         let runtime_key = InstanceRuntimeKey::new(scope, &identifier);
-        state.instances.insert(identifier.clone(), instance);
+        state.instances.insert(identifier, instance);
         if let Err(error) = self.save_state(scope, state) {
             let _ = started.stop();
             return Err(error);
@@ -455,13 +460,12 @@ impl RdsService {
     ) -> Result<DbInstance, RdsError> {
         let identifier = db_instance_identifier.clone();
         let mut state = self.load_state(scope);
-        let current =
+        let mut updated =
             state.instances.get(&identifier).cloned().ok_or_else(|| {
                 RdsError::DbInstanceNotFound {
                     message: format!("DB instance {identifier} not found."),
                 }
             })?;
-        let mut updated = current.clone();
         if let Some(parameter_group_name) =
             input.db_parameter_group_name.as_ref()
         {
@@ -750,13 +754,12 @@ impl RdsService {
     ) -> Result<DbCluster, RdsError> {
         let identifier = db_cluster_identifier.clone();
         let mut state = self.load_state(scope);
-        let current =
+        let mut updated =
             state.clusters.get(&identifier).cloned().ok_or_else(|| {
                 RdsError::DbClusterNotFoundFault {
                     message: format!("DB cluster {identifier} not found."),
                 }
             })?;
-        let mut updated = current.clone();
         if let Some(parameter_group_name) =
             input.db_cluster_parameter_group_name.as_ref()
         {
@@ -1007,13 +1010,7 @@ impl RdsService {
         &self,
         scope: &RdsScope,
         state: &StoredRdsState,
-    ) -> Result<
-        (
-            Vec<(ClusterRuntimeKey, ClusterRuntime)>,
-            Vec<(InstanceRuntimeKey, InstanceRuntime)>,
-        ),
-        RdsError,
-    > {
+    ) -> Result<RestoredScopeRuntimes, RdsError> {
         let mut restored_clusters = Vec::new();
         let mut restored_instances = Vec::new();
         let mut cluster_upstreams = BTreeMap::new();
@@ -1086,10 +1083,18 @@ impl RdsService {
             .into_iter()
             .filter(|instance| instance.db_cluster_identifier.is_some())
         {
-            let cluster_identifier =
-                instance.db_cluster_identifier.as_ref().expect(
-                    "filtered cluster-backed instance should have a cluster",
+            let Some(cluster_identifier) =
+                instance.db_cluster_identifier.as_ref()
+            else {
+                self.stop_restored_runtimes(
+                    restored_instances,
+                    restored_clusters,
                 );
+                return Err(RdsError::internal(format!(
+                    "Missing persisted cluster identifier for DB instance {}.",
+                    instance.db_instance_identifier
+                )));
+            };
             let Some((upstream, auth_endpoints)) =
                 cluster_upstreams.get(cluster_identifier).cloned()
             else {

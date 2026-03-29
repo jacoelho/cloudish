@@ -1086,7 +1086,7 @@ mod tests {
                 &scope,
                 GetSecretValueInput {
                     secret_id: secret_ref("app/secret"),
-                    version_id: created.version_id.clone(),
+                    version_id: created.version_id,
                     version_stage: Some(PREVIOUS_STAGE.to_owned()),
                 },
             )

@@ -1808,7 +1808,7 @@ impl ScopedIamState {
                 StoredPolicyVersion {
                     create_date: created_at,
                     document: PolicyDocument::new(input.policy_document)?,
-                    version_id: version_id.clone(),
+                    version_id,
                 },
             )]),
         };

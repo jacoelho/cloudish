@@ -1609,7 +1609,7 @@ mod tests {
                 &scope,
                 GetRecordsInput {
                     limit: Some(2),
-                    shard_iterator: trim_horizon.shard_iterator.clone(),
+                    shard_iterator: trim_horizon.shard_iterator,
                 },
             )
             .expect("first records page should read");

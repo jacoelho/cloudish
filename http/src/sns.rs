@@ -1119,8 +1119,7 @@ mod tests {
             "/",
             "Action=Subscribe&TopicArn=arn%3Aaws%3Asns%3Aeu-west-2%3A000000000000%3Aorders&Protocol=http&Endpoint=http%3A%2F%2F127.0.0.1%3A9010%2Fsubscription&ReturnSubscriptionArn=true",
         ));
-        let subscribe_body =
-            split_response(&subscribe.to_http_bytes()).2.clone();
+        let subscribe_body = split_response(&subscribe.to_http_bytes()).2;
         let token = forwarder
             .bodies
             .lock()

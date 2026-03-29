@@ -36,7 +36,7 @@ use crate::replication_groups::{
 };
 use crate::runtime::{
     ElastiCacheRuntimeState, ReplicationGroupRuntime,
-    ReplicationGroupRuntimeKey, recover, start_runtime,
+    ReplicationGroupRuntimeKey, RuntimeStartInput, recover, start_runtime,
 };
 use crate::users::{
     REQUESTED_STATUS_ACTIVE, REQUESTED_STATUS_DELETING, StoredElastiCacheUser,
@@ -195,12 +195,14 @@ impl ElastiCacheService {
         let started = start_runtime(
             &self.node_runtime,
             &self.proxy_runtime,
-            scope,
-            &replication_group_id,
-            engine,
-            auth_mode,
-            None,
-            Arc::new(self.clone()),
+            RuntimeStartInput::new(
+                scope.clone(),
+                replication_group_id.clone(),
+                engine,
+                auth_mode,
+                None,
+                Arc::new(self.clone()),
+            ),
         )?;
         let group = StoredReplicationGroup {
             auth_mode,
@@ -251,12 +253,7 @@ impl ElastiCacheService {
             return Ok(vec![group.to_output()]);
         }
 
-        Ok(state
-            .groups
-            .values()
-            .cloned()
-            .map(|group| group.to_output())
-            .collect())
+        Ok(state.groups.values().map(|group| group.to_output()).collect())
     }
 
     /// # Errors
@@ -368,7 +365,6 @@ impl ElastiCacheService {
         Ok(state
             .users
             .values()
-            .cloned()
             .map(|user| user.to_output(scope, REQUESTED_STATUS_ACTIVE))
             .collect())
     }
@@ -475,12 +471,14 @@ impl ElastiCacheService {
             let started = match start_runtime(
                 &self.node_runtime,
                 &self.proxy_runtime,
-                scope,
-                &group.replication_group_id,
-                group.engine,
-                group.auth_mode,
-                Some(group.endpoint.port),
-                Arc::new(self.clone()),
+                RuntimeStartInput::new(
+                    scope.clone(),
+                    group.replication_group_id.clone(),
+                    group.engine,
+                    group.auth_mode,
+                    Some(group.endpoint.port),
+                    Arc::new(self.clone()),
+                ),
             ) {
                 Ok(started) => started,
                 Err(error) => {
@@ -1859,7 +1857,7 @@ mod tests {
         let proxy_runtime = Arc::new(FakeProxyRuntime::with_port(8001));
         let service = service(
             "groups-round-trip",
-            node_runtime.clone(),
+            node_runtime,
             proxy_runtime.clone(),
             Arc::new(RejectAllElastiCacheIamTokenValidator),
         );

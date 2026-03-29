@@ -1398,7 +1398,7 @@ impl LambdaService {
             enabled: input.enabled.unwrap_or(true),
             event_source_arn: input.event_source_arn,
             function_name: locator.function_name.clone(),
-            qualifier: locator.qualifier.clone(),
+            qualifier: locator.qualifier,
             last_modified_epoch_seconds: self.now_epoch_seconds()?,
             maximum_batching_window_in_seconds,
             uuid: self.next_revision_id()?,
@@ -4055,8 +4055,7 @@ mod tests {
     fn lambda_core_update_alias_and_update_code_require_matching_revision_ids()
     {
         let executor = Arc::new(RecordingExecutor::default());
-        let lambda =
-            service(executor.clone(), Arc::new(MemoryBlobStore::default()));
+        let lambda = service(executor, Arc::new(MemoryBlobStore::default()));
 
         let created = lambda
             .create_function(
@@ -4083,7 +4082,7 @@ mod tests {
                 "demo",
                 PublishVersionInput {
                     description: None,
-                    revision_id: Some(created.revision_id.clone()),
+                    revision_id: Some(created.revision_id),
                 },
             )
             .unwrap();
@@ -4093,7 +4092,7 @@ mod tests {
                 "demo",
                 CreateAliasInput {
                     description: None,
-                    function_version: version.version.clone(),
+                    function_version: version.version,
                     name: "live".to_owned(),
                 },
             )
@@ -4136,7 +4135,7 @@ mod tests {
                 UpdateAliasInput {
                     description: Some("new".to_owned()),
                     function_version: Some("1".to_owned()),
-                    revision_id: Some(alias.revision_id.clone()),
+                    revision_id: Some(alias.revision_id),
                 },
             )
             .unwrap();
@@ -4384,8 +4383,7 @@ mod tests {
                 .to_vec(),
             Option::<String>::None,
         ));
-        let lambda =
-            service(executor.clone(), Arc::new(MemoryBlobStore::default()));
+        let lambda = service(executor, Arc::new(MemoryBlobStore::default()));
         let alternate_scope = alternate_scope();
 
         lambda
@@ -4475,10 +4473,8 @@ mod tests {
             br#"{"errorMessage":"boom"}"#.to_vec(),
             Some("Unhandled"),
         ));
-        let (lambda, sqs) = service_with_sqs(
-            executor.clone(),
-            Arc::new(MemoryBlobStore::default()),
-        );
+        let (lambda, sqs) =
+            service_with_sqs(executor, Arc::new(MemoryBlobStore::default()));
         let failure_queue = create_queue(&sqs, "lambda-failure");
         let dead_letter_queue = create_queue(&sqs, "lambda-dlq");
         let failure_queue_arn = queue_arn(&sqs, &failure_queue);
@@ -4489,9 +4485,7 @@ mod tests {
                 &scope(),
                 CreateFunctionInput {
                     code: inline_zip(),
-                    dead_letter_target_arn: Some(
-                        dead_letter_queue_arn.clone(),
-                    ),
+                    dead_letter_target_arn: Some(dead_letter_queue_arn),
                     description: None,
                     environment: BTreeMap::new(),
                     function_name: "async-demo".to_owned(),
@@ -4513,7 +4507,7 @@ mod tests {
                 PutFunctionEventInvokeConfigInput {
                     destination_config: Some(DestinationConfigInput {
                         on_failure: Some(DestinationTargetInput {
-                            destination: failure_queue_arn.clone(),
+                            destination: failure_queue_arn,
                         }),
                         on_success: None,
                     }),

@@ -384,7 +384,7 @@ mod tests {
             Some("arn:aws:sqs:eu-west-2:000000000000:success"),
         );
         let output = function_event_invoke_config_output(
-            Some(config.clone()),
+            Some(config),
             "arn:aws:lambda:eu-west-2:000000000000:function:demo:$LATEST"
                 .to_owned(),
             60,

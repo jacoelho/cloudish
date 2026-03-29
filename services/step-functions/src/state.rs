@@ -257,7 +257,7 @@ impl StepFunctionsService {
                 execution_started_event_details: Some(
                     ExecutionStartedEventDetails {
                         input: input_string,
-                        role_arn: state_machine.role_arn.clone(),
+                        role_arn: state_machine.role_arn,
                     },
                 ),
                 execution_succeeded_event_details: None,
@@ -276,16 +276,14 @@ impl StepFunctionsService {
         let runner = self.clone();
         let task_name = format!("step-functions-{execution_name}");
         let state_machine_scope = scope.clone();
-        let key_for_task = key.clone();
-        let input_for_task = input_value.clone();
         self.execution_spawner.spawn(
             &task_name,
             Box::new(move || {
                 runner.run_execution(
                     &state_machine_scope,
-                    &key_for_task,
+                    &key,
                     &definition,
-                    input_for_task,
+                    input_value,
                 );
             }),
         )?;
@@ -2959,7 +2957,7 @@ mod tests {
                 StartExecutionInput {
                     input: Some(r#"{"hello":"world"}"#.to_owned()),
                     name: Some("run-1".to_owned()),
-                    state_machine_arn: created.state_machine_arn.clone(),
+                    state_machine_arn: created.state_machine_arn,
                     trace_header: None,
                 },
             )
@@ -3254,7 +3252,7 @@ mod tests {
                     UNIX_EPOCH + Duration::from_secs(20),
                 )),
                 execution_spawner: Arc::new(ThreadSpawner),
-                sleeper: sleeper.clone(),
+                sleeper,
                 task_adapter: Arc::new(StaticTaskAdapter::default()),
             },
         );

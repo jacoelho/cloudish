@@ -182,8 +182,7 @@ pub fn build_sns_service(
 ) -> SnsService {
     dependencies.advertised_edge = advertised_edge;
     if dependencies.http_signer.is_none() {
-        dependencies.http_signer =
-            Some(Arc::new(CloudishSnsHttpSigner::default()));
+        dependencies.http_signer = Some(Arc::new(CloudishSnsHttpSigner));
     }
     SnsService::with_transport(
         time_source,
@@ -439,7 +438,7 @@ impl SnsDeliveryDispatcher {
         self.dependencies
             .http_signer
             .clone()
-            .unwrap_or_else(|| Arc::new(CloudishSnsHttpSigner::default()))
+            .unwrap_or_else(|| Arc::new(CloudishSnsHttpSigner))
     }
 }
 

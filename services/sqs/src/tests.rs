@@ -711,7 +711,7 @@ fn sqs_fifo_batch_apis_report_partial_failures() {
             vec![
                 DeleteMessageBatchEntryInput {
                     id: "delete-ok".to_owned(),
-                    receipt_handle: receipt_handle.clone(),
+                    receipt_handle,
                 },
                 DeleteMessageBatchEntryInput {
                     id: "delete-bad".to_owned(),
@@ -748,7 +748,7 @@ fn sqs_fifo_batch_apis_report_partial_failures() {
             vec![
                 ChangeMessageVisibilityBatchEntryInput {
                     id: "change-ok".to_owned(),
-                    receipt_handle: receipt_handle.clone(),
+                    receipt_handle,
                     visibility_timeout: 30,
                 },
                 ChangeMessageVisibilityBatchEntryInput {
