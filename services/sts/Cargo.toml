@@ -12,6 +12,7 @@ workspace = true
 aws = { path = "../../aws" }
 base64 = "0.22.1"
 iam = { path = "../iam" }
+quick-xml.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time = { version = "0.3.47", features = ["formatting"] }

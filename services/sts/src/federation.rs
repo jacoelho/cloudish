@@ -7,6 +7,8 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
 };
+use quick_xml::Reader;
+use quick_xml::events::{BytesStart, Event};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -218,16 +220,14 @@ pub(crate) fn normalize_saml(
     input: &AssumeRoleWithSamlInput,
 ) -> Result<SamlContext, StsError> {
     let decoded = decode_saml_assertion(&input.saml_assertion)?;
-    let role_session_name = extract_attribute_value(
-        &decoded,
-        "https://aws.amazon.com/SAML/Attributes/RoleSessionName",
-    )
-    .unwrap_or_else(|| "saml-session".to_owned());
-    let audience = extract_tag_text(&decoded, "Audience")
-        .unwrap_or_else(|| "urn:amazon:webservices".to_owned());
-    let issuer = extract_tag_text(&decoded, "Issuer")
-        .unwrap_or_else(|| "https://saml.example.com".to_owned());
-    let name_id = extract_name_id(&decoded);
+    let parsed = parse_saml_assertion(&decoded)?;
+    let role_session_name =
+        parsed.role_session_name.unwrap_or_else(|| "saml-session".to_owned());
+    let audience =
+        parsed.audience.unwrap_or_else(|| "urn:amazon:webservices".to_owned());
+    let issuer =
+        parsed.issuer.unwrap_or_else(|| "https://saml.example.com".to_owned());
+    let name_id = parsed.name_id;
     let subject = name_id
         .as_ref()
         .map(|name_id| name_id.value.clone())
@@ -395,31 +395,12 @@ fn decode_saml_assertion(assertion: &str) -> Result<String, StsError> {
     })
 }
 
-fn extract_attribute_value(
-    decoded_assertion: &str,
-    name: &str,
-) -> Option<String> {
-    let attribute_start =
-        decoded_assertion.find(&format!("Name=\"{name}\""))?;
-    let value_start = decoded_assertion[attribute_start..]
-        .find("<AttributeValue>")?
-        + attribute_start
-        + "<AttributeValue>".len();
-    let value_end = decoded_assertion[value_start..]
-        .find("</AttributeValue>")?
-        + value_start;
-
-    Some(decoded_assertion[value_start..value_end].trim().to_owned())
-}
-
-fn extract_tag_text(decoded_assertion: &str, tag: &str) -> Option<String> {
-    let start_tag = format!("<{tag}>");
-    let end_tag = format!("</{tag}>");
-    let value_start = decoded_assertion.find(&start_tag)? + start_tag.len();
-    let value_end =
-        decoded_assertion[value_start..].find(&end_tag)? + value_start;
-
-    Some(decoded_assertion[value_start..value_end].trim().to_owned())
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ParsedSamlAssertion {
+    audience: Option<String>,
+    issuer: Option<String>,
+    name_id: Option<NameId>,
+    role_session_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,26 +426,181 @@ impl NameId {
     }
 }
 
-fn extract_name_id(decoded_assertion: &str) -> Option<NameId> {
-    let start = decoded_assertion.find("<NameID")?;
-    let open_end = decoded_assertion[start..].find('>')? + start;
-    let close_start =
-        decoded_assertion[open_end + 1..].find("</NameID>")? + open_end + 1;
-    let open_tag = &decoded_assertion[start..=open_end];
+fn parse_saml_assertion(
+    decoded_assertion: &str,
+) -> Result<ParsedSamlAssertion, StsError> {
+    let mut reader = Reader::from_str(decoded_assertion);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut parsed = ParsedSamlAssertion::default();
+    let mut current_attribute_name = None;
+    let mut in_attribute_value = false;
+    let mut in_audience = false;
+    let mut in_issuer = false;
+    let mut current_name_id = None;
+    let mut depth = 0_usize;
+    let mut saw_element = false;
 
-    Some(NameId {
-        format: extract_attribute(open_tag, "Format"),
-        name_qualifier: extract_attribute(open_tag, "NameQualifier"),
-        value: decoded_assertion[open_end + 1..close_start].trim().to_owned(),
-    })
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(event)) => {
+                saw_element = true;
+                depth += 1;
+                match xml_local_name(event.name().as_ref()) {
+                    b"Attribute" => {
+                        current_attribute_name =
+                            saml_attribute_value(&event, &reader, b"Name")?;
+                    }
+                    b"AttributeValue" => {
+                        in_attribute_value = current_attribute_name.as_deref()
+                            == Some(
+                                "https://aws.amazon.com/SAML/Attributes/RoleSessionName",
+                            );
+                    }
+                    b"Audience" => in_audience = true,
+                    b"Issuer" => in_issuer = true,
+                    b"NameID" => {
+                        current_name_id = Some(NameId {
+                            format: saml_attribute_value(
+                                &event, &reader, b"Format",
+                            )?,
+                            name_qualifier: saml_attribute_value(
+                                &event,
+                                &reader,
+                                b"NameQualifier",
+                            )?,
+                            value: String::new(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(event)) => {
+                if depth == 0 {
+                    return Err(invalid_saml_assertion_error());
+                }
+                depth -= 1;
+                match xml_local_name(event.name().as_ref()) {
+                    b"Attribute" => current_attribute_name = None,
+                    b"AttributeValue" => in_attribute_value = false,
+                    b"Audience" => in_audience = false,
+                    b"Issuer" => in_issuer = false,
+                    b"NameID" => {
+                        if let Some(name_id) = current_name_id
+                            .take()
+                            .filter(|name_id| !name_id.value.is_empty())
+                            && parsed.name_id.is_none()
+                        {
+                            parsed.name_id = Some(name_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(event)) => {
+                let text = xml_text(event.as_ref())?;
+                capture_saml_text(
+                    &mut parsed,
+                    current_name_id.as_mut(),
+                    &text,
+                    in_attribute_value,
+                    in_audience,
+                    in_issuer,
+                );
+            }
+            Ok(Event::CData(event)) => {
+                let text = xml_text(event.as_ref())?;
+                capture_saml_text(
+                    &mut parsed,
+                    current_name_id.as_mut(),
+                    &text,
+                    in_attribute_value,
+                    in_audience,
+                    in_issuer,
+                );
+            }
+            Ok(Event::Empty(_)) => saw_element = true,
+            Ok(Event::Eof) => {
+                return if saw_element && depth == 0 {
+                    Ok(parsed)
+                } else {
+                    Err(invalid_saml_assertion_error())
+                };
+            }
+            Ok(
+                Event::Comment(_)
+                | Event::Decl(_)
+                | Event::DocType(_)
+                | Event::PI(_),
+            ) => {}
+            Err(_) => return Err(invalid_saml_assertion_error()),
+        }
+        buf.clear();
+    }
 }
 
-fn extract_attribute(open_tag: &str, attribute_name: &str) -> Option<String> {
-    let marker = format!("{attribute_name}=\"");
-    let value_start = open_tag.find(&marker)? + marker.len();
-    let value_end = open_tag[value_start..].find('"')? + value_start;
+fn capture_saml_text(
+    parsed: &mut ParsedSamlAssertion,
+    current_name_id: Option<&mut NameId>,
+    text: &str,
+    in_attribute_value: bool,
+    in_audience: bool,
+    in_issuer: bool,
+) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
 
-    Some(open_tag[value_start..value_end].to_owned())
+    if in_attribute_value && parsed.role_session_name.is_none() {
+        parsed.role_session_name = Some(text.to_owned());
+    }
+    if in_audience && parsed.audience.is_none() {
+        parsed.audience = Some(text.to_owned());
+    }
+    if in_issuer && parsed.issuer.is_none() {
+        parsed.issuer = Some(text.to_owned());
+    }
+    if let Some(name_id) = current_name_id {
+        name_id.value.push_str(text);
+    }
+}
+
+fn saml_attribute_value(
+    event: &BytesStart<'_>,
+    reader: &Reader<&[u8]>,
+    attribute_name: &[u8],
+) -> Result<Option<String>, StsError> {
+    for attribute in event.attributes().with_checks(false) {
+        let attribute =
+            attribute.map_err(|_| invalid_saml_assertion_error())?;
+        if xml_local_name(attribute.key.as_ref()) == attribute_name {
+            return attribute
+                .decode_and_unescape_value(reader.decoder())
+                .map(|value| Some(value.into_owned()))
+                .map_err(|_| invalid_saml_assertion_error());
+        }
+    }
+
+    Ok(None)
+}
+
+fn xml_text(value: &[u8]) -> Result<String, StsError> {
+    let value = std::str::from_utf8(value)
+        .map_err(|_| invalid_saml_assertion_error())?;
+    quick_xml::escape::unescape(value)
+        .map(|value| value.into_owned())
+        .map_err(|_| invalid_saml_assertion_error())
+}
+
+fn xml_local_name(name: &[u8]) -> &[u8] {
+    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
+}
+
+fn invalid_saml_assertion_error() -> StsError {
+    StsError::Validation {
+        message: "The request must contain a valid SAML assertion.".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -487,10 +623,14 @@ mod tests {
         format!("{header}.{payload}.signature")
     }
 
-    fn saml_assertion() -> String {
+    fn namespaced_saml_assertion() -> String {
         STANDARD.encode(
-            r#"<Assertion><Issuer>https://saml.example.com</Issuer><Audience>urn:amazon:webservices</Audience><Subject><NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent" NameQualifier="saml-qualifier">saml-subject</NameID></Subject><Attribute Name="https://aws.amazon.com/SAML/Attributes/RoleSessionName"><AttributeValue>saml-session</AttributeValue></Attribute></Assertion>"#,
+            r#"<saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion"><saml2:Subject><saml2:NameID NameQualifier="saml-qualifier" Format="urn:oasis:names:tc:SAML:2.0:nameid-format:transient">saml-subject</saml2:NameID></saml2:Subject><saml2:AttributeStatement><saml2:Attribute Name="https://aws.amazon.com/SAML/Attributes/RoleSessionName"><saml2:AttributeValue>federated-session</saml2:AttributeValue></saml2:Attribute></saml2:AttributeStatement><saml2:Conditions><saml2:AudienceRestriction><saml2:Audience>urn:amazon:webservices</saml2:Audience></saml2:AudienceRestriction></saml2:Conditions><saml2:Issuer>https://saml.example.com</saml2:Issuer></saml2:Assertion>"#,
         )
+    }
+
+    fn fallback_saml_assertion() -> String {
+        STANDARD.encode("<Assertion />")
     }
 
     #[test]
@@ -561,15 +701,48 @@ mod tests {
             role_arn: "arn:aws:iam::000000000000:role/demo"
                 .parse::<Arn>()
                 .expect("role ARN should parse"),
-            saml_assertion: saml_assertion(),
+            saml_assertion: namespaced_saml_assertion(),
         })
         .expect("SAML assertion should normalize");
 
-        assert_eq!(context.role_session_name(), "saml-session");
+        assert_eq!(context.role_session_name(), "federated-session");
         assert_eq!(context.subject(), "saml-subject");
+        assert_eq!(context.subject_type(), "transient");
         assert_eq!(
             context.condition_values().get("SAML:namequalifier"),
             Some(&vec!["saml-qualifier".to_owned()])
         );
+    }
+
+    #[test]
+    fn normalize_saml_preserves_fallbacks_and_rejects_invalid_xml() {
+        let fallback = normalize_saml(&AssumeRoleWithSamlInput {
+            duration_seconds: None,
+            principal_arn: "arn:aws:iam::000000000000:saml-provider/example"
+                .parse::<Arn>()
+                .expect("principal ARN should parse"),
+            role_arn: "arn:aws:iam::000000000000:role/demo"
+                .parse::<Arn>()
+                .expect("role ARN should parse"),
+            saml_assertion: fallback_saml_assertion(),
+        })
+        .expect("minimal SAML assertion should normalize");
+        let invalid = normalize_saml(&AssumeRoleWithSamlInput {
+            duration_seconds: None,
+            principal_arn: "arn:aws:iam::000000000000:saml-provider/example"
+                .parse::<Arn>()
+                .expect("principal ARN should parse"),
+            role_arn: "arn:aws:iam::000000000000:role/demo"
+                .parse::<Arn>()
+                .expect("role ARN should parse"),
+            saml_assertion: STANDARD.encode("<Assertion>"),
+        })
+        .expect_err("malformed XML should fail");
+
+        assert_eq!(fallback.role_session_name(), "saml-session");
+        assert_eq!(fallback.audience(), "urn:amazon:webservices");
+        assert_eq!(fallback.issuer(), "https://saml.example.com");
+        assert_eq!(fallback.subject(), "saml-subject");
+        assert!(matches!(invalid, crate::StsError::Validation { .. }));
     }
 }

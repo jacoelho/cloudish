@@ -149,7 +149,12 @@ impl IamService {
         let (access_key_id, secret_access_key) =
             guard.next_access_key_material();
         let state = guard.scopes.entry(scope_key(scope)).or_default();
-        state.create_access_key(access_key_id, secret_access_key, user_name)
+        state.create_access_key(
+            access_key_id,
+            secret_access_key,
+            scope.region().clone(),
+            user_name,
+        )
     }
 
     /// Performs the requested IAM operation for the provided scoped state.
@@ -1091,7 +1096,7 @@ impl IamAccessKeyLookup for IamService {
                 access_key_id: access_key_id.to_owned(),
                 account_id: scope.account_id.clone(),
                 create_date: access_key.create_date.clone(),
-                region: scope.region.clone(),
+                region: access_key.region.clone(),
                 secret_access_key: access_key.secret_access_key.clone(),
                 status: access_key.status,
                 user_arn: user.entity.arn.clone(),
@@ -1111,13 +1116,10 @@ impl IamInstanceProfileLookup for IamService {
     ) -> Option<IamInstanceProfileRecord> {
         let guard =
             self.state.lock().unwrap_or_else(|poison| poison.into_inner());
-        let scope = ScopeKey {
-            account_id: account_id.clone(),
-            region: region.clone(),
-        };
-        let state = guard.scopes.get(&scope)?;
+        let state =
+            guard.scopes.get(&ScopeKey { account_id: account_id.clone() })?;
         let profile = state.instance_profiles.get(instance_profile_name)?;
-        Some(state.instance_profile_lookup_record(&scope, profile))
+        Some(state.instance_profile_lookup_record(account_id, region, profile))
     }
 
     fn find_instance_profiles_for_role(
@@ -1128,11 +1130,9 @@ impl IamInstanceProfileLookup for IamService {
     ) -> Vec<IamInstanceProfileRecord> {
         let guard =
             self.state.lock().unwrap_or_else(|poison| poison.into_inner());
-        let scope = ScopeKey {
-            account_id: account_id.clone(),
-            region: region.clone(),
-        };
-        let Some(state) = guard.scopes.get(&scope) else {
+        let Some(state) =
+            guard.scopes.get(&ScopeKey { account_id: account_id.clone() })
+        else {
             return Vec::new();
         };
 
@@ -1141,7 +1141,9 @@ impl IamInstanceProfileLookup for IamService {
             .values()
             .filter(|profile| profile.role_name.as_deref() == Some(role_name))
             .map(|profile| {
-                state.instance_profile_lookup_record(&scope, profile)
+                state.instance_profile_lookup_record(
+                    account_id, region, profile,
+                )
             })
             .collect()
     }
@@ -1174,14 +1176,10 @@ impl Default for IamWorld {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ScopeKey {
     account_id: AccountId,
-    region: RegionId,
 }
 
 fn scope_key(scope: &IamScope) -> ScopeKey {
-    ScopeKey {
-        account_id: scope.account_id().clone(),
-        region: scope.region().clone(),
-    }
+    ScopeKey { account_id: scope.account_id().clone() }
 }
 
 static EMPTY_SCOPE: ScopedIamState = ScopedIamState::new_const();
@@ -1319,6 +1317,7 @@ impl ScopedIamState {
         &mut self,
         access_key_id: String,
         secret_access_key: String,
+        region: RegionId,
         user_name: &str,
     ) -> Result<IamAccessKey, IamError> {
         self.user(user_name)?;
@@ -1347,6 +1346,7 @@ impl ScopedIamState {
             access_key_id,
             StoredAccessKey {
                 create_date: access_key.create_date.clone(),
+                region,
                 secret_access_key,
                 status: access_key.status,
                 user_name: user_name.to_owned(),
@@ -2345,11 +2345,12 @@ impl ScopedIamState {
 
     fn instance_profile_lookup_record(
         &self,
-        scope: &ScopeKey,
+        account_id: &AccountId,
+        region: &RegionId,
         profile: &StoredInstanceProfile,
     ) -> IamInstanceProfileRecord {
         IamInstanceProfileRecord {
-            account_id: scope.account_id.clone(),
+            account_id: account_id.clone(),
             arn: profile.entity.arn.clone(),
             create_date: profile.entity.create_date.clone(),
             instance_profile_id: profile.entity.instance_profile_id.clone(),
@@ -2358,7 +2359,7 @@ impl ScopedIamState {
                 .instance_profile_name
                 .clone(),
             path: profile.entity.path.clone(),
-            region: scope.region.clone(),
+            region: region.clone(),
             role: profile
                 .role_name
                 .as_deref()
@@ -2428,6 +2429,7 @@ struct StoredUser {
 #[derive(Debug, Clone)]
 struct StoredAccessKey {
     create_date: String,
+    region: RegionId,
     secret_access_key: String,
     status: IamAccessKeyStatus,
     user_name: String,
@@ -2755,9 +2757,13 @@ mod tests {
     };
 
     fn scope() -> IamScope {
+        scope_in_region("eu-west-2")
+    }
+
+    fn scope_in_region(region: &str) -> IamScope {
         IamScope::new(
             "000000000000".parse::<AccountId>().expect("account should parse"),
-            "eu-west-2".parse::<RegionId>().expect("region should parse"),
+            region.parse::<RegionId>().expect("region should parse"),
         )
     }
 
@@ -3022,6 +3028,70 @@ mod tests {
         service
             .delete_role(&scope, "secondary-role")
             .expect("secondary role should delete");
+    }
+
+    #[test]
+    fn iam_state_is_account_global_across_regions() {
+        let service = IamService::new();
+        let eu_scope = scope_in_region("eu-west-2");
+        let us_scope = scope_in_region("us-east-1");
+
+        service
+            .create_role(
+                &eu_scope,
+                CreateRoleInput {
+                    assume_role_policy_document: trust_policy(),
+                    description: "role".to_owned(),
+                    max_session_duration: 3_600,
+                    path: "/team/".to_owned(),
+                    role_name: "shared-role".to_owned(),
+                    tags: Vec::new(),
+                },
+            )
+            .expect("role should be created");
+        service
+            .create_instance_profile(
+                &eu_scope,
+                CreateInstanceProfileInput {
+                    instance_profile_name: "shared-profile".to_owned(),
+                    path: "/team/".to_owned(),
+                    tags: Vec::new(),
+                },
+            )
+            .expect("instance profile should be created");
+        service
+            .add_role_to_instance_profile(
+                &eu_scope,
+                "shared-profile",
+                "shared-role",
+            )
+            .expect("role should attach");
+
+        let role = service
+            .get_role(&us_scope, "shared-role")
+            .expect("role should be visible across regions");
+        let profile = service
+            .get_instance_profile(&us_scope, "shared-profile")
+            .expect("instance profile should be visible across regions");
+        let lookup = IamInstanceProfileLookup::find_instance_profile(
+            &service,
+            us_scope.account_id(),
+            us_scope.region(),
+            "shared-profile",
+        )
+        .expect("lookup should resolve the shared profile");
+
+        assert_eq!(role.role_name, "shared-role");
+        assert_eq!(profile.instance_profile_name, "shared-profile");
+        assert_eq!(profile.roles[0].role_name, "shared-role");
+        assert_eq!(lookup.region.as_str(), "us-east-1");
+        assert_eq!(
+            lookup
+                .role
+                .expect("lookup should include the shared role")
+                .role_name,
+            "shared-role"
+        );
     }
 
     #[test]

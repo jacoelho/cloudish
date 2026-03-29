@@ -21,10 +21,10 @@ use crate::trust_policy::{
     TrustAction, TrustEvaluationInput, trust_policy_allows,
 };
 use crate::validation::{
-    ASSUME_ROLE_DURATION, FEDERATION_TOKEN_DURATION, SESSION_TOKEN_DURATION,
-    normalize_duration, parse_role_arn, session_state_for_assume_role,
-    validate_federation_name, validate_saml_principal_arn,
-    validate_session_name, validate_session_tags,
+    ASSUME_ROLE_DURATION, FEDERATION_TOKEN_DURATION,
+    get_session_token_duration_bounds, normalize_duration, parse_role_arn,
+    session_state_for_assume_role, validate_federation_name,
+    validate_saml_principal_arn, validate_session_name, validate_session_tags,
 };
 #[cfg(test)]
 use aws::{AwsError, AwsErrorFamily};
@@ -339,7 +339,7 @@ impl StsService {
         }
         let duration_seconds = normalize_duration(
             input.duration_seconds,
-            SESSION_TOKEN_DURATION,
+            get_session_token_duration_bounds(caller),
         )?;
 
         issue_session(

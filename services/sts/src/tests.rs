@@ -23,9 +23,13 @@ fn time_source(
 }
 
 fn scope(account_id: &str) -> IamScope {
+    scope_in_region(account_id, "eu-west-2")
+}
+
+fn scope_in_region(account_id: &str, region: &str) -> IamScope {
     IamScope::new(
         account_id.parse().expect("account id should parse"),
-        "eu-west-2".parse().expect("region should parse"),
+        region.parse().expect("region should parse"),
     )
 }
 
@@ -130,6 +134,30 @@ fn assumed_role_caller(
             format!("AROA{account_id}:{role_session_name}"),
         )
         .expect("assumed role identity should build"),
+        Vec::new(),
+        BTreeSet::new(),
+    )
+}
+
+fn iam_user_caller(account_id: &str, user_name: &str) -> StsCaller {
+    let account_id: aws::AccountId =
+        account_id.parse().expect("account id should parse");
+    let user_arn = format!("arn:aws:iam::{account_id}:user/{user_name}")
+        .parse::<Arn>()
+        .expect("user ARN should parse");
+
+    StsCaller::new(
+        account_id.clone(),
+        CallerCredentialKind::LongTerm(StableAwsPrincipal::new(
+            user_arn.clone(),
+            AwsPrincipalType::User,
+            Some(user_name.to_owned()),
+        )),
+        CallerIdentity::try_new(
+            user_arn,
+            format!("AIDA{account_id}{user_name}"),
+        )
+        .expect("user caller identity should build"),
         Vec::new(),
         BTreeSet::new(),
     )
@@ -247,6 +275,39 @@ fn sts_assume_role_rejects_invalid_session_names() {
 
     assert!(matches!(error, StsError::Validation { .. }));
     assert!(error.to_aws_error().message().contains("roleSessionName"));
+}
+
+#[test]
+fn sts_assume_role_resolves_iam_state_across_regions() {
+    let iam = IamService::new();
+    create_role(
+        &iam,
+        "000000000000",
+        "demo",
+        aws_trust_policy("000000000000"),
+    );
+    let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
+
+    let assumed = sts
+        .assume_role(
+            &scope_in_region("000000000000", "us-east-1"),
+            &root_caller("000000000000"),
+            AssumeRoleInput {
+                duration_seconds: Some(900),
+                role_arn: "arn:aws:iam::000000000000:role/demo"
+                    .parse()
+                    .expect("role ARN should parse"),
+                role_session_name: "cross-region".to_owned(),
+                tags: Vec::new(),
+                transitive_tag_keys: Vec::new(),
+            },
+        )
+        .expect("assume role should succeed across regions");
+
+    assert_eq!(
+        assumed.assumed_role_user.arn.to_string(),
+        "arn:aws:sts::000000000000:assumed-role/demo/cross-region"
+    );
 }
 
 #[test]
@@ -636,4 +697,56 @@ fn sts_rejects_session_and_federation_tokens_for_temporary_credentials() {
         )
         .expect_err("temporary credentials should not mint federation tokens");
     assert!(matches!(federation_error, StsError::AccessDenied { .. }));
+}
+
+#[test]
+fn sts_get_session_token_applies_root_duration_ceiling() {
+    let iam = IamService::new();
+    let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
+    let session = sts
+        .get_session_token(
+            &scope("000000000000"),
+            &root_caller("000000000000"),
+            GetSessionTokenInput { duration_seconds: None },
+        )
+        .expect("root caller should receive the default session token");
+    let over_limit = sts
+        .get_session_token(
+            &scope("000000000000"),
+            &root_caller("000000000000"),
+            GetSessionTokenInput { duration_seconds: Some(3_601) },
+        )
+        .expect_err("root caller should reject durations above one hour");
+    let record = sts
+        .find_session_credential(&session.access_key_id)
+        .expect("issued session token should be stored");
+
+    assert_eq!(record.expires_at_epoch_seconds, 1_742_909_200);
+    assert!(matches!(over_limit, StsError::Validation { .. }));
+}
+
+#[test]
+fn sts_get_session_token_applies_iam_user_duration_ceiling() {
+    let iam = IamService::new();
+    let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
+    let session = sts
+        .get_session_token(
+            &scope("000000000000"),
+            &iam_user_caller("000000000000", "alice"),
+            GetSessionTokenInput { duration_seconds: Some(129_600) },
+        )
+        .expect("IAM user should receive a 36 hour session token");
+    let over_limit = sts
+        .get_session_token(
+            &scope("000000000000"),
+            &iam_user_caller("000000000000", "alice"),
+            GetSessionTokenInput { duration_seconds: Some(129_601) },
+        )
+        .expect_err("IAM user should reject durations above 36 hours");
+    let record = sts
+        .find_session_credential(&session.access_key_id)
+        .expect("issued session token should be stored");
+
+    assert_eq!(record.expires_at_epoch_seconds, 1_743_035_200);
+    assert!(matches!(over_limit, StsError::Validation { .. }));
 }

@@ -4229,6 +4229,7 @@ dependencies = [
  "aws",
  "base64 0.22.1",
  "iam",
+ "quick-xml",
  "serde_json",
  "thiserror 2.0.18",
  "time",

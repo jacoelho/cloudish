@@ -1,5 +1,5 @@
 use crate::{StsError, caller::StsCaller};
-use aws::{AccountId, Arn, IamResourceTag, ServiceName};
+use aws::{AccountId, Arn, AwsPrincipalType, IamResourceTag, ServiceName};
 use iam::IamTag;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,8 +22,10 @@ impl DurationBounds {
 
 pub(crate) const ASSUME_ROLE_DURATION: DurationBounds =
     DurationBounds::new(3_600, 900, 43_200);
-pub(crate) const SESSION_TOKEN_DURATION: DurationBounds =
-    DurationBounds::new(3_600, 900, 43_200);
+pub(crate) const ROOT_SESSION_TOKEN_DURATION: DurationBounds =
+    DurationBounds::new(3_600, 900, 3_600);
+pub(crate) const IAM_USER_SESSION_TOKEN_DURATION: DurationBounds =
+    DurationBounds::new(43_200, 900, 129_600);
 pub(crate) const FEDERATION_TOKEN_DURATION: DurationBounds =
     DurationBounds::new(3_600, 900, 129_600);
 
@@ -86,6 +88,19 @@ pub(crate) fn normalize_duration(
     }
 
     Ok(value)
+}
+
+pub(crate) fn get_session_token_duration_bounds(
+    caller: &StsCaller,
+) -> DurationBounds {
+    match caller.credential_kind().canonical_trust_principal().principal_type()
+    {
+        AwsPrincipalType::Account => ROOT_SESSION_TOKEN_DURATION,
+        AwsPrincipalType::User => IAM_USER_SESSION_TOKEN_DURATION,
+        AwsPrincipalType::FederatedUser | AwsPrincipalType::Role => {
+            IAM_USER_SESSION_TOKEN_DURATION
+        }
+    }
 }
 
 pub(crate) fn validate_session_tags(
