@@ -196,8 +196,8 @@ impl ElastiCacheService {
             &self.node_runtime,
             &self.proxy_runtime,
             RuntimeStartInput::new(
-                scope.clone(),
-                replication_group_id.clone(),
+                scope,
+                &replication_group_id,
                 engine,
                 auth_mode,
                 None,
@@ -467,13 +467,13 @@ impl ElastiCacheService {
     > {
         let mut restored_groups = Vec::new();
 
-        for group in state.groups.values().cloned() {
+        for group in state.groups.values() {
             let started = match start_runtime(
                 &self.node_runtime,
                 &self.proxy_runtime,
                 RuntimeStartInput::new(
-                    scope.clone(),
-                    group.replication_group_id.clone(),
+                    scope,
+                    &group.replication_group_id,
                     group.engine,
                     group.auth_mode,
                     Some(group.endpoint.port),
