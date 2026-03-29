@@ -605,6 +605,14 @@ impl PresignedAuthorization {
                 "X-Amz-SignedHeaders must list at least one signed header.",
             ));
         }
+        if !signed_headers_include_host(&signed_headers) {
+            return Err(incomplete_signature_error(
+                "X-Amz-SignedHeaders must include host.",
+            ));
+        }
+        if !(1..=604_800).contains(&expires_seconds) {
+            return Err(access_denied_error("Invalid X-Amz-Expires value."));
+        }
 
         Ok(Some(Self {
             credential,
@@ -675,6 +683,16 @@ impl AuthorizationFields {
                 _ => {}
             }
         }
+        let signed_headers = signed_headers.ok_or_else(|| {
+            incomplete_signature_error(
+                "Authorization header must contain SignedHeaders metadata.",
+            )
+        })?;
+        if !signed_headers_include_host(&signed_headers) {
+            return Err(incomplete_signature_error(
+                "Authorization header SignedHeaders must include host.",
+            ));
+        }
 
         Ok(Self {
             credential: credential.ok_or_else(|| {
@@ -687,13 +705,13 @@ impl AuthorizationFields {
                     "Authorization header must contain a SigV4 Signature.",
                 )
             })?,
-            signed_headers: signed_headers.ok_or_else(|| {
-                incomplete_signature_error(
-                    "Authorization header must contain SignedHeaders metadata.",
-                )
-            })?,
+            signed_headers,
         })
     }
+}
+
+fn signed_headers_include_host(signed_headers: &[String]) -> bool {
+    signed_headers.iter().any(|header| header.eq_ignore_ascii_case("host"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1984,6 +2002,34 @@ mod tests {
     }
 
     #[test]
+    fn auth_rejects_authorization_headers_without_host_in_signed_headers() {
+        let request = RequestAuth::new(
+            "POST",
+            "/",
+            vec![
+                RequestHeader::new("Host", "localhost"),
+                RequestHeader::new("X-Amz-Date", "20260325T120000Z"),
+                RequestHeader::new(
+                    "Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260325/eu-west-2/sts/aws4_request, SignedHeaders=x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+            ],
+            b"",
+        );
+
+        let error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
+            .verify(
+                &request,
+                &AccessKeyLookup::default(),
+                &SessionLookup::default(),
+            )
+            .expect_err("SignedHeaders without host should fail");
+
+        assert_eq!(error.code(), "IncompleteSignature");
+        assert!(error.message().contains("host"));
+    }
+
+    #[test]
     fn auth_rejects_credential_scope_date_mismatches() {
         let request = RequestAuth::new(
             "POST",
@@ -2277,6 +2323,91 @@ mod tests {
 
         assert_eq!(verified.account_id().as_str(), "000000000000");
         assert_eq!(verified.scope().service().as_str(), "s3");
+    }
+
+    #[test]
+    fn auth_rejects_presigned_requests_without_host_in_signed_headers() {
+        let request = RequestAuth::new(
+            "GET",
+            "/demo/object.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=test%2F20260325%2Feu-west-2%2Fs3%2Faws4_request&X-Amz-Date=20260325T120000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=x-amz-date&X-Amz-Signature=0000000000000000000000000000000000000000000000000000000000000000",
+            vec![RequestHeader::new("Host", "localhost")],
+            b"",
+        );
+
+        let error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
+            .verify(
+                &request,
+                &AccessKeyLookup::default(),
+                &SessionLookup::default(),
+            )
+            .expect_err("presigned SignedHeaders without host should fail");
+
+        assert_eq!(error.code(), "IncompleteSignature");
+        assert!(error.message().contains("host"));
+    }
+
+    #[test]
+    fn auth_rejects_presigned_requests_with_out_of_range_expires_values() {
+        let zero_path = s3_presigned_get_path("/demo/object.txt", 0);
+        let zero = RequestAuth::new(
+            "GET",
+            &zero_path,
+            vec![RequestHeader::new("Host", "localhost")],
+            b"",
+        );
+        let too_large_path =
+            s3_presigned_get_path("/demo/object.txt", 604_801);
+        let too_large = RequestAuth::new(
+            "GET",
+            &too_large_path,
+            vec![RequestHeader::new("Host", "localhost")],
+            b"",
+        );
+
+        let zero_error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
+            .verify(
+                &zero,
+                &AccessKeyLookup::default(),
+                &SessionLookup::default(),
+            )
+            .expect_err("expires=0 should fail");
+        let too_large_error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
+            .verify(
+                &too_large,
+                &AccessKeyLookup::default(),
+                &SessionLookup::default(),
+            )
+            .expect_err("expires above seven days should fail");
+
+        assert_eq!(zero_error.code(), "AccessDenied");
+        assert_eq!(zero_error.message(), "Invalid X-Amz-Expires value.");
+        assert_eq!(too_large_error.code(), "AccessDenied");
+        assert_eq!(too_large_error.message(), "Invalid X-Amz-Expires value.");
+    }
+
+    #[test]
+    fn auth_accepts_presigned_requests_at_expires_boundaries() {
+        for expires_seconds in [1, 604_800] {
+            let path =
+                s3_presigned_get_path("/demo/object.txt", expires_seconds);
+            let request = RequestAuth::new(
+                "GET",
+                &path,
+                vec![RequestHeader::new("Host", "localhost")],
+                b"",
+            );
+
+            let verified = authenticator(REQUEST_TIME_EPOCH_SECONDS)
+                .verify(
+                    &request,
+                    &AccessKeyLookup::default(),
+                    &SessionLookup::default(),
+                )
+                .expect("boundary pre-signed request should verify")
+                .expect("boundary pre-signed request should authenticate");
+
+            assert_eq!(verified.scope().service().as_str(), "s3");
+        }
     }
 
     #[test]
