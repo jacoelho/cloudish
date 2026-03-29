@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use super::{
     ApiGatewayError, ApiGatewayScope, ApiGatewayService, Integration,
     ROOT_PATH, StoredApiGatewayState, StoredApiMethod, StoredApiResource,
-    StoredDeployment, deployment, domain, rest_api, stage,
-    validate_status_code,
+    StoredDeployment, deployment, domain, execute_api_request_validator,
+    is_valid_execute_api_key, rest_api, stage, validate_status_code,
 };
 
 const EXECUTE_API_REQUEST_ID: &str = "0000000000000000";
@@ -426,6 +426,7 @@ impl ApiGatewayService {
             deployment(api, deployment_id).map_err(not_found_error)?;
         let context = ExecuteApiRequestContext {
             scope,
+            state,
             api_id,
             stage,
             request,
@@ -433,7 +434,7 @@ impl ApiGatewayService {
             host: &normalize_authority(request.host()),
         };
 
-        build_execute_api_invocation(&context, deployment, &resource_path)
+        build_execute_api_invocation(&context, api, deployment, &resource_path)
     }
 
     fn resolve_custom_domain_execute_api(
@@ -562,6 +563,7 @@ impl ApiGatewayService {
         let resource_path = strip_base_path(&path, &mapping.base_path)?;
         let context = ExecuteApiRequestContext {
             scope,
+            state,
             api_id: &mapping.rest_api_id,
             stage,
             request,
@@ -569,12 +571,13 @@ impl ApiGatewayService {
             host: &normalize_authority(request.host()),
         };
 
-        build_execute_api_invocation(&context, deployment, &resource_path)
+        build_execute_api_invocation(&context, api, deployment, &resource_path)
     }
 }
 
 struct ExecuteApiRequestContext<'a> {
     scope: &'a ApiGatewayScope,
+    state: &'a StoredApiGatewayState,
     api_id: &'a str,
     stage: &'a super::StoredStage,
     request: &'a ExecuteApiRequest,
@@ -584,12 +587,14 @@ struct ExecuteApiRequestContext<'a> {
 
 fn build_execute_api_invocation(
     context: &ExecuteApiRequestContext<'_>,
+    api: &super::StoredRestApi,
     deployment: &StoredDeployment,
     resource_path: &str,
 ) -> Result<ExecuteApiInvocation, ExecuteApiError> {
     let match_result = match_resource(deployment, resource_path)?;
     let method =
         resolve_method(match_result.resource, context.request.method())?;
+    validate_execute_api_method(context, api, method, &match_result)?;
     let integration = method.integration.as_ref().ok_or_else(|| {
         ExecuteApiError::IntegrationFailure {
             message: "No integration configured for API Gateway method."
@@ -610,6 +615,92 @@ fn build_execute_api_invocation(
     ))
 }
 
+fn validate_execute_api_method(
+    context: &ExecuteApiRequestContext<'_>,
+    api: &super::StoredRestApi,
+    method: &StoredApiMethod,
+    resource: &MatchedResource<'_>,
+) -> Result<(), ExecuteApiError> {
+    validate_execute_api_authorization(method)?;
+    validate_execute_api_key(context, api, method)?;
+    validate_execute_api_request(context, api, method, resource)?;
+
+    Ok(())
+}
+
+fn validate_execute_api_authorization(
+    method: &StoredApiMethod,
+) -> Result<(), ExecuteApiError> {
+    if method.authorization_type == "NONE" {
+        return Ok(());
+    }
+
+    Err(ExecuteApiError::IntegrationFailure {
+        message: format!(
+            "Unsupported API Gateway authorization type {:?}.",
+            method.authorization_type
+        ),
+        status_code: 501,
+    })
+}
+
+fn validate_execute_api_key(
+    context: &ExecuteApiRequestContext<'_>,
+    api: &super::StoredRestApi,
+    method: &StoredApiMethod,
+) -> Result<(), ExecuteApiError> {
+    if !method.api_key_required || api.api_key_source != "HEADER" {
+        return Ok(());
+    }
+
+    let key_value = request_header(context.request, "x-api-key")
+        .ok_or(ExecuteApiError::Forbidden)?;
+    if is_valid_execute_api_key(
+        context.state,
+        context.api_id,
+        &context.stage.stage_name,
+        key_value,
+    ) {
+        Ok(())
+    } else {
+        Err(ExecuteApiError::Forbidden)
+    }
+}
+
+fn validate_execute_api_request(
+    context: &ExecuteApiRequestContext<'_>,
+    api: &super::StoredRestApi,
+    method: &StoredApiMethod,
+    resource: &MatchedResource<'_>,
+) -> Result<(), ExecuteApiError> {
+    let Some(validator) = execute_api_request_validator(
+        api,
+        &resource.resource.id,
+        context.request.method(),
+    ) else {
+        return Ok(());
+    };
+
+    if validator.validate_request_parameters
+        && required_request_parameter_missing(
+            context.request,
+            resource,
+            method,
+        )?
+    {
+        return Err(invalid_execute_api_request_error());
+    }
+    if validator.validate_request_body && context.request.body().is_empty() {
+        return Err(invalid_execute_api_request_error());
+    }
+
+    Ok(())
+}
+
+fn invalid_execute_api_request_error() -> ExecuteApiError {
+    ExecuteApiError::BadRequest { message: "Invalid request input".to_owned() }
+}
+
 fn prepare_integration_plan(
     context: &ExecuteApiRequestContext<'_>,
     integration: &Integration,
@@ -620,7 +711,7 @@ fn prepare_integration_plan(
             build_lambda_proxy_plan(context, integration, resource)?,
         ))),
         "HTTP" | "HTTP_PROXY" => Ok(ExecuteApiIntegrationPlan::Http(
-            build_http_forward_request(integration, context.request)?,
+            build_http_forward_request(context, integration, resource)?,
         )),
         "MOCK" => Ok(ExecuteApiIntegrationPlan::Mock(build_mock_response(
             integration,
@@ -818,8 +909,9 @@ fn build_lambda_proxy_event(
 }
 
 fn build_http_forward_request(
+    context: &ExecuteApiRequestContext<'_>,
     integration: &Integration,
-    request: &ExecuteApiRequest,
+    resource: &MatchedResource<'_>,
 ) -> Result<HttpForwardRequest, ExecuteApiError> {
     let uri = integration.uri.as_deref().ok_or_else(|| {
         ExecuteApiError::IntegrationFailure {
@@ -828,30 +920,240 @@ fn build_http_forward_request(
         }
     })?;
     let parsed = parse_http_uri(uri)?;
-    let path = combine_query_strings(
+    let request_query_parameters =
+        multi_value_query_string_parameters(context.request.query_string())?;
+    let request_query_parameters =
+        single_value_query_string_parameters(&request_query_parameters);
+    let mapped_parameters = mapped_http_request_parameters(
+        integration,
+        context.request,
+        resource,
+        &request_query_parameters,
+    )?;
+    let path = render_mapped_http_path(
         &parsed.path,
+        &mapped_parameters.path_parameters,
+    )?;
+    let path = render_http_query_string(
+        &path,
         parsed.query.as_deref(),
-        request.query_string(),
-    );
+        context.request.query_string(),
+        &mapped_parameters.query_parameters,
+    )?;
     let method = integration
         .integration_http_method
         .as_deref()
         .or(integration.http_method.as_deref())
-        .unwrap_or(request.method());
-    let body = select_http_request_body(integration, request);
+        .unwrap_or(context.request.method());
+    let body = select_http_request_body(integration, context.request);
     let mut forward =
         HttpForwardRequest::new(parsed.endpoint, method, path).with_body(body);
-    for (name, value) in request.headers() {
-        if name.eq_ignore_ascii_case("host")
-            || name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("connection")
-        {
-            continue;
-        }
+    for (name, value) in render_http_headers(
+        context.request,
+        &mapped_parameters.header_parameters,
+    ) {
         forward = forward.with_header(name.clone(), value.clone());
     }
 
     Ok(forward)
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct MappedHttpRequestParameters {
+    header_parameters: BTreeMap<String, String>,
+    path_parameters: BTreeMap<String, String>,
+    query_parameters: BTreeMap<String, String>,
+}
+
+fn mapped_http_request_parameters(
+    integration: &Integration,
+    request: &ExecuteApiRequest,
+    resource: &MatchedResource<'_>,
+    request_query_parameters: &BTreeMap<String, String>,
+) -> Result<MappedHttpRequestParameters, ExecuteApiError> {
+    let mut mapped = MappedHttpRequestParameters::default();
+
+    for (target, source) in &integration.request_parameters {
+        let source_value = resolve_http_request_parameter_source(
+            source,
+            request,
+            resource,
+            request_query_parameters,
+        )?;
+        match parse_http_request_parameter_target(target)? {
+            HttpRequestParameterTarget::Header(name) => {
+                if let Some(value) = source_value {
+                    mapped.header_parameters.insert(name.to_owned(), value);
+                }
+            }
+            HttpRequestParameterTarget::Path(name) => {
+                if let Some(value) = source_value {
+                    mapped.path_parameters.insert(name.to_owned(), value);
+                }
+            }
+            HttpRequestParameterTarget::QueryString(name) => {
+                if let Some(value) = source_value {
+                    mapped.query_parameters.insert(name.to_owned(), value);
+                }
+            }
+        }
+    }
+
+    Ok(mapped)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpRequestParameterTarget<'a> {
+    Header(&'a str),
+    Path(&'a str),
+    QueryString(&'a str),
+}
+
+fn parse_http_request_parameter_target(
+    target: &str,
+) -> Result<HttpRequestParameterTarget<'_>, ExecuteApiError> {
+    if let Some(name) = target.strip_prefix("integration.request.header.") {
+        return non_empty_mapping_name(name)
+            .map(HttpRequestParameterTarget::Header);
+    }
+    if let Some(name) = target.strip_prefix("integration.request.path.") {
+        return non_empty_mapping_name(name)
+            .map(HttpRequestParameterTarget::Path);
+    }
+    if let Some(name) = target.strip_prefix("integration.request.querystring.")
+    {
+        return non_empty_mapping_name(name)
+            .map(HttpRequestParameterTarget::QueryString);
+    }
+
+    Err(integration_mapping_error(format!(
+        "Unsupported API Gateway request parameter target {target:?}."
+    )))
+}
+
+fn resolve_http_request_parameter_source(
+    source: &str,
+    request: &ExecuteApiRequest,
+    resource: &MatchedResource<'_>,
+    request_query_parameters: &BTreeMap<String, String>,
+) -> Result<Option<String>, ExecuteApiError> {
+    if let Some(name) = source.strip_prefix("method.request.header.") {
+        return Ok(request_header(request, non_empty_mapping_name(name)?)
+            .map(str::to_owned));
+    }
+    if let Some(name) = source.strip_prefix("method.request.path.") {
+        return Ok(resource
+            .path_parameters
+            .get(non_empty_mapping_name(name)?)
+            .cloned());
+    }
+    if let Some(name) = source.strip_prefix("method.request.querystring.") {
+        return Ok(request_query_parameters
+            .get(non_empty_mapping_name(name)?)
+            .cloned());
+    }
+
+    Err(integration_mapping_error(format!(
+        "Unsupported API Gateway request parameter mapping {source:?}."
+    )))
+}
+
+fn non_empty_mapping_name(name: &str) -> Result<&str, ExecuteApiError> {
+    if name.is_empty() {
+        Err(integration_mapping_error(
+            "API Gateway request parameter mappings must name a source or target."
+                .to_owned(),
+        ))
+    } else {
+        Ok(name)
+    }
+}
+
+fn render_mapped_http_path(
+    path: &str,
+    mapped_path_parameters: &BTreeMap<String, String>,
+) -> Result<String, ExecuteApiError> {
+    let mut rendered_path = path.to_owned();
+
+    for (name, value) in mapped_path_parameters {
+        let placeholder = format!("{{{name}}}");
+        if !rendered_path.contains(&placeholder) {
+            return Err(integration_mapping_error(format!(
+                "HTTP integration URI does not declare path parameter {name:?}."
+            )));
+        }
+        rendered_path =
+            rendered_path.replace(&placeholder, &urlencoding::encode(value));
+    }
+    if rendered_path.contains('{') || rendered_path.contains('}') {
+        return Err(integration_mapping_error(
+            "HTTP integration URI references missing path variables."
+                .to_owned(),
+        ));
+    }
+
+    Ok(rendered_path)
+}
+
+fn render_http_query_string(
+    path: &str,
+    template_query: Option<&str>,
+    request_query: Option<&str>,
+    mapped_query_parameters: &BTreeMap<String, String>,
+) -> Result<String, ExecuteApiError> {
+    let mut parameters = single_value_query_string_parameters(
+        &multi_value_query_string_parameters(template_query)?,
+    );
+    parameters.extend(single_value_query_string_parameters(
+        &multi_value_query_string_parameters(request_query)?,
+    ));
+    parameters.extend(mapped_query_parameters.clone());
+    if parameters.is_empty() {
+        return Ok(path.to_owned());
+    }
+
+    let query = parameters
+        .into_iter()
+        .map(|(name, value)| {
+            format!(
+                "{}={}",
+                urlencoding::encode(&name),
+                urlencoding::encode(&value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+
+    Ok(format!("{path}?{query}"))
+}
+
+fn render_http_headers(
+    request: &ExecuteApiRequest,
+    mapped_header_parameters: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut headers = request
+        .headers()
+        .iter()
+        .filter(|(name, _)| {
+            !name.eq_ignore_ascii_case("host")
+                && !name.eq_ignore_ascii_case("content-length")
+                && !name.eq_ignore_ascii_case("connection")
+                && !mapped_header_parameters
+                    .keys()
+                    .any(|target| target.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    headers.extend(
+        mapped_header_parameters
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
+    headers
+}
+
+fn integration_mapping_error(message: String) -> ExecuteApiError {
+    ExecuteApiError::IntegrationFailure { message, status_code: 500 }
 }
 
 fn build_mock_response(
@@ -1313,22 +1615,53 @@ fn parse_http_uri(uri: &str) -> Result<ParsedHttpUri, ExecuteApiError> {
     Ok(ParsedHttpUri { endpoint: Endpoint::new(host, port), path, query })
 }
 
-fn combine_query_strings(
-    path: &str,
-    template_query: Option<&str>,
-    request_query: Option<&str>,
-) -> String {
-    let combined = [template_query, request_query]
-        .into_iter()
-        .flatten()
-        .filter(|query| !query.is_empty())
-        .collect::<Vec<_>>()
-        .join("&");
-    if combined.is_empty() {
-        path.to_owned()
-    } else {
-        format!("{path}?{combined}")
+fn request_header<'a>(
+    request: &'a ExecuteApiRequest,
+    name: &str,
+) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .rev()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn required_request_parameter_missing(
+    request: &ExecuteApiRequest,
+    resource: &MatchedResource<'_>,
+    method: &StoredApiMethod,
+) -> Result<bool, ExecuteApiError> {
+    let query_parameters = single_value_query_string_parameters(
+        &multi_value_query_string_parameters(request.query_string())?,
+    );
+
+    for (name, required) in &method.request_parameters {
+        if !required {
+            continue;
+        }
+
+        let present = if let Some(header_name) =
+            name.strip_prefix("method.request.header.")
+        {
+            request_header(request, header_name).is_some()
+        } else if let Some(parameter_name) =
+            name.strip_prefix("method.request.querystring.")
+        {
+            query_parameters.contains_key(parameter_name)
+        } else if let Some(parameter_name) =
+            name.strip_prefix("method.request.path.")
+        {
+            resource.path_parameters.contains_key(parameter_name)
+        } else {
+            false
+        };
+        if !present {
+            return Ok(true);
+        }
     }
+
+    Ok(false)
 }
 
 fn multi_value_headers(
@@ -2084,6 +2417,386 @@ mod tests {
             ExecuteApiError::IntegrationFailure {
                 message: "Unsupported API Gateway integration type \"AWS\"."
                     .to_owned(),
+                status_code: 500,
+            }
+        );
+    }
+
+    #[test]
+    fn apigw_v1_runtime_unsupported_rest_authorization_fails_closed() {
+        let service = service("unsupported-auth");
+        let scope = scope();
+        let api = service
+            .create_rest_api(
+                &scope,
+                CreateRestApiInput {
+                    binary_media_types: Vec::new(),
+                    description: None,
+                    disable_execute_api_endpoint: None,
+                    endpoint_configuration: None,
+                    name: "demo".to_owned(),
+                    tags: BTreeMap::new(),
+                },
+            )
+            .expect("api should create");
+        let resource = service
+            .create_resource(
+                &scope,
+                &api.id,
+                &api.root_resource_id,
+                CreateResourceInput { path_part: "pets".to_owned() },
+            )
+            .expect("resource should create");
+        service
+            .put_method(
+                &scope,
+                &api.id,
+                &resource.id,
+                "GET",
+                PutMethodInput {
+                    api_key_required: Some(false),
+                    authorizer_id: None,
+                    authorization_type: "CUSTOM".to_owned(),
+                    operation_name: None,
+                    request_models: BTreeMap::new(),
+                    request_parameters: BTreeMap::new(),
+                    request_validator_id: None,
+                },
+            )
+            .expect("method should create");
+        service
+            .put_integration(
+                &scope,
+                &api.id,
+                &resource.id,
+                "GET",
+                PutIntegrationInput {
+                    cache_key_parameters: Vec::new(),
+                    cache_namespace: None,
+                    connection_id: None,
+                    connection_type: None,
+                    content_handling: None,
+                    credentials: None,
+                    http_method: Some("GET".to_owned()),
+                    integration_http_method: Some("GET".to_owned()),
+                    passthrough_behavior: None,
+                    request_parameters: BTreeMap::new(),
+                    request_templates: BTreeMap::new(),
+                    timeout_in_millis: None,
+                    type_: "MOCK".to_owned(),
+                    uri: None,
+                },
+            )
+            .expect("integration should create");
+        let deployment = service
+            .create_deployment(
+                &scope,
+                &api.id,
+                CreateDeploymentInput {
+                    description: None,
+                    stage_description: None,
+                    stage_name: None,
+                    variables: BTreeMap::new(),
+                },
+            )
+            .expect("deployment should create");
+        service
+            .create_stage(
+                &scope,
+                &api.id,
+                CreateStageInput {
+                    cache_cluster_enabled: None,
+                    cache_cluster_size: None,
+                    deployment_id: deployment.id,
+                    description: None,
+                    stage_name: "dev".to_owned(),
+                    tags: BTreeMap::new(),
+                    variables: BTreeMap::new(),
+                },
+            )
+            .expect("stage should create");
+
+        let error = service
+            .resolve_execute_api_by_api_id(
+                &api.id,
+                &ExecuteApiRequest::new("localhost", "GET", "/dev/pets"),
+                None,
+            )
+            .expect_err("unsupported auth should fail");
+
+        assert_eq!(
+            error,
+            ExecuteApiError::IntegrationFailure {
+                message:
+                    "Unsupported API Gateway authorization type \"CUSTOM\"."
+                        .to_owned(),
+                status_code: 501,
+            }
+        );
+    }
+
+    #[test]
+    fn apigw_v1_runtime_http_request_parameter_mappings_are_applied() {
+        let service = service("http-request-mappings");
+        let scope = scope();
+        let api = service
+            .create_rest_api(
+                &scope,
+                CreateRestApiInput {
+                    binary_media_types: Vec::new(),
+                    description: None,
+                    disable_execute_api_endpoint: None,
+                    endpoint_configuration: None,
+                    name: "demo".to_owned(),
+                    tags: BTreeMap::new(),
+                },
+            )
+            .expect("api should create");
+        let pets = service
+            .create_resource(
+                &scope,
+                &api.id,
+                &api.root_resource_id,
+                CreateResourceInput { path_part: "pets".to_owned() },
+            )
+            .expect("pets resource should create");
+        let pet = service
+            .create_resource(
+                &scope,
+                &api.id,
+                &pets.id,
+                CreateResourceInput { path_part: "{pet_id}".to_owned() },
+            )
+            .expect("pet resource should create");
+        service
+            .put_method(
+                &scope,
+                &api.id,
+                &pet.id,
+                "GET",
+                PutMethodInput {
+                    api_key_required: Some(false),
+                    authorizer_id: None,
+                    authorization_type: "NONE".to_owned(),
+                    operation_name: None,
+                    request_models: BTreeMap::new(),
+                    request_parameters: BTreeMap::new(),
+                    request_validator_id: None,
+                },
+            )
+            .expect("method should create");
+        service
+            .put_integration(
+                &scope,
+                &api.id,
+                &pet.id,
+                "GET",
+                PutIntegrationInput {
+                    cache_key_parameters: Vec::new(),
+                    cache_namespace: None,
+                    connection_id: None,
+                    connection_type: None,
+                    content_handling: None,
+                    credentials: None,
+                    http_method: Some("GET".to_owned()),
+                    integration_http_method: Some("GET".to_owned()),
+                    passthrough_behavior: None,
+                    request_parameters: BTreeMap::from([
+                        (
+                            "integration.request.header.X-Upstream-Test"
+                                .to_owned(),
+                            "method.request.header.X-Test".to_owned(),
+                        ),
+                        (
+                            "integration.request.path.proxy".to_owned(),
+                            "method.request.path.pet_id".to_owned(),
+                        ),
+                        (
+                            "integration.request.querystring.mode".to_owned(),
+                            "method.request.querystring.view".to_owned(),
+                        ),
+                    ]),
+                    request_templates: BTreeMap::new(),
+                    timeout_in_millis: None,
+                    type_: "HTTP_PROXY".to_owned(),
+                    uri: Some(
+                        "http://backend.example/orders/{proxy}?fixed=1"
+                            .to_owned(),
+                    ),
+                },
+            )
+            .expect("integration should create");
+        let deployment = service
+            .create_deployment(
+                &scope,
+                &api.id,
+                CreateDeploymentInput {
+                    description: None,
+                    stage_description: None,
+                    stage_name: None,
+                    variables: BTreeMap::new(),
+                },
+            )
+            .expect("deployment should create");
+        service
+            .create_stage(
+                &scope,
+                &api.id,
+                CreateStageInput {
+                    cache_cluster_enabled: None,
+                    cache_cluster_size: None,
+                    deployment_id: deployment.id,
+                    description: None,
+                    stage_name: "dev".to_owned(),
+                    tags: BTreeMap::new(),
+                    variables: BTreeMap::new(),
+                },
+            )
+            .expect("stage should create");
+
+        let invocation = service
+            .resolve_execute_api_by_api_id(
+                &api.id,
+                &ExecuteApiRequest::new("localhost", "GET", "/dev/pets/cat-1")
+                    .with_header("X-Test", "true")
+                    .with_query_string("view=full"),
+                None,
+            )
+            .expect("mapped request should resolve");
+
+        match invocation.invocation().integration() {
+            ExecuteApiIntegrationPlan::Http(request) => {
+                assert_eq!(request.endpoint().host(), "backend.example");
+                assert_eq!(request.endpoint().port(), 80);
+                assert_eq!(
+                    request.path(),
+                    "/orders/cat-1?fixed=1&mode=full&view=full"
+                );
+                assert_eq!(
+                    request.headers(),
+                    &[
+                        ("X-Test".to_owned(), "true".to_owned()),
+                        ("X-Upstream-Test".to_owned(), "true".to_owned(),),
+                    ]
+                );
+            }
+            other => panic!("expected HTTP integration plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apigw_v1_runtime_unsupported_http_request_parameter_mapping_is_explicit()
+     {
+        let service = service("http-request-mappings-invalid");
+        let scope = scope();
+        let api = service
+            .create_rest_api(
+                &scope,
+                CreateRestApiInput {
+                    binary_media_types: Vec::new(),
+                    description: None,
+                    disable_execute_api_endpoint: None,
+                    endpoint_configuration: None,
+                    name: "demo".to_owned(),
+                    tags: BTreeMap::new(),
+                },
+            )
+            .expect("api should create");
+        let resource = service
+            .create_resource(
+                &scope,
+                &api.id,
+                &api.root_resource_id,
+                CreateResourceInput { path_part: "pets".to_owned() },
+            )
+            .expect("resource should create");
+        service
+            .put_method(
+                &scope,
+                &api.id,
+                &resource.id,
+                "GET",
+                PutMethodInput {
+                    api_key_required: Some(false),
+                    authorizer_id: None,
+                    authorization_type: "NONE".to_owned(),
+                    operation_name: None,
+                    request_models: BTreeMap::new(),
+                    request_parameters: BTreeMap::new(),
+                    request_validator_id: None,
+                },
+            )
+            .expect("method should create");
+        service
+            .put_integration(
+                &scope,
+                &api.id,
+                &resource.id,
+                "GET",
+                PutIntegrationInput {
+                    cache_key_parameters: Vec::new(),
+                    cache_namespace: None,
+                    connection_id: None,
+                    connection_type: None,
+                    content_handling: None,
+                    credentials: None,
+                    http_method: Some("GET".to_owned()),
+                    integration_http_method: Some("GET".to_owned()),
+                    passthrough_behavior: None,
+                    request_parameters: BTreeMap::from([(
+                        "integration.request.header.X-Upstream-Test"
+                            .to_owned(),
+                        "$context.requestId".to_owned(),
+                    )]),
+                    request_templates: BTreeMap::new(),
+                    timeout_in_millis: None,
+                    type_: "HTTP_PROXY".to_owned(),
+                    uri: Some("http://backend.example/orders".to_owned()),
+                },
+            )
+            .expect("integration should create");
+        let deployment = service
+            .create_deployment(
+                &scope,
+                &api.id,
+                CreateDeploymentInput {
+                    description: None,
+                    stage_description: None,
+                    stage_name: None,
+                    variables: BTreeMap::new(),
+                },
+            )
+            .expect("deployment should create");
+        service
+            .create_stage(
+                &scope,
+                &api.id,
+                CreateStageInput {
+                    cache_cluster_enabled: None,
+                    cache_cluster_size: None,
+                    deployment_id: deployment.id,
+                    description: None,
+                    stage_name: "dev".to_owned(),
+                    tags: BTreeMap::new(),
+                    variables: BTreeMap::new(),
+                },
+            )
+            .expect("stage should create");
+
+        let error = service
+            .resolve_execute_api_by_api_id(
+                &api.id,
+                &ExecuteApiRequest::new("localhost", "GET", "/dev/pets"),
+                None,
+            )
+            .expect_err("unsupported mapping should fail");
+
+        assert_eq!(
+            error,
+            ExecuteApiError::IntegrationFailure {
+                message:
+                    "Unsupported API Gateway request parameter mapping \"$context.requestId\"."
+                        .to_owned(),
                 status_code: 500,
             }
         );

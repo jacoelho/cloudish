@@ -2772,10 +2772,10 @@ impl StoredAuthorizer {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StoredRequestValidator {
-    id: String,
-    name: String,
-    validate_request_body: bool,
-    validate_request_parameters: bool,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) validate_request_body: bool,
+    pub(crate) validate_request_parameters: bool,
 }
 
 impl StoredRequestValidator {
@@ -3067,6 +3067,41 @@ fn request_validator_mut<'a>(
     })
 }
 
+pub(crate) fn execute_api_request_validator<'a>(
+    api: &'a StoredRestApi,
+    resource_id: &str,
+    http_method: &str,
+) -> Option<&'a StoredRequestValidator> {
+    execute_api_method(api, resource_id, http_method)
+        .and_then(|method| method.request_validator_id.as_deref())
+        .and_then(|request_validator_id| {
+            api.request_validators.get(request_validator_id)
+        })
+}
+
+pub(crate) fn is_valid_execute_api_key(
+    state: &StoredApiGatewayState,
+    api_id: &str,
+    stage_name: &str,
+    key_value: &str,
+) -> bool {
+    let stage_key = format!("{api_id}/{stage_name}");
+    state.api_keys.values().any(|api_key| {
+        api_key.enabled
+            && api_key.value == key_value
+            && (api_key
+                .stage_keys
+                .iter()
+                .any(|candidate| candidate == &stage_key)
+                || state.usage_plans.values().any(|usage_plan| {
+                    usage_plan.api_stages.iter().any(|api_stage| {
+                        api_stage.api_id == api_id
+                            && api_stage.stage == stage_name
+                    }) && usage_plan.usage_plan_keys.contains_key(&api_key.id)
+                }))
+    })
+}
+
 fn api_key<'a>(
     state: &'a StoredApiGatewayState,
     api_key_id: &str,
@@ -3123,6 +3158,17 @@ pub(crate) fn domain<'a>(
     state.domains.get(domain_name).ok_or_else(|| ApiGatewayError::NotFound {
         resource: format!("Domain name {domain_name}"),
     })
+}
+
+fn execute_api_method<'a>(
+    api: &'a StoredRestApi,
+    resource_id: &str,
+    http_method: &str,
+) -> Option<&'a StoredApiMethod> {
+    let normalized = normalize_http_method(http_method).ok()?;
+    let resource = api.resources.get(resource_id)?;
+
+    resource.methods.get(&normalized).or_else(|| resource.methods.get("ANY"))
 }
 
 fn domain_mut<'a>(
@@ -3828,7 +3874,7 @@ mod tests {
         CreateRequestValidatorInput, CreateResourceInput, CreateRestApiInput,
         CreateStageInput, CreateUsagePlanInput, CreateUsagePlanKeyInput,
         PatchOperation, PutIntegrationInput, PutMethodInput,
-        PutMethodResponseInput,
+        PutMethodResponseInput, UsagePlanApiStage, is_valid_execute_api_key,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -4351,7 +4397,7 @@ mod tests {
             .create_usage_plan(
                 &scope,
                 CreateUsagePlanInput {
-                    api_stages: vec![super::UsagePlanApiStage {
+                    api_stages: vec![UsagePlanApiStage {
                         api_id: api.id.clone(),
                         stage: "dev".to_owned(),
                     }],
@@ -4410,6 +4456,134 @@ mod tests {
             )
             .expect("base path mapping should create");
         assert_eq!(mapping.base_path, "v1");
+    }
+
+    #[test]
+    fn apigw_v1_execute_api_key_validation_uses_usage_plans_and_stage_keys() {
+        let service = service("apigw-v1-execute-api-keys");
+        let scope = scope();
+        let api = service
+            .create_rest_api(
+                &scope,
+                CreateRestApiInput {
+                    binary_media_types: Vec::new(),
+                    description: None,
+                    disable_execute_api_endpoint: None,
+                    endpoint_configuration: None,
+                    name: "demo".to_owned(),
+                    tags: BTreeMap::new(),
+                },
+            )
+            .expect("rest api should be created");
+        let deployment = service
+            .create_deployment(
+                &scope,
+                &api.id,
+                CreateDeploymentInput {
+                    description: None,
+                    stage_description: None,
+                    stage_name: None,
+                    variables: BTreeMap::new(),
+                },
+            )
+            .expect("deployment should create");
+        service
+            .create_stage(
+                &scope,
+                &api.id,
+                CreateStageInput {
+                    cache_cluster_enabled: None,
+                    cache_cluster_size: None,
+                    deployment_id: deployment.id,
+                    description: None,
+                    stage_name: "dev".to_owned(),
+                    tags: BTreeMap::new(),
+                    variables: BTreeMap::new(),
+                },
+            )
+            .expect("stage should create");
+        let bound_stage_key = service
+            .create_api_key(
+                &scope,
+                CreateApiKeyInput {
+                    customer_id: None,
+                    description: None,
+                    enabled: Some(true),
+                    name: Some("stage-key".to_owned()),
+                    stage_keys: vec![format!("{}/dev", api.id)],
+                    tags: BTreeMap::new(),
+                    value: Some("stage-secret".to_owned()),
+                },
+            )
+            .expect("stage key should create");
+        let bound_usage_plan_key = service
+            .create_api_key(
+                &scope,
+                CreateApiKeyInput {
+                    customer_id: None,
+                    description: None,
+                    enabled: Some(true),
+                    name: Some("usage-key".to_owned()),
+                    stage_keys: Vec::new(),
+                    tags: BTreeMap::new(),
+                    value: Some("usage-secret".to_owned()),
+                },
+            )
+            .expect("usage plan key should create");
+        let usage_plan = service
+            .create_usage_plan(
+                &scope,
+                CreateUsagePlanInput {
+                    api_stages: vec![UsagePlanApiStage {
+                        api_id: api.id.clone(),
+                        stage: "dev".to_owned(),
+                    }],
+                    description: None,
+                    name: "basic".to_owned(),
+                    product_code: None,
+                    quota: None,
+                    tags: BTreeMap::new(),
+                    throttle: None,
+                },
+            )
+            .expect("usage plan should create");
+        service
+            .create_usage_plan_key(
+                &scope,
+                &usage_plan.id,
+                CreateUsagePlanKeyInput {
+                    key_id: bound_usage_plan_key.id.clone(),
+                    key_type: "API_KEY".to_owned(),
+                },
+            )
+            .expect("usage plan key should bind");
+
+        let state = service.load_state(&scope);
+
+        assert!(is_valid_execute_api_key(
+            &state,
+            &api.id,
+            "dev",
+            bound_stage_key
+                .value
+                .as_deref()
+                .expect("stage key value should exist")
+        ));
+        assert!(is_valid_execute_api_key(
+            &state,
+            &api.id,
+            "dev",
+            bound_usage_plan_key
+                .value
+                .as_deref()
+                .expect("usage plan key value should exist")
+        ));
+        assert!(!is_valid_execute_api_key(
+            &state,
+            &api.id,
+            "dev",
+            "invalid-secret"
+        ));
     }
 
     #[test]

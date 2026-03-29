@@ -16,10 +16,11 @@ pub(crate) use state::{
     HTTP_API_AUTHORIZER_ID_WIDTH, HTTP_DEPLOYMENT_ID_WIDTH,
     HTTP_INTEGRATION_ID_WIDTH, HTTP_ROUTE_ID_WIDTH, ROOT_PATH,
     StoredApiGatewayState, StoredApiMethod, StoredApiResource,
-    StoredDeployment, StoredDomainName, StoredStage, deployment, domain,
-    next_identifier, normalize_http_method, optional_empty_to_none, paginate,
-    rest_api, stage, validate_name, validate_stage_name, validate_status_code,
-    validate_tags,
+    StoredDeployment, StoredDomainName, StoredRestApi, StoredStage,
+    deployment, domain, execute_api_request_validator,
+    is_valid_execute_api_key, next_identifier, normalize_http_method,
+    optional_empty_to_none, paginate, rest_api, stage, validate_name,
+    validate_stage_name, validate_status_code, validate_tags,
 };
 
 pub use errors::ApiGatewayError;
