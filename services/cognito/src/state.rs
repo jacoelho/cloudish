@@ -920,7 +920,7 @@ impl CognitoService {
                 "username".to_owned(),
             ],
             id_token_signing_alg_values_supported: vec!["RS256".to_owned()],
-            issuer: issuer.clone(),
+            issuer,
             jwks_uri: self
                 .advertised_edge
                 .current()
@@ -1743,12 +1743,10 @@ fn ensure_pool_issuer(
     pool: &mut StoredUserPool,
     advertised_edge: &aws::AdvertisedEdge,
 ) -> Result<String, CognitoError> {
-    if let Some(issuer_origin) = pool.issuer_origin.clone() {
-        return Ok(format!("{issuer_origin}/{}", pool.id));
-    }
-
     let origin = advertised_edge.origin();
-    pool.issuer_origin = Some(origin.clone());
+    if pool.issuer_origin.as_deref() != Some(origin.as_str()) {
+        pool.issuer_origin = Some(origin);
+    }
 
     Ok(advertised_edge.cognito_issuer(pool.id.as_str()))
 }
@@ -2207,16 +2205,19 @@ mod tests {
         AdminCreateUserInput, AdminGetUserInput, AdminInitiateAuthInput,
         AdminSetUserPasswordInput, AdminUpdateUserAttributesInput,
         AttributeType, ChangePasswordInput, CognitoExplicitAuthFlow,
-        CognitoScope, CognitoService, CognitoUserPoolClientId,
-        CognitoUserPoolId, ConfirmSignUpInput, CreateUserPoolClientInput,
-        CreateUserPoolInput, CreateUserPoolOutput, DeleteUserPoolInput,
-        DescribeUserPoolInput, DescribeUserPoolOutput, GetUserInput,
-        InitiateAuthInput, ListUserPoolClientsInput, ListUserPoolsInput,
-        ListUsersInput, RespondToAuthChallengeInput, SignUpInput,
-        StoredCognitoState, StoredUserPool, UpdateUserAttributesInput,
-        UpdateUserPoolClientInput, UpdateUserPoolInput,
+        CognitoScope, CognitoService, CognitoStateKey,
+        CognitoUserPoolClientId, CognitoUserPoolId, ConfirmSignUpInput,
+        CreateUserPoolClientInput, CreateUserPoolInput, CreateUserPoolOutput,
+        DeleteUserPoolInput, DescribeUserPoolInput, DescribeUserPoolOutput,
+        GetUserInput, InitiateAuthInput, ListUserPoolClientsInput,
+        ListUserPoolsInput, ListUsersInput, RespondToAuthChallengeInput,
+        SignUpInput, StoredCognitoState, StoredUserPool,
+        UpdateUserAttributesInput, UpdateUserPoolClientInput,
+        UpdateUserPoolInput,
     };
-    use aws::{AccountId, Clock, RegionId};
+    use aws::{
+        AccountId, AdvertisedEdge, Clock, RegionId, SharedAdvertisedEdge,
+    };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2253,6 +2254,22 @@ mod tests {
         let store: StorageHandle<_, _> =
             Arc::new(InMemoryStorage::<_, StoredCognitoState>::new());
         CognitoService::with_store(Arc::new(FixedClock::new(100)), store)
+    }
+
+    fn service_with_advertised_edge(
+        advertised_edge: SharedAdvertisedEdge,
+    ) -> (CognitoService, StorageHandle<CognitoStateKey, StoredCognitoState>)
+    {
+        let store: StorageHandle<_, _> =
+            Arc::new(InMemoryStorage::<_, StoredCognitoState>::new());
+        (
+            CognitoService::with_store_and_advertised_edge(
+                Arc::new(FixedClock::new(100)),
+                Arc::clone(&store),
+                advertised_edge,
+            ),
+            store,
+        )
     }
 
     fn user_pool_id(value: &str) -> CognitoUserPoolId {
@@ -2309,6 +2326,61 @@ mod tests {
             user_status: super::CognitoUserStatus::Confirmed,
             username: username.to_owned(),
         }
+    }
+
+    fn create_confirmed_password_user(
+        service: &CognitoService,
+        scope: &CognitoScope,
+    ) -> (CognitoUserPoolId, CognitoUserPoolClientId) {
+        let pool_id = service
+            .create_user_pool(
+                scope,
+                CreateUserPoolInput { pool_name: "auth-demo".to_owned() },
+            )
+            .expect("pool should create")
+            .user_pool
+            .id;
+        let client_id = service
+            .create_user_pool_client(
+                scope,
+                CreateUserPoolClientInput {
+                    client_name: "app".to_owned(),
+                    explicit_auth_flows: Some(vec![
+                        CognitoExplicitAuthFlow::AllowUserPasswordAuth,
+                    ]),
+                    generate_secret: Some(false),
+                    user_pool_id: pool_id.clone(),
+                },
+            )
+            .expect("client should create")
+            .user_pool_client
+            .client_id;
+        service
+            .sign_up(
+                scope,
+                SignUpInput {
+                    client_id: client_id.clone(),
+                    password: "Perm1234!".to_owned(),
+                    user_attributes: vec![AttributeType {
+                        name: "email".to_owned(),
+                        value: "user@example.com".to_owned(),
+                    }],
+                    username: "alice".to_owned(),
+                },
+            )
+            .expect("sign up should succeed");
+        service
+            .confirm_sign_up(
+                scope,
+                ConfirmSignUpInput {
+                    client_id: client_id.clone(),
+                    confirmation_code: "000000".to_owned(),
+                    username: "alice".to_owned(),
+                },
+            )
+            .expect("confirm sign up should succeed");
+
+        (pool_id, client_id)
     }
 
     #[test]
@@ -2401,9 +2473,10 @@ mod tests {
                 }],
             })
             .expect("token-backed attribute update should succeed");
+        let access_token = result.access_token;
         service
             .change_password(ChangePasswordInput {
-                access_token: result.access_token.clone(),
+                access_token,
                 previous_password: "Perm1234!".to_owned(),
                 proposed_password: "Perm5678!".to_owned(),
             })
@@ -2454,6 +2527,165 @@ mod tests {
             )
             .expect("new password should authenticate");
         assert!(updated_password.authentication_result.is_some());
+    }
+
+    #[test]
+    fn cognito_openid_configuration_tracks_updated_advertised_edge() {
+        let advertised_edge = SharedAdvertisedEdge::new(AdvertisedEdge::new(
+            "http",
+            "first.example.test",
+            4566,
+        ));
+        let (service, _) =
+            service_with_advertised_edge(advertised_edge.clone());
+        let scope = scope("eu-west-2");
+        let pool_id = service
+            .create_user_pool(
+                &scope,
+                CreateUserPoolInput { pool_name: "edge-demo".to_owned() },
+            )
+            .expect("pool should create")
+            .user_pool
+            .id;
+
+        let first = service
+            .open_id_configuration(&pool_id)
+            .expect("openid configuration should resolve");
+        advertised_edge.update(AdvertisedEdge::new(
+            "http",
+            "second.example.test",
+            4566,
+        ));
+        let second = service
+            .open_id_configuration(&pool_id)
+            .expect("openid configuration should resolve after edge update");
+
+        assert_eq!(
+            first.issuer,
+            format!("http://first.example.test:4566/{pool_id}")
+        );
+        assert_eq!(
+            second.issuer,
+            format!("http://second.example.test:4566/{pool_id}")
+        );
+        assert_eq!(
+            second.jwks_uri,
+            format!(
+                "http://second.example.test:4566/{pool_id}/.well-known/jwks.json"
+            )
+        );
+    }
+
+    #[test]
+    fn cognito_issued_tokens_use_the_current_edge_even_if_state_is_stale() {
+        let advertised_edge = SharedAdvertisedEdge::new(AdvertisedEdge::new(
+            "http",
+            "current.example.test",
+            4566,
+        ));
+        let (service, store) =
+            service_with_advertised_edge(advertised_edge.clone());
+        let scope = scope("eu-west-2");
+        let (pool_id, client_id) =
+            create_confirmed_password_user(&service, &scope);
+        let state_key = super::scope_key(&scope);
+        let mut state = store.get(&state_key).expect("state should exist");
+        let pool =
+            state.user_pools.get_mut(&pool_id).expect("pool should exist");
+        pool.issuer_origin = Some("http://stale.example.test:4566".to_owned());
+        store.put(state_key, state).expect("state should persist");
+
+        let auth = service
+            .initiate_auth(
+                &scope,
+                InitiateAuthInput {
+                    auth_flow: "USER_PASSWORD_AUTH".to_owned(),
+                    auth_parameters: BTreeMap::from([
+                        ("PASSWORD".to_owned(), "Perm1234!".to_owned()),
+                        ("USERNAME".to_owned(), "alice".to_owned()),
+                    ]),
+                    client_id,
+                },
+            )
+            .expect("password auth should succeed");
+        let tokens = auth
+            .authentication_result
+            .expect("auth result should issue tokens");
+        let claims: serde_json::Value =
+            super::decode_and_verify_token(&tokens.id_token)
+                .expect("issued token should verify");
+        let refreshed_state =
+            store.get(&super::scope_key(&scope)).expect("state should exist");
+
+        assert_eq!(
+            claims["iss"],
+            serde_json::Value::String(
+                advertised_edge.current().cognito_issuer(pool_id.as_str())
+            )
+        );
+        assert_eq!(
+            refreshed_state
+                .user_pools
+                .get(&pool_id)
+                .and_then(|pool| pool.issuer_origin.clone()),
+            Some(advertised_edge.current().origin())
+        );
+    }
+
+    #[test]
+    fn cognito_openid_configuration_self_heals_legacy_issuer_origin() {
+        let advertised_edge = SharedAdvertisedEdge::new(AdvertisedEdge::new(
+            "http",
+            "edge.example.test",
+            4566,
+        ));
+        let (service, store) =
+            service_with_advertised_edge(advertised_edge.clone());
+        let scope = scope("eu-west-2");
+        let pool_id = user_pool_id("eu-west-2_000000001");
+        store
+            .put(
+                super::scope_key(&scope),
+                StoredCognitoState {
+                    auth_sessions: BTreeMap::new(),
+                    issued_tokens: BTreeMap::new(),
+                    next_auth_session_sequence: 0,
+                    next_token_sequence: 0,
+                    next_user_pool_sequence: 1,
+                    next_user_pool_client_sequence: 0,
+                    next_user_sub_sequence: 0,
+                    user_pool_clients: BTreeMap::new(),
+                    user_pools: BTreeMap::from([(
+                        pool_id.clone(),
+                        StoredUserPool {
+                            issuer_origin: Some(
+                                "http://legacy.example.test:4566".to_owned(),
+                            ),
+                            ..stored_user_pool(&scope, pool_id.as_str())
+                        },
+                    )]),
+                    users: BTreeMap::new(),
+                },
+            )
+            .expect("legacy state should seed");
+
+        let open_id = service
+            .open_id_configuration(&pool_id)
+            .expect("openid configuration should resolve");
+        let refreshed =
+            store.get(&super::scope_key(&scope)).expect("state should exist");
+
+        assert_eq!(
+            open_id.issuer,
+            advertised_edge.current().cognito_issuer(pool_id.as_str())
+        );
+        assert_eq!(
+            refreshed
+                .user_pools
+                .get(&pool_id)
+                .and_then(|pool| pool.issuer_origin.clone()),
+            Some(advertised_edge.current().origin())
+        );
     }
 
     #[test]
@@ -2676,10 +2908,7 @@ mod tests {
             .update_user_pool_client(
                 &scope,
                 UpdateUserPoolClientInput {
-                    client_id: created_client
-                        .user_pool_client
-                        .client_id
-                        .clone(),
+                    client_id: created_client.user_pool_client.client_id,
                     client_name: Some("app-updated".to_owned()),
                     explicit_auth_flows: Some(vec![
                         CognitoExplicitAuthFlow::AllowRefreshTokenAuth,
@@ -2782,7 +3011,7 @@ mod tests {
         service
             .delete_user_pool(
                 &scope,
-                DeleteUserPoolInput { user_pool_id: user_pool.id.clone() },
+                DeleteUserPoolInput { user_pool_id: user_pool.id },
             )
             .expect("pool should delete");
         let pools = service
@@ -2811,7 +3040,7 @@ mod tests {
         let error = service
             .describe_user_pool(
                 &east,
-                DescribeUserPoolInput { user_pool_id: pool.id.clone() },
+                DescribeUserPoolInput { user_pool_id: pool.id },
             )
             .expect_err("cross-region access should fail");
         assert_eq!(error.to_aws_error().code(), "ResourceNotFoundException");
