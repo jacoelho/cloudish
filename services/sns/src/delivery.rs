@@ -95,6 +95,32 @@ pub struct NotificationPayload {
     pub topic_arn: Arn,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnsHttpRequest {
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
+}
+
+impl SnsHttpRequest {
+    fn new(body: Vec<u8>, headers: Vec<(String, String)>) -> Self {
+        Self { body, headers }
+    }
+
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+}
+
+pub trait SnsHttpSigner: Send + Sync {
+    fn sign(&self, string_to_sign: &str) -> String;
+
+    fn signing_cert_url(&self) -> String;
+}
+
 impl NotificationPayload {
     pub fn http_body(
         &self,
@@ -106,6 +132,29 @@ impl NotificationPayload {
         }
 
         self.notification_json(advertised_edge).to_string().into_bytes()
+    }
+
+    pub fn http_request(
+        &self,
+        raw_message_delivery: bool,
+        advertised_edge: &AdvertisedEdge,
+        signer: &dyn SnsHttpSigner,
+    ) -> SnsHttpRequest {
+        let headers = http_headers(
+            "Notification",
+            &self.message_id,
+            &self.topic_arn,
+            Some(&self.subscription_arn),
+        );
+        let body = if raw_message_delivery {
+            self.message.as_bytes().to_vec()
+        } else {
+            self.signed_notification_json(advertised_edge, signer)
+                .to_string()
+                .into_bytes()
+        };
+
+        SnsHttpRequest::new(body, headers)
     }
 
     pub fn lambda_event(&self, advertised_edge: &AdvertisedEdge) -> Vec<u8> {
@@ -161,6 +210,86 @@ impl NotificationPayload {
                 .sns_unsubscribe_url(&self.subscription_arn),
             "MessageAttributes": notification_message_attributes(&self.message_attributes),
         })
+    }
+
+    fn signed_notification_json(
+        &self,
+        advertised_edge: &AdvertisedEdge,
+        signer: &dyn SnsHttpSigner,
+    ) -> Value {
+        let signature_version = "1";
+        let signature = signer.sign(&notification_string_to_sign(self));
+        let mut body = serde_json::Map::from_iter([
+            ("Type".to_owned(), json!("Notification")),
+            ("MessageId".to_owned(), json!(self.message_id)),
+            ("TopicArn".to_owned(), json!(self.topic_arn)),
+            ("Message".to_owned(), json!(self.message)),
+            ("Timestamp".to_owned(), json!(self.timestamp)),
+            ("SignatureVersion".to_owned(), json!(signature_version)),
+            ("Signature".to_owned(), json!(signature)),
+            ("SigningCertURL".to_owned(), json!(signer.signing_cert_url())),
+            (
+                "UnsubscribeURL".to_owned(),
+                json!(
+                    advertised_edge
+                        .sns_unsubscribe_url(&self.subscription_arn)
+                ),
+            ),
+            (
+                "MessageAttributes".to_owned(),
+                json!(notification_message_attributes(
+                    &self.message_attributes
+                )),
+            ),
+        ]);
+        if let Some(subject) = &self.subject {
+            body.insert("Subject".to_owned(), json!(subject));
+        }
+
+        Value::Object(body)
+    }
+}
+
+impl ConfirmationDelivery {
+    pub fn http_request(
+        &self,
+        message_id: &str,
+        timestamp: &str,
+        advertised_edge: &AdvertisedEdge,
+        signer: &dyn SnsHttpSigner,
+    ) -> SnsHttpRequest {
+        let headers = http_headers(
+            "SubscriptionConfirmation",
+            message_id,
+            &self.topic_arn,
+            None,
+        );
+        let subscribe_url = advertised_edge
+            .sns_confirm_subscription_url(&self.topic_arn, &self.token);
+        let signature = signer.sign(&confirmation_string_to_sign(
+            &confirmation_message(&self.topic_arn),
+            message_id,
+            &subscribe_url,
+            timestamp,
+            &self.token,
+            &self.topic_arn,
+        ));
+        let body = json!({
+            "Type": "SubscriptionConfirmation",
+            "MessageId": message_id,
+            "Token": self.token,
+            "TopicArn": self.topic_arn,
+            "Message": confirmation_message(&self.topic_arn),
+            "SubscribeURL": subscribe_url,
+            "Timestamp": timestamp,
+            "SignatureVersion": "1",
+            "Signature": signature,
+            "SigningCertURL": signer.signing_cert_url(),
+        })
+        .to_string()
+        .into_bytes();
+
+        SnsHttpRequest::new(body, headers)
     }
 }
 
@@ -312,6 +441,63 @@ fn notification_message_attributes(
         .collect()
 }
 
+fn http_headers(
+    message_type: &str,
+    message_id: &str,
+    topic_arn: &Arn,
+    subscription_arn: Option<&Arn>,
+) -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("x-amz-sns-message-type".to_owned(), message_type.to_owned()),
+        ("x-amz-sns-message-id".to_owned(), message_id.to_owned()),
+        ("x-amz-sns-topic-arn".to_owned(), topic_arn.to_string()),
+        ("Content-Type".to_owned(), "text/plain; charset=UTF-8".to_owned()),
+    ];
+    if let Some(subscription_arn) = subscription_arn {
+        headers.push((
+            "x-amz-sns-subscription-arn".to_owned(),
+            subscription_arn.to_string(),
+        ));
+    }
+
+    headers
+}
+
+fn confirmation_message(topic_arn: &Arn) -> String {
+    format!(
+        "You have chosen to subscribe to the topic {topic_arn}.\nTo confirm the subscription, visit the SubscribeURL included in this message."
+    )
+}
+
+fn notification_string_to_sign(payload: &NotificationPayload) -> String {
+    let mut string_to_sign = format!(
+        "Message\n{}\nMessageId\n{}\n",
+        payload.message, payload.message_id
+    );
+    if let Some(subject) = &payload.subject {
+        string_to_sign.push_str(&format!("Subject\n{subject}\n"));
+    }
+    string_to_sign.push_str(&format!(
+        "Timestamp\n{}\nTopicArn\n{}\nType\nNotification\n",
+        payload.timestamp, payload.topic_arn
+    ));
+
+    string_to_sign
+}
+
+fn confirmation_string_to_sign(
+    message: &str,
+    message_id: &str,
+    subscribe_url: &str,
+    timestamp: &str,
+    token: &str,
+    topic_arn: &Arn,
+) -> String {
+    format!(
+        "Message\n{message}\nMessageId\n{message_id}\nSubscribeURL\n{subscribe_url}\nTimestamp\n{timestamp}\nToken\n{token}\nTopicArn\n{topic_arn}\nType\nSubscriptionConfirmation\n"
+    )
+}
+
 pub(crate) fn validate_publish_batch_entries(
     entries: &[PublishBatchEntryInput],
 ) -> Result<(), SnsError> {
@@ -350,7 +536,11 @@ fn publish_target_arn(input: &PublishInput) -> Result<Arn, SnsError> {
     match (&input.topic_arn, &input.target_arn) {
         (Some(topic_arn), None) => Ok(topic_arn.clone()),
         (None, Some(target_arn)) => Ok(target_arn.clone()),
-        (Some(topic_arn), Some(_)) => Ok(topic_arn.clone()),
+        (Some(_), Some(_)) => Err(SnsError::InvalidParameter {
+            message:
+                "Invalid parameter: TopicArn and TargetArn cannot both be set."
+                    .to_owned(),
+        }),
         (None, None) => Err(SnsError::InvalidParameter {
             message: "Invalid parameter: TopicArn".to_owned(),
         }),

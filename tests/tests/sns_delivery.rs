@@ -40,6 +40,11 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+struct CapturedHttpRequest {
+    body: String,
+    headers: Vec<(String, String)>,
+}
+
 struct CaptureHttpServer {
     address: SocketAddr,
     handle: Option<JoinHandle<()>>,
@@ -80,22 +85,38 @@ impl CaptureHttpServer {
         format!("http://{}/subscription", self.address)
     }
 
-    fn next_body(&self, label: &str) -> String {
+    fn next_request(&self, label: &str) -> CapturedHttpRequest {
         let request =
             self.request_rx.recv_timeout(Duration::from_secs(2)).expect(label);
-        let body_start = request
+        let header_end = request
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
-            .map(|index| index + 4)
             .expect("fixture request should contain headers");
-
-        String::from_utf8(
+        let headers = std::str::from_utf8(
             request
-                .get(body_start..)
-                .expect("fixture request should contain a body")
-                .to_vec(),
+                .get(..header_end)
+                .expect("fixture request should contain header bytes"),
         )
-        .expect("fixture body should be UTF-8")
+        .expect("fixture request headers should be UTF-8");
+        let mut lines = headers.split("\r\n");
+        let _request_line =
+            lines.next().expect("fixture request line should exist");
+        let parsed_headers = lines
+            .map(|line| {
+                let (name, value) =
+                    line.split_once(':').expect("header should contain ':'");
+                (name.to_owned(), value.trim().to_owned())
+            })
+            .collect();
+        let body_start = request
+            .get(header_end + 4..)
+            .expect("fixture request should contain a body");
+
+        CapturedHttpRequest {
+            body: String::from_utf8(body_start.to_vec())
+                .expect("fixture body should be UTF-8"),
+            headers: parsed_headers,
+        }
     }
 
     fn assert_no_more_requests(&self) {
@@ -254,9 +275,10 @@ async fn sns_delivery_fanout_and_filter_policies_across_sqs_lambda_and_http() {
         .subscription_arn()
         .expect("pending http subscription ARN should be returned")
         .to_owned();
-    let confirmation_body = callback.next_body("subscription confirmation");
+    let confirmation_request =
+        callback.next_request("subscription confirmation");
     let confirmation: serde_json::Value =
-        serde_json::from_str(&confirmation_body)
+        serde_json::from_str(&confirmation_request.body)
             .expect("confirmation should be JSON");
     let token = confirmation
         .get("Token")
@@ -273,6 +295,19 @@ async fn sns_delivery_fanout_and_filter_policies_across_sqs_lambda_and_http() {
         confirmed.subscription_arn(),
         Some(pending_http_subscription_arn.as_str())
     );
+    assert!(confirmation_request.headers.contains(&(
+        "x-amz-sns-message-type".to_owned(),
+        "SubscriptionConfirmation".to_owned(),
+    )));
+    assert!(
+        confirmation_request
+            .headers
+            .contains(&("x-amz-sns-topic-arn".to_owned(), topic_arn.clone(),))
+    );
+    assert!(confirmation_request.headers.contains(&(
+        "Content-Type".to_owned(),
+        "text/plain; charset=UTF-8".to_owned(),
+    )));
 
     let matching_message = r#"{"detail":{"kind":"order-created"}}"#;
     sns.publish()
@@ -315,13 +350,39 @@ async fn sns_delivery_fanout_and_filter_policies_across_sqs_lambda_and_http() {
         matching_message
     );
 
-    let notification_body = callback.next_body("notification delivery");
+    let notification_request = callback.next_request("notification delivery");
     let notification: serde_json::Value =
-        serde_json::from_str(&notification_body)
+        serde_json::from_str(&notification_request.body)
             .expect("notification should be JSON");
     assert_eq!(notification["Type"], "Notification");
     assert_eq!(notification["Message"], matching_message);
     assert_eq!(notification["MessageAttributes"]["store"]["Value"], "eu-west");
+    assert!(notification_request.headers.contains(&(
+        "x-amz-sns-message-type".to_owned(),
+        "Notification".to_owned(),
+    )));
+    assert!(
+        notification_request.headers.contains(&(
+            "x-amz-sns-message-id".to_owned(),
+            notification["MessageId"]
+                .as_str()
+                .expect("notification message id should exist")
+                .to_owned(),
+        ))
+    );
+    assert!(
+        notification_request
+            .headers
+            .contains(&("x-amz-sns-topic-arn".to_owned(), topic_arn.clone(),))
+    );
+    assert!(notification_request.headers.iter().any(|(name, value)| {
+        name == "x-amz-sns-subscription-arn"
+            && value.starts_with("arn:aws:sns:eu-west-2:000000000000:orders:")
+    }));
+    assert!(notification_request.headers.contains(&(
+        "Content-Type".to_owned(),
+        "text/plain; charset=UTF-8".to_owned(),
+    )));
 
     sns.publish()
         .topic_arn(&topic_arn)

@@ -28,12 +28,14 @@ use lambda::{ApiGatewayInvokeInput, LambdaScope};
 use lambda::{InvokeInput, LambdaInvocationType};
 #[cfg(feature = "s3")]
 use s3::{S3Error, S3EventNotification, S3NotificationTransport, S3Scope};
+#[cfg(feature = "sns")]
+use sha1::{Digest, Sha1};
 #[cfg(feature = "eventbridge")]
 use sns::PublishInput;
 #[cfg(feature = "sns")]
 use sns::{
     ConfirmationDelivery, DeliveryEndpoint, PlannedDelivery,
-    SnsDeliveryTransport, SnsIdentifierSource, SnsService,
+    SnsDeliveryTransport, SnsHttpSigner, SnsIdentifierSource, SnsService,
 };
 #[cfg(any(feature = "eventbridge", feature = "s3", feature = "sns"))]
 use sqs::{SendMessageInput, SqsService};
@@ -166,6 +168,7 @@ impl ExecuteApiIntegrationExecutor for ApiGatewayIntegrationExecutor {
 pub struct SnsServiceDependencies {
     pub advertised_edge: SharedAdvertisedEdge,
     pub http_forwarder: Option<Arc<dyn HttpForwarder + Send + Sync>>,
+    pub http_signer: Option<Arc<dyn SnsHttpSigner + Send + Sync>>,
     pub lambda: Option<LambdaService>,
     pub sqs: Option<SqsService>,
 }
@@ -178,11 +181,32 @@ pub fn build_sns_service(
     mut dependencies: SnsServiceDependencies,
 ) -> SnsService {
     dependencies.advertised_edge = advertised_edge;
+    if dependencies.http_signer.is_none() {
+        dependencies.http_signer =
+            Some(Arc::new(CloudishSnsHttpSigner::default()));
+    }
     SnsService::with_transport(
         time_source,
         identifier_source,
         Arc::new(SnsDeliveryDispatcher { dependencies }),
     )
+}
+
+#[cfg(feature = "sns")]
+#[derive(Clone, Default)]
+struct CloudishSnsHttpSigner;
+
+#[cfg(feature = "sns")]
+impl SnsHttpSigner for CloudishSnsHttpSigner {
+    fn sign(&self, string_to_sign: &str) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(string_to_sign.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn signing_cert_url(&self) -> String {
+        "https://cloudish.invalid/sns.pem".to_owned()
+    }
 }
 
 #[cfg(feature = "eventbridge")]
@@ -308,26 +332,17 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
             return;
         };
         let advertised_edge = self.dependencies.advertised_edge.current();
-        let body = serde_json::json!({
-            "Type": "SubscriptionConfirmation",
-            "MessageId": message_id,
-            "Token": delivery.token,
-            "TopicArn": delivery.topic_arn,
-            "Timestamp": timestamp,
-            "SubscribeURL": advertised_edge
-                .sns_confirm_subscription_url(&delivery.topic_arn, &delivery.token),
-        })
-        .to_string()
-        .into_bytes();
-        let _ = forwarder.forward(
-            &HttpForwardRequest::new(
-                delivery.endpoint.endpoint.clone(),
-                "POST",
-                delivery.endpoint.path.clone(),
-            )
-            .with_header("Content-Type", "text/plain; charset=UTF-8")
-            .with_body(body),
+        let request = delivery.http_request(
+            &message_id,
+            &timestamp,
+            &advertised_edge,
+            self.http_signer().as_ref(),
         );
+        let _ = forwarder.forward(&self.http_forward_request(
+            delivery.endpoint.endpoint.clone(),
+            delivery.endpoint.path.clone(),
+            &request,
+        ));
     }
 
     fn deliver_notification(&self, delivery: &PlannedDelivery) {
@@ -339,20 +354,16 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
                 else {
                     return;
                 };
-                let _ = forwarder.forward(
-                    &HttpForwardRequest::new(
-                        parsed.endpoint.clone(),
-                        "POST",
-                        parsed.path.clone(),
-                    )
-                    .with_header("Content-Type", "text/plain; charset=UTF-8")
-                    .with_body(
-                        delivery.payload.http_body(
-                            delivery.raw_message_delivery,
-                            &advertised_edge,
-                        ),
-                    ),
+                let request = delivery.payload.http_request(
+                    delivery.raw_message_delivery,
+                    &advertised_edge,
+                    self.http_signer().as_ref(),
                 );
+                let _ = forwarder.forward(&self.http_forward_request(
+                    parsed.endpoint.clone(),
+                    parsed.path.clone(),
+                    &request,
+                ));
             }
             DeliveryEndpoint::Lambda(arn) => {
                 let Some(lambda) = self.dependencies.lambda.as_ref() else {
@@ -404,6 +415,31 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
                 );
             }
         }
+    }
+}
+
+#[cfg(feature = "sns")]
+impl SnsDeliveryDispatcher {
+    fn http_forward_request(
+        &self,
+        endpoint: aws::Endpoint,
+        path: String,
+        request: &sns::SnsHttpRequest,
+    ) -> HttpForwardRequest {
+        let mut forward = HttpForwardRequest::new(endpoint, "POST", path)
+            .with_body(request.body().to_vec());
+        for (name, value) in request.headers() {
+            forward = forward.with_header(name.clone(), value.clone());
+        }
+
+        forward
+    }
+
+    fn http_signer(&self) -> Arc<dyn SnsHttpSigner + Send + Sync> {
+        self.dependencies
+            .http_signer
+            .clone()
+            .unwrap_or_else(|| Arc::new(CloudishSnsHttpSigner::default()))
     }
 }
 
@@ -768,7 +804,7 @@ mod tests {
         S3EventNotification, S3NotificationTransport, S3Scope, S3Service,
     };
     use serde_json::json;
-    use sns::{CreateTopicInput, SnsScope, SubscribeInput};
+    use sns::{CreateTopicInput, SnsHttpSigner, SnsScope, SubscribeInput};
     use sqs::{CreateQueueInput, ReceiveMessageInput, SqsScope, SqsService};
     use std::collections::BTreeMap;
     use std::error::Error;
@@ -784,14 +820,29 @@ mod tests {
 
     type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedForwardRequest {
+        body: String,
+        headers: Vec<(String, String)>,
+    }
+
     #[derive(Debug, Default)]
     struct RecordingForwarder {
-        bodies: Mutex<Vec<String>>,
+        requests: Mutex<Vec<RecordedForwardRequest>>,
     }
 
     impl RecordingForwarder {
         fn bodies(&self) -> Vec<String> {
-            self.bodies
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|request| request.body.clone())
+                .collect()
+        }
+
+        fn requests(&self) -> Vec<RecordedForwardRequest> {
+            self.requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
@@ -803,11 +854,30 @@ mod tests {
             &self,
             request: &aws::HttpForwardRequest,
         ) -> Result<HttpForwardResponse, InfrastructureError> {
-            self.bodies
+            self.requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(String::from_utf8_lossy(request.body()).into_owned());
+                .push(RecordedForwardRequest {
+                    body: String::from_utf8_lossy(request.body()).into_owned(),
+                    headers: request.headers().to_vec(),
+                });
             Ok(HttpForwardResponse::new(200, "OK", Vec::new(), Vec::new()))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestSnsHttpSigner {
+        signature: String,
+        signing_cert_url: String,
+    }
+
+    impl SnsHttpSigner for TestSnsHttpSigner {
+        fn sign(&self, _string_to_sign: &str) -> String {
+            self.signature.clone()
+        }
+
+        fn signing_cert_url(&self) -> String {
+            self.signing_cert_url.clone()
         }
     }
 
@@ -1129,6 +1199,11 @@ mod tests {
                 advertised_edge: SharedAdvertisedEdge::default(),
                 http_forwarder: Some(Arc::clone(&forwarder)
                     as Arc<dyn HttpForwarder + Send + Sync>),
+                http_signer: Some(Arc::new(TestSnsHttpSigner {
+                    signature: "signed-by-test".to_owned(),
+                    signing_cert_url: "https://example.com/cert.pem"
+                        .to_owned(),
+                })),
                 lambda: Some(lambda),
                 sqs: Some(sqs),
             },
@@ -1172,10 +1247,108 @@ mod tests {
         })
         .expect("publish should succeed");
 
-        let bodies = forwarder.bodies();
-        assert_eq!(bodies.len(), 2);
-        assert!(bodies[0].contains("\"Type\":\"SubscriptionConfirmation\""));
-        assert!(bodies[1].contains("\"Type\":\"Notification\""));
+        let requests = forwarder.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].body.contains("\"Type\":\"SubscriptionConfirmation\"")
+        );
+        assert!(requests[1].body.contains("\"Type\":\"Notification\""));
+        assert!(requests[0].headers.contains(&(
+            "x-amz-sns-message-type".to_owned(),
+            "SubscriptionConfirmation".to_owned(),
+        )));
+        assert!(requests[1].headers.contains(&(
+            "x-amz-sns-message-type".to_owned(),
+            "Notification".to_owned(),
+        )));
+        assert!(requests[1].headers.contains(&(
+            "Content-Type".to_owned(),
+            "text/plain; charset=UTF-8".to_owned(),
+        )));
+        assert!(requests[0].body.contains("\"Signature\":\"signed-by-test\""));
+        assert!(requests[1].body.contains("\"Signature\":\"signed-by-test\""));
+        assert!(
+            requests[1].body.contains(
+                "\"SigningCertURL\":\"https://example.com/cert.pem\""
+            )
+        );
+        assert!(!requests[0].body.contains("\"Signature\":\"CLOUDISH\""));
+    }
+
+    #[test]
+    fn sns_delivery_dispatcher_forwards_http_headers_without_optional_dependencies()
+     {
+        let forwarder = Arc::new(RecordingForwarder::default());
+        let signer = Arc::new(TestSnsHttpSigner {
+            signature: "signature-a".to_owned(),
+            signing_cert_url: "https://example.com/cert-a.pem".to_owned(),
+        });
+        let sns = build_sns_service(
+            SharedAdvertisedEdge::default(),
+            Arc::new(|| UNIX_EPOCH + Duration::from_secs(1)),
+            Arc::new(sns::SequentialSnsIdentifierSource::default()),
+            SnsServiceDependencies {
+                advertised_edge: SharedAdvertisedEdge::default(),
+                http_forwarder: Some(Arc::clone(&forwarder)
+                    as Arc<dyn HttpForwarder + Send + Sync>),
+                http_signer: Some(signer),
+                lambda: None,
+                sqs: None,
+            },
+        );
+        let topic_arn = sns
+            .create_topic(
+                &sns_scope().expect("SNS scope should build"),
+                CreateTopicInput {
+                    attributes: BTreeMap::new(),
+                    name: "headers".to_owned(),
+                },
+            )
+            .expect("topic should create");
+
+        sns.subscribe(SubscribeInput {
+            attributes: BTreeMap::new(),
+            endpoint: "http://example.com/hooks".to_owned(),
+            protocol: "http".to_owned(),
+            return_subscription_arn: false,
+            topic_arn: topic_arn.clone(),
+        })
+        .expect("http subscription should create");
+        let confirmation_body = forwarder.bodies()[0].clone();
+        let confirmation: serde_json::Value =
+            serde_json::from_str(&confirmation_body)
+                .expect("confirmation body should be JSON");
+        let token = confirmation["Token"]
+            .as_str()
+            .expect("confirmation token should be present")
+            .to_owned();
+        sns.confirm_subscription(&topic_arn, &token)
+            .expect("subscription should confirm");
+        sns.publish(sns::PublishInput {
+            message: "hello".to_owned(),
+            message_attributes: BTreeMap::new(),
+            message_deduplication_id: None,
+            message_group_id: None,
+            subject: None,
+            target_arn: None,
+            topic_arn: Some(topic_arn),
+        })
+        .expect("publish should succeed");
+
+        let requests = forwarder.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].headers.contains(&(
+            "x-amz-sns-topic-arn".to_owned(),
+            "arn:aws:sns:eu-west-2:000000000000:headers".to_owned(),
+        )));
+        assert!(
+            requests[1]
+                .headers
+                .iter()
+                .any(|(name, _)| name == "x-amz-sns-subscription-arn")
+        );
+        assert!(requests[0].body.contains("\"Signature\":\"signature-a\""));
+        assert!(requests[1].body.contains("\"Signature\":\"signature-a\""));
     }
 
     #[test]

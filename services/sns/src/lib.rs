@@ -8,7 +8,7 @@ pub use delivery::{
     DeliveryEndpoint, MessageAttributeValue, NotificationPayload,
     PlannedDelivery, PublishBatchEntryInput, PublishBatchFailure,
     PublishBatchOutput, PublishBatchSuccess, PublishInput, PublishOutput,
-    SnsDeliveryTransport,
+    SnsDeliveryTransport, SnsHttpRequest, SnsHttpSigner,
 };
 pub use errors::SnsError;
 pub use scope::SnsScope;
@@ -457,11 +457,11 @@ mod tests {
         ListedSubscription, MessageAttributeValue, NotificationPayload,
         PlannedDelivery, PublishBatchEntryInput, PublishInput,
         SUBSCRIBE_PENDING_CONFIRMATION_ARN, SequentialSnsIdentifierSource,
-        SnsDeliveryTransport, SnsError, SnsScope, SnsService,
+        SnsDeliveryTransport, SnsError, SnsHttpSigner, SnsScope, SnsService,
         SubscriptionState, formatted_timestamp, parse_http_endpoint,
         percent_encode,
     };
-    use aws::{AccountId, Arn, ServiceName};
+    use aws::{AccountId, AdvertisedEdge, Arn, ServiceName};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, UNIX_EPOCH};
@@ -506,6 +506,22 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .push(delivery.clone());
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestHttpSigner {
+        signature: String,
+        signing_cert_url: String,
+    }
+
+    impl SnsHttpSigner for TestHttpSigner {
+        fn sign(&self, _string_to_sign: &str) -> String {
+            self.signature.clone()
+        }
+
+        fn signing_cert_url(&self) -> String {
+            self.signing_cert_url.clone()
         }
     }
 
@@ -1037,7 +1053,7 @@ mod tests {
 
     #[test]
     fn sns_delivery_payload_helpers_encode_http_sqs_and_lambda_messages() {
-        let advertised_edge = aws::AdvertisedEdge::default();
+        let advertised_edge = AdvertisedEdge::default();
         let payload = NotificationPayload {
             message: r#"{"hello":"world"}"#.to_owned(),
             message_attributes: BTreeMap::from([(
@@ -1087,6 +1103,79 @@ mod tests {
             lambda_event["Records"][0]["Sns"]["Message"],
             r#"{"hello":"world"}"#
         );
+    }
+
+    #[test]
+    fn sns_delivery_http_messages_share_signature_fields_and_headers() {
+        let signer = TestHttpSigner {
+            signature: "signed-message".to_owned(),
+            signing_cert_url: "https://example.com/cert.pem".to_owned(),
+        };
+        let advertised_edge = AdvertisedEdge::default();
+        let confirmation = ConfirmationDelivery {
+            endpoint: parse_http_endpoint(
+                "http://127.0.0.1:9010/subscription",
+            )
+            .expect("endpoint should parse"),
+            token: "token-1".to_owned(),
+            topic_arn: "arn:aws:sns:eu-west-2:000000000000:orders"
+                .parse()
+                .expect("topic ARN should parse"),
+        };
+        let payload = NotificationPayload {
+            message: r#"{"hello":"world"}"#.to_owned(),
+            message_attributes: BTreeMap::new(),
+            message_deduplication_id: None,
+            message_group_id: None,
+            message_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            subject: Some("Orders".to_owned()),
+            subscription_arn:
+                "arn:aws:sns:eu-west-2:000000000000:orders:sub-http"
+                    .parse()
+                    .expect("subscription ARN should parse"),
+            timestamp: "1970-01-01T00:00:00Z".to_owned(),
+            topic_arn: "arn:aws:sns:eu-west-2:000000000000:orders"
+                .parse()
+                .expect("topic ARN should parse"),
+        };
+
+        let confirmation_request = confirmation.http_request(
+            "00000000-0000-0000-0000-000000000002",
+            "1970-01-01T00:00:00Z",
+            &advertised_edge,
+            &signer,
+        );
+        let notification_request =
+            payload.http_request(false, &advertised_edge, &signer);
+        let confirmation_body: serde_json::Value =
+            serde_json::from_slice(confirmation_request.body())
+                .expect("confirmation body should be JSON");
+        let notification_body: serde_json::Value =
+            serde_json::from_slice(notification_request.body())
+                .expect("notification body should be JSON");
+
+        assert_eq!(confirmation_body["Type"], "SubscriptionConfirmation");
+        assert_eq!(notification_body["Type"], "Notification");
+        assert_eq!(confirmation_body["SignatureVersion"], "1");
+        assert_eq!(notification_body["SignatureVersion"], "1");
+        assert_eq!(confirmation_body["Signature"], "signed-message");
+        assert_eq!(notification_body["Signature"], "signed-message");
+        assert_eq!(
+            confirmation_body["SigningCertURL"],
+            "https://example.com/cert.pem"
+        );
+        assert_eq!(
+            notification_body["SigningCertURL"],
+            "https://example.com/cert.pem"
+        );
+        assert!(confirmation_request.headers().contains(&(
+            "x-amz-sns-message-type".to_owned(),
+            "SubscriptionConfirmation".to_owned(),
+        )));
+        assert!(notification_request.headers().contains(&(
+            "x-amz-sns-subscription-arn".to_owned(),
+            "arn:aws:sns:eu-west-2:000000000000:orders:sub-http".to_owned(),
+        )));
     }
 
     #[test]
@@ -1245,6 +1334,30 @@ mod tests {
         service
             .unsubscribe(&subscribed.subscription_arn)
             .expect("unsubscribe should remain idempotent");
+    }
+
+    #[test]
+    fn sns_core_publish_rejects_conflicting_topic_and_target_arns() {
+        let service = SnsService::new();
+        let topic_arn = create_topic(&service, "orders");
+        let error = service
+            .publish(PublishInput {
+                message: "payload".to_owned(),
+                message_attributes: BTreeMap::new(),
+                message_deduplication_id: None,
+                message_group_id: None,
+                subject: None,
+                target_arn: Some(
+                    "arn:aws:lambda:eu-west-2:000000000000:function:target"
+                        .parse()
+                        .expect("target ARN should parse"),
+                ),
+                topic_arn: Some(topic_arn),
+            })
+            .expect_err("conflicting publish targets should fail");
+
+        assert_eq!(error.code(), "InvalidParameter");
+        assert!(error.message().contains("TopicArn and TargetArn"));
     }
 
     #[test]

@@ -273,6 +273,7 @@ impl LocalRuntimeBuilder {
             SnsServiceDependencies {
                 advertised_edge: advertised_edge.clone(),
                 http_forwarder: http_forwarder.clone(),
+                http_signer: None,
                 lambda: Some(lambda.clone()),
                 sqs: Some(sqs.clone()),
             },
@@ -355,7 +356,6 @@ impl LocalRuntimeBuilder {
                 ssm: Some(Arc::new(ssm.clone())),
             },
         );
-        #[cfg(feature = "apigateway")]
         factory.load_all().map_err(RuntimeBuildError::StorageLoad)?;
         #[cfg(feature = "lambda")]
         let background_tasks = start_lambda_background_tasks(
@@ -375,6 +375,7 @@ impl LocalRuntimeBuilder {
         elasticache
             .restore_runtimes()
             .map_err(RuntimeBuildError::ElastiCacheRestore)?;
+        #[cfg(feature = "apigateway")]
         let execute_api_executor: Arc<
             dyn ExecuteApiIntegrationExecutor + Send + Sync,
         > = Arc::new(ApiGatewayIntegrationExecutor::new(
@@ -587,6 +588,7 @@ impl TestRuntimeBuilder {
             SnsServiceDependencies {
                 advertised_edge: advertised_edge.clone(),
                 http_forwarder: http_forwarder.clone(),
+                http_signer: None,
                 lambda: Some(lambda.clone()),
                 sqs: Some(sqs.clone()),
             },
