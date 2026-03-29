@@ -90,6 +90,18 @@ pub(crate) fn normalize_duration(
     Ok(value)
 }
 
+pub(crate) fn assume_role_duration_bounds(
+    caller: &StsCaller,
+    role_max_session_duration: u32,
+) -> DurationBounds {
+    let bounds = ASSUME_ROLE_DURATION.with_max(role_max_session_duration);
+    if caller.uses_long_term_credentials() {
+        bounds
+    } else {
+        bounds.with_max(3_600)
+    }
+}
+
 pub(crate) fn get_session_token_duration_bounds(
     caller: &StsCaller,
 ) -> DurationBounds {

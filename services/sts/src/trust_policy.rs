@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 pub(crate) enum TrustAction {
     Role,
     Saml,
+    TagSession,
     WebIdentity,
 }
 
@@ -16,6 +17,7 @@ impl TrustAction {
         match self {
             Self::Role => "sts:AssumeRole",
             Self::Saml => "sts:AssumeRoleWithSAML",
+            Self::TagSession => "sts:TagSession",
             Self::WebIdentity => "sts:AssumeRoleWithWebIdentity",
         }
     }
@@ -48,10 +50,6 @@ impl TrustConditionContext {
 
     fn value(&self, key: &str) -> Option<&[String]> {
         self.values.get(key).map(Vec::as_slice)
-    }
-
-    fn contains_key(&self, key: &str) -> bool {
-        self.values.contains_key(key)
     }
 }
 
@@ -142,6 +140,22 @@ enum StatementEffect {
     Deny,
 }
 
+const AWS_SUPPORTED_CONDITION_KEYS: &[&str] = &[
+    "aws:PrincipalArn",
+    "aws:PrincipalAccount",
+    "aws:PrincipalType",
+    "aws:username",
+    "sts:RoleSessionName",
+];
+const SAML_SUPPORTED_CONDITION_KEYS: &[&str] = &[
+    "SAML:aud",
+    "SAML:iss",
+    "SAML:sub",
+    "SAML:sub_type",
+    "SAML:namequalifier",
+    "sts:RoleSessionName",
+];
+
 pub(crate) fn trust_policy_allows(
     role: &IamRole,
     input: TrustEvaluationInput,
@@ -204,17 +218,8 @@ fn effect(statement: &Value) -> Option<StatementEffect> {
 }
 
 fn action_matches(statement: &Value, expected_action: TrustAction) -> bool {
-    match statement.get("Action") {
-        Some(Value::String(action)) => {
-            action_matches_value(action, expected_action)
-        }
-        Some(Value::Array(actions)) => actions.iter().any(|action| {
-            action.as_str().is_some_and(|action| {
-                action_matches_value(action, expected_action)
-            })
-        }),
-        _ => false,
-    }
+    string_or_array_values(statement.get("Action"))
+        .any(|action| action_matches_value(action, expected_action))
 }
 
 fn action_matches_value(action: &str, expected_action: TrustAction) -> bool {
@@ -312,7 +317,7 @@ fn condition_matches(
     for (operator, clauses) in operators {
         let clauses = clauses.as_object().ok_or(())?;
         for (key, expected) in clauses {
-            if !is_supported_condition_key(key, context, principal) {
+            if !is_supported_condition_key(key, principal) {
                 return Err(());
             }
             if !condition_clause_matches(operator, key, expected, context)? {
@@ -324,31 +329,9 @@ fn condition_matches(
     Ok(true)
 }
 
-fn is_supported_condition_key(
-    key: &str,
-    context: &TrustConditionContext,
-    principal: &TrustPrincipal,
-) -> bool {
-    match key {
-        "aws:PrincipalArn"
-        | "aws:PrincipalAccount"
-        | "aws:PrincipalType"
-        | "aws:username"
-        | "sts:RoleSessionName"
-        | "SAML:aud"
-        | "SAML:iss"
-        | "SAML:sub"
-        | "SAML:sub_type"
-        | "SAML:namequalifier" => true,
-        _ if matches!(principal, TrustPrincipal::WebIdentity { .. })
-            && key.split(':').nth(1).is_some_and(|suffix| {
-                matches!(suffix, "aud" | "sub" | "amr")
-            }) =>
-        {
-            true
-        }
-        _ => context.contains_key(key),
-    }
+fn is_supported_condition_key(key: &str, principal: &TrustPrincipal) -> bool {
+    supported_condition_keys(principal).contains(&key)
+        || is_supported_web_identity_condition_key(principal, key)
 }
 
 fn condition_clause_matches(
@@ -359,41 +342,17 @@ fn condition_clause_matches(
 ) -> Result<bool, ()> {
     let actual = context.value(key).unwrap_or(&[]);
     match operator {
-        "StringEquals" => {
-            let expected = string_condition_values(expected)?;
-            Ok(any_value_matches(actual, &expected, |actual, expected| {
-                actual == expected
-            }))
+        "StringEquals" | "ForAnyValue:StringEquals" => {
+            evaluate_any_string_condition(actual, expected, string_equals)
         }
-        "StringLike" => {
-            let expected = string_condition_values(expected)?;
-            Ok(any_value_matches(actual, &expected, glob_matches))
-        }
-        "ForAnyValue:StringEquals" => {
-            let expected = string_condition_values(expected)?;
-            Ok(any_value_matches(actual, &expected, |actual, expected| {
-                actual == expected
-            }))
-        }
-        "ForAnyValue:StringLike" => {
-            let expected = string_condition_values(expected)?;
-            Ok(any_value_matches(actual, &expected, glob_matches))
+        "StringLike" | "ForAnyValue:StringLike" => {
+            evaluate_any_string_condition(actual, expected, glob_matches)
         }
         "ForAllValues:StringEquals" => {
-            let expected = string_condition_values(expected)?;
-            Ok(!actual.is_empty()
-                && actual.iter().all(|actual| {
-                    expected.iter().any(|expected| actual == expected)
-                }))
+            evaluate_all_string_condition(actual, expected, string_equals)
         }
         "ForAllValues:StringLike" => {
-            let expected = string_condition_values(expected)?;
-            Ok(!actual.is_empty()
-                && actual.iter().all(|actual| {
-                    expected
-                        .iter()
-                        .any(|expected| glob_matches(actual, expected))
-                }))
+            evaluate_all_string_condition(actual, expected, glob_matches)
         }
         "Null" => match expected {
             Value::Bool(expected_is_null) => {
@@ -434,32 +393,117 @@ fn any_value_matches(
         })
 }
 
+fn all_value_matches(
+    actual: &[String],
+    expected: &[String],
+    matcher: impl Fn(&str, &str) -> bool,
+) -> bool {
+    actual.iter().all(|actual| {
+        expected.iter().any(|expected| matcher(actual, expected))
+    })
+}
+
+fn evaluate_any_string_condition(
+    actual: &[String],
+    expected: &Value,
+    matcher: impl Fn(&str, &str) -> bool,
+) -> Result<bool, ()> {
+    let expected = string_condition_values(expected)?;
+    Ok(any_value_matches(actual, &expected, matcher))
+}
+
+fn evaluate_all_string_condition(
+    actual: &[String],
+    expected: &Value,
+    matcher: impl Fn(&str, &str) -> bool,
+) -> Result<bool, ()> {
+    let expected = string_condition_values(expected)?;
+    Ok(all_value_matches(actual, &expected, matcher))
+}
+
+fn string_equals(actual: &str, expected: &str) -> bool {
+    actual == expected
+}
+
+fn supported_condition_keys(
+    principal: &TrustPrincipal,
+) -> &'static [&'static str] {
+    match principal {
+        TrustPrincipal::Aws { .. } => AWS_SUPPORTED_CONDITION_KEYS,
+        TrustPrincipal::Saml { .. } => SAML_SUPPORTED_CONDITION_KEYS,
+        TrustPrincipal::WebIdentity { .. } => &["sts:RoleSessionName"],
+    }
+}
+
+fn is_supported_web_identity_condition_key(
+    principal: &TrustPrincipal,
+    key: &str,
+) -> bool {
+    matches!(principal, TrustPrincipal::WebIdentity { .. })
+        && key
+            .split_once(':')
+            .is_some_and(|(_, suffix)| matches!(suffix, "aud" | "sub" | "amr"))
+}
+
+fn string_or_array_values(
+    value: Option<&Value>,
+) -> impl Iterator<Item = &str> {
+    value.into_iter().flat_map(|value| match value {
+        Value::String(value) => vec![value.as_str()],
+        Value::Array(values) => {
+            values.iter().filter_map(Value::as_str).collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
+    })
+}
+
 fn glob_matches(actual: &str, pattern: &str) -> bool {
     glob_matches_bytes(actual.as_bytes(), pattern.as_bytes())
 }
 
 fn glob_matches_bytes(actual: &[u8], pattern: &[u8]) -> bool {
-    match pattern.split_first() {
-        None => actual.is_empty(),
-        Some((b'*', rest)) => {
-            glob_matches_bytes(actual, rest)
-                || actual
-                    .split_first()
-                    .is_some_and(|(_, tail)| glob_matches_bytes(tail, pattern))
-        }
-        Some((expected, rest)) => {
-            actual.split_first().is_some_and(|(actual, tail)| {
-                *expected == *actual && glob_matches_bytes(tail, rest)
-            })
+    let (mut actual_index, mut pattern_index) = (0, 0);
+    let mut star_index = None;
+    let mut star_match_index = 0;
+
+    while actual_index < actual.len() {
+        match pattern.get(pattern_index) {
+            Some(b'?') => {
+                actual_index += 1;
+                pattern_index += 1;
+            }
+            Some(b'*') => {
+                star_index = Some(pattern_index);
+                pattern_index += 1;
+                star_match_index = actual_index;
+            }
+            Some(expected) if actual.get(actual_index) == Some(expected) => {
+                actual_index += 1;
+                pattern_index += 1;
+            }
+            _ => {
+                let Some(star_index) = star_index else {
+                    return false;
+                };
+                pattern_index = star_index + 1;
+                star_match_index += 1;
+                actual_index = star_match_index;
+            }
         }
     }
+
+    while matches!(pattern.get(pattern_index), Some(b'*')) {
+        pattern_index += 1;
+    }
+
+    pattern_index == pattern.len()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        TrustAction, TrustEvaluationInput, TrustPrincipal, glob_matches,
-        trust_policy_allows,
+        TrustAction, TrustConditionContext, TrustEvaluationInput,
+        TrustPrincipal, glob_matches, trust_policy_allows,
     };
     use crate::caller::StsCaller;
     use aws::{
@@ -561,6 +605,38 @@ mod tests {
     }
 
     #[test]
+    fn glob_matches_supports_question_marks_and_middle_stars() {
+        assert!(glob_matches(
+            "repo:cloudish:prod:deploy",
+            "repo:cloudish:*:dep?oy"
+        ));
+        assert!(glob_matches("abcz", "a*z"));
+        assert!(!glob_matches(
+            "repo:cloudish:prod:deploy",
+            "repo:cloudish:*:dep??o"
+        ));
+    }
+
+    #[test]
+    fn for_all_values_string_like_matches_empty_actual_sets() {
+        let role = role(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"ForAllValues:StringLike":{"token.actions.githubusercontent.com:amr":"auth*"}}}]}"#,
+        );
+
+        assert!(trust_policy_allows(
+            &role,
+            TrustEvaluationInput::web_identity(
+                &[
+                    "token.actions.githubusercontent.com".to_owned(),
+                    "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+                        .to_owned(),
+                ],
+                &BTreeMap::new(),
+            )
+        ));
+    }
+
+    #[test]
     fn aws_condition_context_exposes_principal_type_and_username() {
         let caller = StsCaller::new(
             "123456789012".parse().expect("account id should parse"),
@@ -592,5 +668,80 @@ mod tests {
             input.condition_context.value("aws:username"),
             Some(&["alice".to_owned()][..])
         );
+    }
+
+    #[test]
+    fn unsupported_condition_keys_fail_closed_for_aws_principals() {
+        let role = role(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"123456789012"},"Action":"sts:AssumeRole","Condition":{"StringEquals":{"aws:MultiFactorAuthPresent":"true"}}}]}"#,
+        );
+        let input = TrustEvaluationInput {
+            action: TrustAction::Role,
+            condition_context: TrustConditionContext::from_values(
+                BTreeMap::from([(
+                    "aws:MultiFactorAuthPresent".to_owned(),
+                    vec!["true".to_owned()],
+                )]),
+            ),
+            principal: TrustPrincipal::Aws {
+                account_id: "123456789012"
+                    .parse()
+                    .expect("account id should parse"),
+                canonical_principal_arn:
+                    "arn:aws:iam::123456789012:role/source"
+                        .parse()
+                        .expect("principal ARN should parse"),
+                presented_principal_arn:
+                    "arn:aws:sts::123456789012:assumed-role/source/build"
+                        .parse()
+                        .expect("presented ARN should parse"),
+            },
+        };
+
+        assert!(!trust_policy_allows(&role, input));
+    }
+
+    #[test]
+    fn unsupported_condition_keys_fail_closed_for_saml_principals() {
+        let role = role(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::123456789012:saml-provider/example"},"Action":"sts:AssumeRoleWithSAML","Condition":{"StringEquals":{"SAML:department":"eng"}}}]}"#,
+        );
+        let input = TrustEvaluationInput {
+            action: TrustAction::Saml,
+            condition_context: TrustConditionContext::from_values(
+                BTreeMap::from([(
+                    "SAML:department".to_owned(),
+                    vec!["eng".to_owned()],
+                )]),
+            ),
+            principal: TrustPrincipal::Saml {
+                principal_arn:
+                    "arn:aws:iam::123456789012:saml-provider/example"
+                        .parse()
+                        .expect("principal ARN should parse"),
+            },
+        };
+
+        assert!(!trust_policy_allows(&role, input));
+    }
+
+    #[test]
+    fn unsupported_condition_keys_fail_closed_for_web_identity_principals() {
+        let role = role(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"token.actions.githubusercontent.com:email":"dev@example.com"}}}]}"#,
+        );
+        let input = TrustEvaluationInput::web_identity(
+            &[
+                "token.actions.githubusercontent.com".to_owned(),
+                "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+                    .to_owned(),
+            ],
+            &BTreeMap::from([(
+                "token.actions.githubusercontent.com:email".to_owned(),
+                vec!["dev@example.com".to_owned()],
+            )]),
+        );
+
+        assert!(!trust_policy_allows(&role, input));
     }
 }

@@ -73,6 +73,8 @@ pub struct GetFederationTokenOutput {
 pub(crate) struct WebIdentityContext {
     audience: String,
     condition_values: BTreeMap<String, Vec<String>>,
+    expiration_epoch_seconds: Option<u64>,
+    not_before_epoch_seconds: Option<u64>,
     provider_output: String,
     trusted_federated_principals: Vec<String>,
     subject: String,
@@ -85,6 +87,14 @@ impl WebIdentityContext {
 
     pub(crate) fn condition_values(&self) -> &BTreeMap<String, Vec<String>> {
         &self.condition_values
+    }
+
+    pub(crate) fn expiration_epoch_seconds(&self) -> Option<u64> {
+        self.expiration_epoch_seconds
+    }
+
+    pub(crate) fn not_before_epoch_seconds(&self) -> Option<u64> {
+        self.not_before_epoch_seconds
     }
 
     pub(crate) fn provider_output(&self) -> &str {
@@ -157,6 +167,7 @@ pub(crate) fn normalize_web_identity(
 ) -> Result<WebIdentityContext, StsError> {
     if let Some(claims) = parse_jwt_claims(&input.web_identity_token)? {
         let issuer = claims
+            .values
             .get("iss")
             .and_then(|values| values.first())
             .ok_or_else(|| StsError::Validation {
@@ -169,6 +180,7 @@ pub(crate) fn normalize_web_identity(
             "arn:aws:iam::{role_account_id}:oidc-provider/{provider_key}"
         );
         let audience = claims
+            .values
             .get("aud")
             .and_then(|values| values.first())
             .cloned()
@@ -178,6 +190,7 @@ pub(crate) fn normalize_web_identity(
                         .to_owned(),
             })?;
         let subject = claims
+            .values
             .get("sub")
             .and_then(|values| values.first())
             .cloned()
@@ -186,11 +199,14 @@ pub(crate) fn normalize_web_identity(
                     "The web identity token must contain a subject claim."
                         .to_owned(),
             })?;
-        let condition_values = oidc_condition_values(&provider_key, &claims);
+        let condition_values =
+            oidc_condition_values(&provider_key, &claims.values);
 
         return Ok(WebIdentityContext {
             audience,
             condition_values,
+            expiration_epoch_seconds: claims.expiration_epoch_seconds,
+            not_before_epoch_seconds: claims.not_before_epoch_seconds,
             provider_output: issuer.clone(),
             trusted_federated_principals: vec![provider_key, provider_arn],
             subject,
@@ -210,6 +226,8 @@ pub(crate) fn normalize_web_identity(
     Ok(WebIdentityContext {
         audience: "sts.amazonaws.com".to_owned(),
         condition_values: BTreeMap::new(),
+        expiration_epoch_seconds: None,
+        not_before_epoch_seconds: None,
         provider_output: provider_id.to_owned(),
         trusted_federated_principals: vec![provider_id.to_owned()],
         subject: "web-identity-subject".to_owned(),
@@ -287,9 +305,7 @@ pub(crate) fn federated_user_identity(
     })
 }
 
-fn parse_jwt_claims(
-    token: &str,
-) -> Result<Option<BTreeMap<String, Vec<String>>>, StsError> {
+fn parse_jwt_claims(token: &str) -> Result<Option<ParsedJwtClaims>, StsError> {
     let mut segments = token.split('.');
     let _header = segments.next();
     let Some(payload_segment) = segments.next() else {
@@ -318,7 +334,18 @@ fn parse_jwt_claims(
         }
     }
 
-    Ok(Some(extracted))
+    Ok(Some(ParsedJwtClaims {
+        values: extracted,
+        expiration_epoch_seconds: epoch_seconds_claim(claims.get("exp")),
+        not_before_epoch_seconds: epoch_seconds_claim(claims.get("nbf")),
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedJwtClaims {
+    values: BTreeMap<String, Vec<String>>,
+    expiration_epoch_seconds: Option<u64>,
+    not_before_epoch_seconds: Option<u64>,
 }
 
 fn decode_url_safe(value: &str) -> Result<Vec<u8>, StsError> {
@@ -341,6 +368,13 @@ fn claim_values(value: &Value) -> Option<Vec<String>> {
                 .collect::<Option<Vec<_>>>()?;
             Some(strings.into_iter().map(str::to_owned).collect())
         }
+        _ => None,
+    }
+}
+
+fn epoch_seconds_claim(value: Option<&Value>) -> Option<u64> {
+    match value {
+        Some(Value::Number(value)) => value.as_u64(),
         _ => None,
     }
 }
@@ -623,6 +657,14 @@ mod tests {
         format!("{header}.{payload}.signature")
     }
 
+    fn github_jwt_with_times(exp: u64, nbf: u64) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"iss":"https://token.actions.githubusercontent.com","sub":"repo:cloudish:ref:refs/heads/main","aud":["sts.amazonaws.com"],"amr":["authenticated"],"exp":{exp},"nbf":{nbf}}}"#
+        ));
+        format!("{header}.{payload}.signature")
+    }
+
     fn namespaced_saml_assertion() -> String {
         STANDARD.encode(
             r#"<saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion"><saml2:Subject><saml2:NameID NameQualifier="saml-qualifier" Format="urn:oasis:names:tc:SAML:2.0:nameid-format:transient">saml-subject</saml2:NameID></saml2:Subject><saml2:AttributeStatement><saml2:Attribute Name="https://aws.amazon.com/SAML/Attributes/RoleSessionName"><saml2:AttributeValue>federated-session</saml2:AttributeValue></saml2:Attribute></saml2:AttributeStatement><saml2:Conditions><saml2:AudienceRestriction><saml2:Audience>urn:amazon:webservices</saml2:Audience></saml2:AudienceRestriction></saml2:Conditions><saml2:Issuer>https://saml.example.com</saml2:Issuer></saml2:Assertion>"#,
@@ -668,6 +710,33 @@ mod tests {
                 .get("token.actions.githubusercontent.com:sub"),
             Some(&vec!["repo:cloudish:ref:refs/heads/main".to_owned()])
         );
+        assert_eq!(context.expiration_epoch_seconds(), None);
+        assert_eq!(context.not_before_epoch_seconds(), None);
+    }
+
+    #[test]
+    fn normalize_web_identity_preserves_numeric_exp_and_nbf_claims() {
+        let context = normalize_web_identity(
+            &AssumeRoleWithWebIdentityInput {
+                duration_seconds: None,
+                provider_id: None,
+                role_arn: "arn:aws:iam::000000000000:role/demo"
+                    .parse::<Arn>()
+                    .expect("role ARN should parse"),
+                role_session_name: "web-session".to_owned(),
+                web_identity_token: github_jwt_with_times(
+                    1_742_905_900,
+                    1_742_905_500,
+                ),
+            },
+            &"000000000000"
+                .parse::<AccountId>()
+                .expect("account id should parse"),
+        )
+        .expect("OIDC token should normalize");
+
+        assert_eq!(context.expiration_epoch_seconds(), Some(1_742_905_900));
+        assert_eq!(context.not_before_epoch_seconds(), Some(1_742_905_500));
     }
 
     #[test]
@@ -689,6 +758,29 @@ mod tests {
         .expect_err("opaque tokens require an explicit provider");
 
         assert!(matches!(error, crate::StsError::Validation { .. }));
+    }
+
+    #[test]
+    fn normalize_web_identity_opaque_provider_tokens_keep_time_claims_empty() {
+        let context = normalize_web_identity(
+            &AssumeRoleWithWebIdentityInput {
+                duration_seconds: None,
+                provider_id: Some("graph.facebook.com".to_owned()),
+                role_arn: "arn:aws:iam::000000000000:role/demo"
+                    .parse::<Arn>()
+                    .expect("role ARN should parse"),
+                role_session_name: "web-session".to_owned(),
+                web_identity_token: "opaque-token".to_owned(),
+            },
+            &"000000000000"
+                .parse::<AccountId>()
+                .expect("account id should parse"),
+        )
+        .expect("opaque provider tokens should normalize");
+
+        assert_eq!(context.provider_output(), "graph.facebook.com");
+        assert_eq!(context.expiration_epoch_seconds(), None);
+        assert_eq!(context.not_before_epoch_seconds(), None);
     }
 
     #[test]

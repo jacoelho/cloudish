@@ -39,6 +39,12 @@ fn aws_trust_policy(account_id: &str) -> String {
     )
 }
 
+fn aws_assume_role_only_trust_policy(account_id: &str) -> String {
+    format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{account_id}"}},"Action":"sts:AssumeRole"}}]}}"#
+    )
+}
+
 fn federated_trust_policy(
     account_id: &str,
     provider_arn: &str,
@@ -66,12 +72,28 @@ fn create_role(
     role_name: &str,
     assume_role_policy_document: String,
 ) {
+    create_role_with_max_session_duration(
+        iam,
+        account_id,
+        role_name,
+        assume_role_policy_document,
+        3_600,
+    );
+}
+
+fn create_role_with_max_session_duration(
+    iam: &IamService,
+    account_id: &str,
+    role_name: &str,
+    assume_role_policy_document: String,
+    max_session_duration: u32,
+) {
     iam.create_role(
         &scope(account_id),
         CreateRoleInput {
             assume_role_policy_document,
             description: "demo".to_owned(),
-            max_session_duration: 3_600,
+            max_session_duration,
             path: "/".to_owned(),
             role_name: role_name.to_owned(),
             tags: Vec::new(),
@@ -167,6 +189,15 @@ fn github_jwt(subject: &str) -> String {
     let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
     let payload = URL_SAFE_NO_PAD.encode(format!(
         r#"{{"iss":"https://token.actions.githubusercontent.com","sub":"{subject}","aud":["sts.amazonaws.com"],"amr":["authenticated"]}}"#
+    ));
+
+    format!("{header}.{payload}.signature")
+}
+
+fn github_jwt_with_times(subject: &str, exp: u64, nbf: u64) -> String {
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(format!(
+        r#"{{"iss":"https://token.actions.githubusercontent.com","sub":"{subject}","aud":["sts.amazonaws.com"],"amr":["authenticated"],"exp":{exp},"nbf":{nbf}}}"#
     ));
 
     format!("{header}.{payload}.signature")
@@ -364,6 +395,59 @@ fn sts_assume_role_rejects_duplicate_and_transitive_tag_errors() {
 }
 
 #[test]
+fn sts_assume_role_requires_tag_session_when_tags_are_requested() {
+    let iam = IamService::new();
+    create_role(
+        &iam,
+        "000000000000",
+        "untagged",
+        aws_assume_role_only_trust_policy("000000000000"),
+    );
+    let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
+    let caller = root_caller("000000000000");
+
+    let tagged = sts
+        .assume_role(
+            &scope("000000000000"),
+            &caller,
+            AssumeRoleInput {
+                duration_seconds: None,
+                role_arn: "arn:aws:iam::000000000000:role/untagged"
+                    .parse()
+                    .expect("role ARN should parse"),
+                role_session_name: "tagged".to_owned(),
+                tags: vec![IamTag {
+                    key: "env".to_owned(),
+                    value: "dev".to_owned(),
+                }],
+                transitive_tag_keys: vec!["env".to_owned()],
+            },
+        )
+        .expect_err("tagged assume-role should require sts:TagSession");
+    assert!(matches!(tagged, StsError::AccessDenied { .. }));
+
+    let untagged = sts
+        .assume_role(
+            &scope("000000000000"),
+            &caller,
+            AssumeRoleInput {
+                duration_seconds: None,
+                role_arn: "arn:aws:iam::000000000000:role/untagged"
+                    .parse()
+                    .expect("role ARN should parse"),
+                role_session_name: "plain".to_owned(),
+                tags: Vec::new(),
+                transitive_tag_keys: Vec::new(),
+            },
+        )
+        .expect("untagged assume-role should still succeed");
+    assert_eq!(
+        untagged.assumed_role_user.arn.to_string(),
+        "arn:aws:sts::000000000000:assumed-role/untagged/plain"
+    );
+}
+
+#[test]
 fn sts_assume_role_chaining_rejects_transitive_tag_overrides() {
     let iam = IamService::new();
     create_role(
@@ -417,6 +501,58 @@ fn sts_assume_role_chaining_rejects_transitive_tag_overrides() {
         .expect_err("transitive tag override should fail");
 
     assert!(matches!(error, StsError::InvalidParameterValue { .. }));
+}
+
+#[test]
+fn sts_assume_role_chaining_caps_duration_at_one_hour() {
+    let iam = IamService::new();
+    create_role_with_max_session_duration(
+        &iam,
+        "000000000000",
+        "long-lived",
+        aws_trust_policy("000000000000"),
+        7_200,
+    );
+    let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
+    let caller = assumed_role_caller("000000000000", "source", "session");
+
+    let error = sts
+        .assume_role(
+            &scope("000000000000"),
+            &caller,
+            AssumeRoleInput {
+                duration_seconds: Some(3_601),
+                role_arn: "arn:aws:iam::000000000000:role/long-lived"
+                    .parse()
+                    .expect("role ARN should parse"),
+                role_session_name: "next-session".to_owned(),
+                tags: Vec::new(),
+                transitive_tag_keys: Vec::new(),
+            },
+        )
+        .expect_err("role chaining should reject sessions above one hour");
+    assert!(matches!(error, StsError::Validation { .. }));
+    assert!(error.to_aws_error().message().contains("between 900 and 3600"));
+
+    let assumed = sts
+        .assume_role(
+            &scope("000000000000"),
+            &caller,
+            AssumeRoleInput {
+                duration_seconds: Some(3_600),
+                role_arn: "arn:aws:iam::000000000000:role/long-lived"
+                    .parse()
+                    .expect("role ARN should parse"),
+                role_session_name: "one-hour".to_owned(),
+                tags: Vec::new(),
+                transitive_tag_keys: Vec::new(),
+            },
+        )
+        .expect("role chaining at one hour should succeed");
+    assert_eq!(
+        assumed.assumed_role_user.arn.to_string(),
+        "arn:aws:sts::000000000000:assumed-role/long-lived/one-hour"
+    );
 }
 
 #[test]
@@ -581,6 +717,74 @@ fn sts_assume_role_with_web_identity_enforces_trust_policy() {
         )
         .expect_err("explicitly denied web identity provider should fail");
     assert!(matches!(denied, StsError::AccessDenied { .. }));
+}
+
+#[test]
+fn sts_assume_role_with_web_identity_rejects_expired_and_not_yet_valid_tokens()
+{
+    let iam = IamService::new();
+    create_role(
+        &iam,
+        "000000000000",
+        "web-timed",
+        federated_trust_policy(
+            "000000000000",
+            "arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com",
+            "token.actions.githubusercontent.com",
+            "arn:aws:iam::000000000000:saml-provider/Test",
+        ),
+    );
+    let sts = StsService::with_time_source(iam, time_source(1_742_905_600));
+
+    let expired = sts
+        .assume_role_with_web_identity(
+            &scope("000000000000"),
+            AssumeRoleWithWebIdentityInput {
+                duration_seconds: Some(900),
+                provider_id: None,
+                role_arn: "arn:aws:iam::000000000000:role/web-timed"
+                    .parse()
+                    .expect("role ARN should parse"),
+                role_session_name: "web-session".to_owned(),
+                web_identity_token: github_jwt_with_times(
+                    "repo:cloudish:ref:refs/heads/main",
+                    1_742_905_599,
+                    1_742_905_500,
+                ),
+            },
+        )
+        .expect_err("expired tokens should fail before trust evaluation");
+    assert!(matches!(expired, StsError::Validation { .. }));
+    assert_eq!(
+        expired.to_aws_error().message(),
+        "The web identity token has expired."
+    );
+
+    let not_yet_valid = sts
+        .assume_role_with_web_identity(
+            &scope("000000000000"),
+            AssumeRoleWithWebIdentityInput {
+                duration_seconds: Some(900),
+                provider_id: None,
+                role_arn: "arn:aws:iam::000000000000:role/web-timed"
+                    .parse()
+                    .expect("role ARN should parse"),
+                role_session_name: "web-session".to_owned(),
+                web_identity_token: github_jwt_with_times(
+                    "repo:cloudish:ref:refs/heads/main",
+                    1_742_905_900,
+                    1_742_905_601,
+                ),
+            },
+        )
+        .expect_err(
+            "not-yet-valid tokens should fail before trust evaluation",
+        );
+    assert!(matches!(not_yet_valid, StsError::Validation { .. }));
+    assert_eq!(
+        not_yet_valid.to_aws_error().message(),
+        "The web identity token is not yet valid."
+    );
 }
 
 #[test]

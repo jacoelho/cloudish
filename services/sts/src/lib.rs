@@ -22,9 +22,10 @@ use crate::trust_policy::{
 };
 use crate::validation::{
     ASSUME_ROLE_DURATION, FEDERATION_TOKEN_DURATION,
-    get_session_token_duration_bounds, normalize_duration, parse_role_arn,
-    session_state_for_assume_role, validate_federation_name,
-    validate_saml_principal_arn, validate_session_name, validate_session_tags,
+    assume_role_duration_bounds, get_session_token_duration_bounds,
+    normalize_duration, parse_role_arn, session_state_for_assume_role,
+    validate_federation_name, validate_saml_principal_arn,
+    validate_session_name, validate_session_tags,
 };
 #[cfg(test)]
 use aws::{AwsError, AwsErrorFamily};
@@ -34,7 +35,7 @@ use aws::{
 use iam::{IamScope, IamService};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub use crate::assume_role::{AssumeRoleInput, AssumeRoleOutput};
@@ -67,6 +68,13 @@ impl StsService {
         time_source: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     ) -> Self {
         Self { iam, state: Arc::default(), time_source }
+    }
+
+    fn current_epoch_seconds(&self) -> u64 {
+        (self.time_source)()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     /// Issues credentials for a role session after validating the caller,
@@ -103,10 +111,20 @@ impl StsService {
         ) {
             return Err(access_denied(caller, &input.role_arn));
         }
+        let requests_session_tags =
+            !input.tags.is_empty() || !input.transitive_tag_keys.is_empty();
+        if requests_session_tags
+            && !trust_policy_allows(
+                &role,
+                TrustEvaluationInput::aws(caller, TrustAction::TagSession),
+            )
+        {
+            return Err(access_denied(caller, &input.role_arn));
+        }
 
         let duration_seconds = normalize_duration(
             input.duration_seconds,
-            ASSUME_ROLE_DURATION.with_max(role.max_session_duration),
+            assume_role_duration_bounds(caller, role.max_session_duration),
         )?;
         let (session_tags, transitive_tag_keys) =
             session_state_for_assume_role(
@@ -126,8 +144,8 @@ impl StsService {
             SessionIssueInput {
                 account_id: role_ref.account_id,
                 credential_kind: TemporaryCredentialKind::AssumedRole {
-                    role_arn: input.role_arn.clone(),
-                    role_session_name: input.role_session_name.clone(),
+                    role_arn: input.role_arn,
+                    role_session_name: input.role_session_name,
                 },
                 duration_seconds,
                 principal_arn: assumed_role.user.arn.clone(),
@@ -176,6 +194,11 @@ impl StsService {
             .map_err(|_| StsError::Validation {
                 message: format!("{} is invalid", input.role_arn),
             })?;
+        validate_web_identity_token_times(
+            self.current_epoch_seconds(),
+            web_identity.expiration_epoch_seconds(),
+            web_identity.not_before_epoch_seconds(),
+        )?;
         if !trust_policy_allows(
             &role,
             TrustEvaluationInput::web_identity(
@@ -208,7 +231,7 @@ impl StsService {
                     TemporaryCredentialKind::AssumedRoleWithWebIdentity {
                         provider: web_identity.provider_output().to_owned(),
                         role_arn: input.role_arn.clone(),
-                        role_session_name: input.role_session_name.clone(),
+                        role_session_name: input.role_session_name,
                     },
                 duration_seconds,
                 principal_arn: assumed_role.user.arn.clone(),
@@ -284,7 +307,7 @@ impl StsService {
                 credential_kind:
                     TemporaryCredentialKind::AssumedRoleWithSaml {
                         principal_arn: input.principal_arn.clone(),
-                        role_arn: input.role_arn.clone(),
+                        role_arn: input.role_arn,
                         role_session_name: saml.role_session_name().to_owned(),
                     },
                 duration_seconds,
@@ -390,7 +413,7 @@ impl StsService {
                 account_id: caller.account_id().clone(),
                 credential_kind: TemporaryCredentialKind::FederationToken {
                     federated_user_arn: federated_user.user.arn.clone(),
-                    federated_user_name: input.name.clone(),
+                    federated_user_name: input.name,
                 },
                 duration_seconds,
                 principal_arn: federated_user.user.arn.clone(),
@@ -412,6 +435,29 @@ fn temporary_credentials_not_supported(action: &str) -> StsError {
     StsError::AccessDenied {
         message: format!("Cannot call {action} with session credentials."),
     }
+}
+
+fn validate_web_identity_token_times(
+    now_epoch_seconds: u64,
+    expiration_epoch_seconds: Option<u64>,
+    not_before_epoch_seconds: Option<u64>,
+) -> Result<(), StsError> {
+    if expiration_epoch_seconds
+        .is_some_and(|expiration| expiration <= now_epoch_seconds)
+    {
+        return Err(StsError::Validation {
+            message: "The web identity token has expired.".to_owned(),
+        });
+    }
+    if not_before_epoch_seconds
+        .is_some_and(|not_before| now_epoch_seconds < not_before)
+    {
+        return Err(StsError::Validation {
+            message: "The web identity token is not yet valid.".to_owned(),
+        });
+    }
+
+    Ok(())
 }
 
 impl SessionCredentialLookup for StsService {
