@@ -1,7 +1,7 @@
-use aws::{AccountId, Clock, RegionId};
+use aws::{AccountId, AdvertisedEdge, Clock, RegionId, SharedAdvertisedEdge};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::UNIX_EPOCH;
 use storage::{StorageFactory, StorageHandle};
 
@@ -11,7 +11,8 @@ use crate::{
 const DEFAULT_API_KEY_SOURCE: &str = "HEADER";
 const DEFAULT_DOMAIN_STATUS: &str = "AVAILABLE";
 const DEFAULT_SECURITY_POLICY: &str = "TLS_1_2";
-const REST_API_ID_WIDTH: usize = 10;
+const EXECUTE_API_ID_WIDTH: usize = 10;
+const GLOBAL_ROUTING_STATE_KEY: &str = "global";
 const RESOURCE_ID_WIDTH: usize = 8;
 const DEPLOYMENT_ID_WIDTH: usize = 10;
 const AUTHORIZER_ID_WIDTH: usize = 8;
@@ -21,7 +22,6 @@ const USAGE_PLAN_ID_WIDTH: usize = 10;
 pub(crate) const ROOT_PATH: &str = "/";
 const TAGS_LIMIT: usize = 50;
 const REGIONAL_HOSTED_ZONE_ID: &str = "Z2OJLYMUO9EFXC";
-pub(crate) const HTTP_API_ID_WIDTH: usize = 10;
 pub(crate) const HTTP_ROUTE_ID_WIDTH: usize = 10;
 pub(crate) const HTTP_INTEGRATION_ID_WIDTH: usize = 10;
 pub(crate) const HTTP_DEPLOYMENT_ID_WIDTH: usize = 10;
@@ -532,13 +532,34 @@ pub struct TagResourceInput {
 
 #[derive(Clone)]
 pub struct ApiGatewayService {
+    pub(crate) advertised_edge: SharedAdvertisedEdge,
     clock: Arc<dyn Clock>,
+    global_store: StorageHandle<String, StoredApiGatewayGlobalState>,
+    mutation_lock: Arc<Mutex<()>>,
     state_store: StorageHandle<ApiGatewayStateKey, StoredApiGatewayState>,
 }
 
 impl ApiGatewayService {
     pub fn new(factory: &StorageFactory, clock: Arc<dyn Clock>) -> Self {
-        Self { clock, state_store: factory.create("apigateway", "v1-control") }
+        Self::with_advertised_edge(
+            factory,
+            clock,
+            SharedAdvertisedEdge::default(),
+        )
+    }
+
+    pub fn with_advertised_edge(
+        factory: &StorageFactory,
+        clock: Arc<dyn Clock>,
+        advertised_edge: SharedAdvertisedEdge,
+    ) -> Self {
+        Self {
+            advertised_edge,
+            clock,
+            global_store: factory.create("apigateway", "runtime-routing"),
+            mutation_lock: Arc::new(Mutex::new(())),
+            state_store: factory.create("apigateway", "v1-control"),
+        }
     }
 
     #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
@@ -554,11 +575,9 @@ impl ApiGatewayService {
                 input.endpoint_configuration,
             )?;
 
+        let _guard = self.lock_state();
         let mut state = self.load_state(scope);
-        let api_id = next_identifier(
-            &mut state.next_rest_api_sequence,
-            REST_API_ID_WIDTH,
-        );
+        let api_id = self.allocate_execute_api_id()?;
         let root_resource_id = next_identifier(
             &mut state.next_resource_sequence,
             RESOURCE_ID_WIDTH,
@@ -2101,6 +2120,12 @@ impl ApiGatewayService {
         validate_domain_name(&input.domain_name)?;
         validate_tags(&input.tags)?;
 
+        let _guard = self.lock_state();
+        if self.domain_exists_globally(&input.domain_name) {
+            return Err(ApiGatewayError::Conflict {
+                resource: format!("Domain name {}", input.domain_name),
+            });
+        }
         let mut state = self.load_state(scope);
         if state.domains.contains_key(&input.domain_name) {
             return Err(ApiGatewayError::Conflict {
@@ -2121,7 +2146,8 @@ impl ApiGatewayService {
                 .or_else(|| Some(DEFAULT_SECURITY_POLICY.to_owned())),
             tags: input.tags,
         };
-        let response = domain.to_domain_name(scope);
+        let response =
+            domain.to_domain_name(scope, &self.advertised_edge.current());
         state.domains.insert(input.domain_name, domain);
         self.save_state(scope, state)?;
 
@@ -2137,7 +2163,7 @@ impl ApiGatewayService {
         let state = self.load_state(scope);
         let domain = domain(&state, domain_name)?;
 
-        Ok(domain.to_domain_name(scope))
+        Ok(domain.to_domain_name(scope, &self.advertised_edge.current()))
     }
 
     #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
@@ -2151,7 +2177,9 @@ impl ApiGatewayService {
         let domains = state
             .domains
             .values()
-            .map(|domain| domain.to_domain_name(scope))
+            .map(|domain| {
+                domain.to_domain_name(scope, &self.advertised_edge.current())
+            })
             .collect::<Vec<_>>();
 
         paginate(domains, position, limit)
@@ -2189,7 +2217,8 @@ impl ApiGatewayService {
             }
         }
 
-        let response = domain(&state, domain_name)?.to_domain_name(scope);
+        let response = domain(&state, domain_name)?
+            .to_domain_name(scope, &self.advertised_edge.current());
         self.save_state(scope, state)?;
 
         Ok(response)
@@ -2479,6 +2508,20 @@ impl ApiGatewayService {
         self.state_store.get(&scope_key(scope)).unwrap_or_default()
     }
 
+    pub(crate) fn all_states(
+        &self,
+    ) -> Vec<(ApiGatewayScope, StoredApiGatewayState)> {
+        let mut keys = self.state_store.keys();
+        keys.sort();
+        keys.into_iter()
+            .filter_map(|key| {
+                self.state_store
+                    .get(&key)
+                    .map(|state| (scope_from_key(&key), state))
+            })
+            .collect()
+    }
+
     pub(crate) fn save_state(
         &self,
         scope: &ApiGatewayScope,
@@ -2496,6 +2539,52 @@ impl ApiGatewayService {
             .unwrap_or_default()
             .as_secs()
     }
+
+    pub(crate) fn lock_state(&self) -> MutexGuard<'_, ()> {
+        self.mutation_lock.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    pub(crate) fn allocate_execute_api_id(
+        &self,
+    ) -> Result<String, ApiGatewayError> {
+        let mut global = self
+            .global_store
+            .get(&GLOBAL_ROUTING_STATE_KEY.to_owned())
+            .unwrap_or_default();
+        loop {
+            let api_id = next_identifier(
+                &mut global.next_execute_api_sequence,
+                EXECUTE_API_ID_WIDTH,
+            );
+            if !self.execute_api_id_exists_globally(&api_id) {
+                self.global_store
+                    .put(GLOBAL_ROUTING_STATE_KEY.to_owned(), global)
+                    .map_err(ApiGatewayError::Store)?;
+                return Ok(api_id);
+            }
+        }
+    }
+
+    pub(crate) fn domain_exists_globally(&self, domain_name: &str) -> bool {
+        self.all_states().into_iter().any(|(_, state)| {
+            state
+                .domains
+                .keys()
+                .any(|candidate| candidate.eq_ignore_ascii_case(domain_name))
+        })
+    }
+
+    fn execute_api_id_exists_globally(&self, api_id: &str) -> bool {
+        self.all_states().into_iter().any(|(_, state)| {
+            state.rest_apis.contains_key(api_id)
+                || state.http_apis.contains_key(api_id)
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(crate) struct StoredApiGatewayGlobalState {
+    pub(crate) next_execute_api_sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -2790,7 +2879,11 @@ pub(crate) struct StoredDomainName {
 }
 
 impl StoredDomainName {
-    fn to_domain_name(&self, scope: &ApiGatewayScope) -> DomainName {
+    fn to_domain_name(
+        &self,
+        scope: &ApiGatewayScope,
+        advertised_edge: &AdvertisedEdge,
+    ) -> DomainName {
         DomainName {
             certificate_arn: self.certificate_arn.clone(),
             certificate_name: self.certificate_name.clone(),
@@ -2801,10 +2894,7 @@ impl StoredDomainName {
             ),
             domain_name_status: DEFAULT_DOMAIN_STATUS.to_owned(),
             endpoint_configuration: self.endpoint_configuration.clone(),
-            regional_domain_name: format!(
-                "{}.regional.cloudish",
-                self.domain_name
-            ),
+            regional_domain_name: advertised_edge.authority(),
             regional_hosted_zone_id: REGIONAL_HOSTED_ZONE_ID.to_owned(),
             security_policy: self.security_policy.clone(),
             tags: self.tags.clone(),
@@ -2834,6 +2924,10 @@ fn scope_key(scope: &ApiGatewayScope) -> ApiGatewayStateKey {
         account_id: scope.account_id().clone(),
         region: scope.region().clone(),
     }
+}
+
+fn scope_from_key(key: &ApiGatewayStateKey) -> ApiGatewayScope {
+    ApiGatewayScope::new(key.account_id.clone(), key.region.clone())
 }
 
 pub(crate) fn rest_api<'a>(

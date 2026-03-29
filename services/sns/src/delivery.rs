@@ -4,7 +4,7 @@ use crate::subscriptions::{
     ConfirmationDelivery, ParsedHttpEndpoint, SubscriptionRecordState,
 };
 use crate::topics::TopicKey;
-use aws::Arn;
+use aws::{AdvertisedEdge, Arn};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -96,15 +96,19 @@ pub struct NotificationPayload {
 }
 
 impl NotificationPayload {
-    pub fn http_body(&self, raw_message_delivery: bool) -> Vec<u8> {
+    pub fn http_body(
+        &self,
+        raw_message_delivery: bool,
+        advertised_edge: &AdvertisedEdge,
+    ) -> Vec<u8> {
         if raw_message_delivery {
             return self.message.as_bytes().to_vec();
         }
 
-        self.notification_json().to_string().into_bytes()
+        self.notification_json(advertised_edge).to_string().into_bytes()
     }
 
-    pub fn lambda_event(&self) -> Vec<u8> {
+    pub fn lambda_event(&self, advertised_edge: &AdvertisedEdge) -> Vec<u8> {
         json!({
             "Records": [{
                 "EventSource": "aws:sns",
@@ -120,10 +124,8 @@ impl NotificationPayload {
                     "SignatureVersion": "1",
                     "Signature": "CLOUDISH",
                     "SigningCertUrl": "https://cloudish.invalid/sns.pem",
-                    "UnsubscribeUrl": format!(
-                        "http://localhost:4566/?Action=Unsubscribe&SubscriptionArn={}",
-                        percent_encode(&self.subscription_arn.to_string())
-                    ),
+                    "UnsubscribeUrl": advertised_edge
+                        .sns_unsubscribe_url(&self.subscription_arn),
                     "MessageAttributes": notification_message_attributes(&self.message_attributes),
                 },
             }],
@@ -132,15 +134,19 @@ impl NotificationPayload {
         .into_bytes()
     }
 
-    pub fn sqs_body(&self, raw_message_delivery: bool) -> String {
+    pub fn sqs_body(
+        &self,
+        raw_message_delivery: bool,
+        advertised_edge: &AdvertisedEdge,
+    ) -> String {
         if raw_message_delivery {
             self.message.clone()
         } else {
-            self.notification_json().to_string()
+            self.notification_json(advertised_edge).to_string()
         }
     }
 
-    fn notification_json(&self) -> Value {
+    fn notification_json(&self, advertised_edge: &AdvertisedEdge) -> Value {
         json!({
             "Type": "Notification",
             "MessageId": self.message_id,
@@ -151,10 +157,8 @@ impl NotificationPayload {
             "SignatureVersion": "1",
             "Signature": "CLOUDISH",
             "SigningCertURL": "https://cloudish.invalid/sns.pem",
-            "UnsubscribeURL": format!(
-                "http://localhost:4566/?Action=Unsubscribe&SubscriptionArn={}",
-                percent_encode(&self.subscription_arn.to_string())
-            ),
+            "UnsubscribeURL": advertised_edge
+                .sns_unsubscribe_url(&self.subscription_arn),
             "MessageAttributes": notification_message_attributes(&self.message_attributes),
         })
     }
@@ -176,7 +180,6 @@ pub trait SnsDeliveryTransport {
     fn deliver_confirmation(
         &self,
         delivery: &ConfirmationDelivery,
-        confirmation_base_url: Option<&str>,
         message_id: String,
         timestamp: String,
     );
@@ -191,7 +194,6 @@ impl SnsDeliveryTransport for NoopSnsDeliveryTransport {
     fn deliver_confirmation(
         &self,
         _delivery: &ConfirmationDelivery,
-        _confirmation_base_url: Option<&str>,
         _message_id: String,
         _timestamp: String,
     ) {
@@ -366,9 +368,9 @@ pub(crate) fn formatted_timestamp(time: SystemTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
+#[cfg(test)]
 pub(crate) fn percent_encode(value: &str) -> String {
     let mut encoded = String::new();
-
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric()
             || matches!(byte, b'-' | b'_' | b'.' | b'~')

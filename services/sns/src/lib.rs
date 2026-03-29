@@ -181,7 +181,6 @@ impl SnsService {
     pub fn subscribe(
         &self,
         input: SubscribeInput,
-        confirmation_base_url: Option<&str>,
     ) -> Result<SubscribeOutput, SnsError> {
         let subscription_id = self.identifier_source.next_subscription_id();
         let confirmation_token =
@@ -203,7 +202,7 @@ impl SnsService {
         };
 
         if let Some(delivery) = confirmation_delivery.as_ref() {
-            self.deliver_confirmation(delivery, confirmation_base_url);
+            self.deliver_confirmation(delivery);
         }
 
         Ok(SubscribeOutput {
@@ -429,14 +428,9 @@ impl SnsService {
         state.list_tags_for_resource(topic_arn)
     }
 
-    fn deliver_confirmation(
-        &self,
-        delivery: &ConfirmationDelivery,
-        confirmation_base_url: Option<&str>,
-    ) {
+    fn deliver_confirmation(&self, delivery: &ConfirmationDelivery) {
         self.delivery_transport.deliver_confirmation(
             delivery,
-            confirmation_base_url,
             self.identifier_source.next_message_id(),
             formatted_timestamp((self.time_source)()),
         );
@@ -498,7 +492,6 @@ mod tests {
         fn deliver_confirmation(
             &self,
             delivery: &ConfirmationDelivery,
-            _confirmation_base_url: Option<&str>,
             _message_id: String,
             _timestamp: String,
         ) {
@@ -690,16 +683,13 @@ mod tests {
         let topic_arn = create_topic(&service, "orders");
 
         let subscribed = service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::new(),
-                    endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
-                    protocol: "http".to_owned(),
-                    return_subscription_arn: false,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
+                protocol: "http".to_owned(),
+                return_subscription_arn: false,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("subscription should be created");
         let subscriptions = service
             .list_subscriptions_by_topic(&topic_arn)
@@ -729,16 +719,13 @@ mod tests {
         let (service, transport) = service_with_transport(0);
         let topic_arn = create_topic(&service, "orders");
         let subscribed = service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::new(),
-                    endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
-                    protocol: "http".to_owned(),
-                    return_subscription_arn: true,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
+                protocol: "http".to_owned(),
+                return_subscription_arn: true,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("subscription should be created");
         let token = transport.confirmations()[0].token.clone();
 
@@ -766,18 +753,14 @@ mod tests {
         let service = SnsService::new();
         let topic_arn = create_topic(&service, "orders");
         let subscribed = service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::new(),
-                    endpoint:
-                        "arn:aws:sqs:eu-west-2:000000000000:orders-queue"
-                            .to_owned(),
-                    protocol: "sqs".to_owned(),
-                    return_subscription_arn: false,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: "arn:aws:sqs:eu-west-2:000000000000:orders-queue"
+                    .to_owned(),
+                protocol: "sqs".to_owned(),
+                return_subscription_arn: false,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("sqs subscription should auto confirm");
 
         assert_eq!(subscribed.state, SubscriptionState::Confirmed);
@@ -793,16 +776,13 @@ mod tests {
         let (service, _transport) = service_with_transport(0);
         let topic_arn = create_topic(&service, "orders");
         let _ = service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::new(),
-                    endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
-                    protocol: "http".to_owned(),
-                    return_subscription_arn: true,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
+                protocol: "http".to_owned(),
+                return_subscription_arn: true,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("subscription should be created");
 
         let invalid_token = service
@@ -826,16 +806,13 @@ mod tests {
         let topic_arn = create_topic(&service, "orders");
         let other_topic_arn = create_topic(&service, "other-orders");
         let _ = service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::new(),
-                    endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
-                    protocol: "http".to_owned(),
-                    return_subscription_arn: true,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
+                protocol: "http".to_owned(),
+                return_subscription_arn: true,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("subscription should be created");
         let token = transport.confirmations()[0].token.clone();
 
@@ -890,16 +867,13 @@ mod tests {
             .expect_err("missing topic should fail");
         let topic_arn = create_topic(&service, "orders");
         let unsupported = service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::new(),
-                    endpoint: "user@example.com".to_owned(),
-                    protocol: "email".to_owned(),
-                    return_subscription_arn: false,
-                    topic_arn,
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: "user@example.com".to_owned(),
+                protocol: "email".to_owned(),
+                return_subscription_arn: false,
+                topic_arn,
+            })
             .expect_err("email should be unsupported");
 
         assert_eq!(missing.code(), "NotFound");
@@ -918,19 +892,16 @@ mod tests {
         let topic_arn = create_topic(&service, "orders");
 
         service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::from([(
-                        "FilterPolicy".to_owned(),
-                        r#"{"store":["eu-west"]}"#.to_owned(),
-                    )]),
-                    endpoint: "http://127.0.0.1:9010/confirmed".to_owned(),
-                    protocol: "http".to_owned(),
-                    return_subscription_arn: true,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::from([(
+                    "FilterPolicy".to_owned(),
+                    r#"{"store":["eu-west"]}"#.to_owned(),
+                )]),
+                endpoint: "http://127.0.0.1:9010/confirmed".to_owned(),
+                protocol: "http".to_owned(),
+                return_subscription_arn: true,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("http subscription should be created");
         let confirmation_token = transport.confirmations()[0].token.clone();
         service
@@ -938,56 +909,44 @@ mod tests {
             .expect("http subscription should confirm");
 
         service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::from([
-                        ("RawMessageDelivery".to_owned(), "true".to_owned()),
-                        (
-                            "FilterPolicy".to_owned(),
-                            r#"{"store":["eu-west"]}"#.to_owned(),
-                        ),
-                    ]),
-                    endpoint: queue_arn("orders-queue").to_string(),
-                    protocol: "sqs".to_owned(),
-                    return_subscription_arn: false,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::from([
+                    ("RawMessageDelivery".to_owned(), "true".to_owned()),
+                    (
+                        "FilterPolicy".to_owned(),
+                        r#"{"store":["eu-west"]}"#.to_owned(),
+                    ),
+                ]),
+                endpoint: queue_arn("orders-queue").to_string(),
+                protocol: "sqs".to_owned(),
+                return_subscription_arn: false,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("sqs subscription should be created");
         service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::from([
-                        (
-                            "FilterPolicy".to_owned(),
-                            r#"{"detail":{"kind":[{"prefix":"order-"}]}}"#
-                                .to_owned(),
-                        ),
-                        (
-                            "FilterPolicyScope".to_owned(),
-                            "MessageBody".to_owned(),
-                        ),
-                    ]),
-                    endpoint: lambda_arn("processor").to_string(),
-                    protocol: "lambda".to_owned(),
-                    return_subscription_arn: false,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::from([
+                    (
+                        "FilterPolicy".to_owned(),
+                        r#"{"detail":{"kind":[{"prefix":"order-"}]}}"#
+                            .to_owned(),
+                    ),
+                    ("FilterPolicyScope".to_owned(), "MessageBody".to_owned()),
+                ]),
+                endpoint: lambda_arn("processor").to_string(),
+                protocol: "lambda".to_owned(),
+                return_subscription_arn: false,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("lambda subscription should be created");
         service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::new(),
-                    endpoint: "http://127.0.0.1:9010/pending".to_owned(),
-                    protocol: "http".to_owned(),
-                    return_subscription_arn: true,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: "http://127.0.0.1:9010/pending".to_owned(),
+                protocol: "http".to_owned(),
+                return_subscription_arn: true,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("pending subscription should be created");
 
         service
@@ -1078,6 +1037,7 @@ mod tests {
 
     #[test]
     fn sns_delivery_payload_helpers_encode_http_sqs_and_lambda_messages() {
+        let advertised_edge = aws::AdvertisedEdge::default();
         let payload = NotificationPayload {
             message: r#"{"hello":"world"}"#.to_owned(),
             message_attributes: BTreeMap::from([(
@@ -1101,22 +1061,26 @@ mod tests {
                 .expect("topic ARN should parse"),
         };
 
-        let http_body: serde_json::Value =
-            serde_json::from_slice(&payload.http_body(false))
-                .expect("http body should be JSON");
+        let http_body: serde_json::Value = serde_json::from_slice(
+            &payload.http_body(false, &advertised_edge),
+        )
+        .expect("http body should be JSON");
         assert_eq!(http_body["Type"], "Notification");
         assert_eq!(http_body["Subject"], "Orders");
         assert_eq!(http_body["Message"], r#"{"hello":"world"}"#);
-        assert_eq!(payload.sqs_body(true), r#"{"hello":"world"}"#);
+        assert_eq!(
+            payload.sqs_body(true, &advertised_edge),
+            r#"{"hello":"world"}"#
+        );
 
         let sqs_body: serde_json::Value =
-            serde_json::from_str(&payload.sqs_body(false))
+            serde_json::from_str(&payload.sqs_body(false, &advertised_edge))
                 .expect("sqs body should be JSON");
         assert_eq!(sqs_body["Message"], r#"{"hello":"world"}"#);
         assert_eq!(sqs_body["MessageAttributes"]["store"]["Value"], "eu-west");
 
         let lambda_event: serde_json::Value =
-            serde_json::from_slice(&payload.lambda_event())
+            serde_json::from_slice(&payload.lambda_event(&advertised_edge))
                 .expect("lambda event should be JSON");
         assert_eq!(lambda_event["Records"][0]["EventSource"], "aws:sns");
         assert_eq!(
@@ -1131,22 +1095,19 @@ mod tests {
         let service = SnsService::new();
         let topic_arn = create_topic(&service, "orders");
         let subscribed = service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::from([
-                        ("RawMessageDelivery".to_owned(), "true".to_owned()),
-                        (
-                            "FilterPolicy".to_owned(),
-                            r#"{"store":["eu-west"]}"#.to_owned(),
-                        ),
-                    ]),
-                    endpoint: queue_arn("orders-queue").to_string(),
-                    protocol: "sqs".to_owned(),
-                    return_subscription_arn: true,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::from([
+                    ("RawMessageDelivery".to_owned(), "true".to_owned()),
+                    (
+                        "FilterPolicy".to_owned(),
+                        r#"{"store":["eu-west"]}"#.to_owned(),
+                    ),
+                ]),
+                endpoint: queue_arn("orders-queue").to_string(),
+                protocol: "sqs".to_owned(),
+                return_subscription_arn: true,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("subscription should be created");
 
         let attributes = service
@@ -1192,19 +1153,16 @@ mod tests {
         );
 
         let error = service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::from([(
-                        "FilterPolicy".to_owned(),
-                        r#"{"store":[{"suffix":"west"}]}"#.to_owned(),
-                    )]),
-                    endpoint: queue_arn("other-queue").to_string(),
-                    protocol: "sqs".to_owned(),
-                    return_subscription_arn: false,
-                    topic_arn,
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::from([(
+                    "FilterPolicy".to_owned(),
+                    r#"{"store":[{"suffix":"west"}]}"#.to_owned(),
+                )]),
+                endpoint: queue_arn("other-queue").to_string(),
+                protocol: "sqs".to_owned(),
+                return_subscription_arn: false,
+                topic_arn,
+            })
             .expect_err("unsupported filter operators should fail");
 
         assert_eq!(error.code(), "InvalidParameter");
@@ -1222,16 +1180,13 @@ mod tests {
         let topic_arn = create_topic(&service, "orders");
 
         service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::new(),
-                    endpoint: queue_arn("orders-queue").to_string(),
-                    protocol: "sqs".to_owned(),
-                    return_subscription_arn: false,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: queue_arn("orders-queue").to_string(),
+                protocol: "sqs".to_owned(),
+                return_subscription_arn: false,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("sqs subscription should be created");
 
         let output = service
@@ -1271,18 +1226,14 @@ mod tests {
         let service = SnsService::new();
         let topic_arn = create_topic(&service, "orders");
         let subscribed = service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::new(),
-                    endpoint:
-                        "arn:aws:sqs:eu-west-2:000000000000:orders-queue"
-                            .to_owned(),
-                    protocol: "sqs".to_owned(),
-                    return_subscription_arn: false,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: "arn:aws:sqs:eu-west-2:000000000000:orders-queue"
+                    .to_owned(),
+                protocol: "sqs".to_owned(),
+                return_subscription_arn: false,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("subscription should succeed");
 
         service.delete_topic(&topic_arn).expect("delete should succeed");
@@ -1307,16 +1258,13 @@ mod tests {
         let (service, transport) = service_with_transport(0);
         let topic_arn = create_topic(&service, "orders");
         let _ = service
-            .subscribe(
-                super::SubscribeInput {
-                    attributes: BTreeMap::new(),
-                    endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
-                    protocol: "http".to_owned(),
-                    return_subscription_arn: false,
-                    topic_arn: topic_arn.clone(),
-                },
-                Some("http://localhost:4566/"),
-            )
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
+                protocol: "http".to_owned(),
+                return_subscription_arn: false,
+                topic_arn: topic_arn.clone(),
+            })
             .expect("failing forwarder should not fail subscribe");
         let bad_topic = service
             .create_topic(

@@ -2,7 +2,7 @@ use super::{
     ApiGatewayError, ApiGatewayScope, ApiGatewayService, ExecuteApiError,
     ExecuteApiIntegrationPlan, ExecuteApiInvocation,
     ExecuteApiLambdaProxyPlan, ExecuteApiPreparedResponse, ExecuteApiRequest,
-    HTTP_API_AUTHORIZER_ID_WIDTH, HTTP_API_ID_WIDTH, HTTP_DEPLOYMENT_ID_WIDTH,
+    HTTP_API_AUTHORIZER_ID_WIDTH, HTTP_DEPLOYMENT_ID_WIDTH,
     HTTP_INTEGRATION_ID_WIDTH, HTTP_ROUTE_ID_WIDTH, ROOT_PATH,
     StoredApiGatewayState, next_identifier, optional_empty_to_none, paginate,
     validate_name, validate_stage_name, validate_tags,
@@ -12,7 +12,7 @@ use crate::http_api::{
     normalize_route_key, select_http_stage,
 };
 use aws::{
-    AccountId, CallerIdentity, Endpoint, ExecuteApiSourceArn,
+    AccountId, AdvertisedEdge, CallerIdentity, Endpoint, ExecuteApiSourceArn,
     HttpForwardRequest, LambdaFunctionTarget, RegionId,
 };
 use base64::Engine as _;
@@ -401,12 +401,10 @@ impl StoredHttpApi {
     fn to_api(
         &self,
         _scope: &ApiGatewayScope,
+        advertised_edge: &AdvertisedEdge,
     ) -> Result<HttpApi, ApiGatewayError> {
         Ok(HttpApi {
-            api_endpoint: format!(
-                "https://{}.execute-api.localhost",
-                self.api_id
-            ),
+            api_endpoint: advertised_edge.execute_api_endpoint(&self.api_id),
             api_id: self.api_id.clone(),
             created_date: format_timestamp(self.created_date)?,
             description: self.description.clone(),
@@ -618,8 +616,9 @@ impl ApiGatewayService {
         let ip_address_type =
             normalize_ip_address_type(input.ip_address_type.as_deref())?;
 
+        let _guard = self.lock_state();
         let mut state = self.load_state(scope);
-        let api_id = next_http_api_id(&mut state);
+        let api_id = self.allocate_execute_api_id()?;
         let api = StoredHttpApi {
             api_id: api_id.clone(),
             created_date: self.now_epoch_seconds(),
@@ -639,7 +638,7 @@ impl ApiGatewayService {
             deployments: BTreeMap::new(),
             stages: BTreeMap::new(),
         };
-        let response = api.to_api(scope)?;
+        let response = api.to_api(scope, &self.advertised_edge.current())?;
         state.http_apis.insert(api_id, api);
         self.save_state(scope, state)?;
 
@@ -653,7 +652,8 @@ impl ApiGatewayService {
         api_id: &str,
     ) -> Result<HttpApi, ApiGatewayError> {
         let state = self.load_state(scope);
-        http_api(&state, api_id)?.to_api(scope)
+        http_api(&state, api_id)?
+            .to_api(scope, &self.advertised_edge.current())
     }
 
     #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway HTTP control-plane state cannot be loaded or persisted."]
@@ -667,7 +667,7 @@ impl ApiGatewayService {
         let apis = state
             .http_apis
             .values()
-            .map(|api| api.to_api(scope))
+            .map(|api| api.to_api(scope, &self.advertised_edge.current()))
             .collect::<Result<Vec<_>, _>>()?;
 
         paginate_http_collection(apis, next_token, max_results)
@@ -710,7 +710,7 @@ impl ApiGatewayService {
             api.version = optional_empty_to_none(Some(version));
         }
 
-        let response = api.to_api(scope)?;
+        let response = api.to_api(scope, &self.advertised_edge.current())?;
         self.save_state(scope, state)?;
         Ok(response)
     }
@@ -1544,20 +1544,6 @@ pub fn map_lambda_proxy_response_v2(
     };
 
     Ok(ExecuteApiPreparedResponse::new(status_code, headers, body))
-}
-
-fn next_http_api_id(state: &mut StoredApiGatewayState) -> String {
-    loop {
-        let api_id = next_identifier(
-            &mut state.next_http_api_sequence,
-            HTTP_API_ID_WIDTH,
-        );
-        if !state.rest_apis.contains_key(&api_id)
-            && !state.http_apis.contains_key(&api_id)
-        {
-            return api_id;
-        }
-    }
 }
 
 fn http_api<'a>(

@@ -13,7 +13,7 @@ mod state;
 mod v2;
 
 pub(crate) use state::{
-    HTTP_API_AUTHORIZER_ID_WIDTH, HTTP_API_ID_WIDTH, HTTP_DEPLOYMENT_ID_WIDTH,
+    HTTP_API_AUTHORIZER_ID_WIDTH, HTTP_DEPLOYMENT_ID_WIDTH,
     HTTP_INTEGRATION_ID_WIDTH, HTTP_ROUTE_ID_WIDTH, ROOT_PATH,
     StoredApiGatewayState, StoredApiMethod, StoredApiResource,
     StoredDeployment, StoredDomainName, StoredStage, deployment, domain,
@@ -26,7 +26,8 @@ pub use errors::ApiGatewayError;
 pub use execute_api::{
     ExecuteApiError, ExecuteApiIntegrationExecutor, ExecuteApiIntegrationPlan,
     ExecuteApiInvocation, ExecuteApiLambdaProxyPlan,
-    ExecuteApiPreparedResponse, ExecuteApiRequest, map_lambda_proxy_response,
+    ExecuteApiPreparedResponse, ExecuteApiRequest, ResolvedExecuteApiTarget,
+    map_lambda_proxy_response,
 };
 pub use http_api::{
     CreateHttpApiAuthorizerInput, CreateHttpApiDeploymentInput,

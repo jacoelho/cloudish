@@ -9,7 +9,7 @@ use self::hosting::{
 };
 use aws::{
     Arn, ArnResource, BlobKey, BlobStore, CallerIdentity, Clock,
-    LambdaFunctionTarget, RandomSource, ServiceName,
+    LambdaFunctionTarget, RandomSource, RegionId, ServiceName,
 };
 use iam::{IamScope, IamService};
 use s3::{S3Scope, S3Service};
@@ -87,12 +87,12 @@ use crate::{
         FunctionUrlInvocationOutput, LambdaFunctionUrlAuthType,
         LambdaFunctionUrlConfig, LambdaFunctionUrlInvokeMode,
         LambdaFunctionUrlQualifierStore, ListFunctionUrlConfigsOutput,
-        UpdateFunctionUrlConfigInput, build_function_url_event,
-        function_url_config_key, function_url_config_qualifier,
-        function_url_exists_error, function_url_not_found_error,
-        lambda_function_url_config, list_function_url_configs_output,
-        map_function_url_response, validate_function_url_invoke_mode,
-        validate_function_url_qualifier,
+        ResolvedFunctionUrlTarget, UpdateFunctionUrlConfigInput,
+        build_function_url_event, function_url_config_key,
+        function_url_config_qualifier, function_url_exists_error,
+        function_url_not_found_error, lambda_function_url_config,
+        list_function_url_configs_output, map_function_url_response,
+        validate_function_url_invoke_mode, validate_function_url_qualifier,
     },
     versions::{
         LambdaAliasVersionRecord, LambdaVersionStore,
@@ -781,7 +781,7 @@ impl LambdaService {
                 auth_type: input.auth_type,
                 invoke_mode: input.invoke_mode,
                 last_modified_epoch_seconds: self.now_epoch_seconds()?,
-                url_id: self.next_url_id()?,
+                url_id: self.next_unique_url_id(scope.region())?,
             };
             let output = self.function_url_config(
                 scope,
@@ -1553,6 +1553,103 @@ impl LambdaService {
 
     /// # Errors
     ///
+    /// Returns an error when the function URL cannot be resolved uniquely in
+    /// the requested region.
+    pub fn resolve_function_url(
+        &self,
+        region: &RegionId,
+        url_id: &str,
+    ) -> Result<ResolvedFunctionUrlTarget, LambdaError> {
+        let mut matches =
+            self.matching_function_url_targets(region, url_id).into_iter();
+        let Some(target) = matches.next() else {
+            return Err(LambdaError::ResourceNotFound {
+                message: format!("Function URL not found: {url_id}"),
+            });
+        };
+        if matches.next().is_some() {
+            return Err(internal_error(format!(
+                "multiple function URLs matched region {} and id {}",
+                region.as_str(),
+                url_id,
+            )));
+        }
+
+        Ok(target)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the resolved function URL target is missing,
+    /// permissions reject the caller, or Lambda execution fails.
+    pub fn invoke_resolved_function_url(
+        &self,
+        target: &ResolvedFunctionUrlTarget,
+        input: FunctionUrlInvocationInput,
+        caller_identity: Option<&CallerIdentity>,
+    ) -> Result<FunctionUrlInvocationOutput, LambdaError> {
+        let key =
+            LambdaFunctionKey::new(target.scope(), target.function_name());
+        let state = self.function_store.get(target.scope(), &key).ok_or_else(
+            || {
+                function_not_found_error(
+                    target.scope(),
+                    target.function_name(),
+                    target.qualifier(),
+                )
+            },
+        )?;
+        let config_key = function_url_config_key(target.qualifier());
+        let config =
+            state.function_url_configs.get(config_key).ok_or_else(|| {
+                function_url_not_found_error(
+                    function_arn_with_optional_qualifier(
+                        target.scope(),
+                        target.function_name(),
+                        target.qualifier(),
+                    ),
+                )
+            })?;
+        if config.url_id != target.url_id() {
+            return Err(internal_error(format!(
+                "resolved function URL target {} no longer matches stored URL {}",
+                target.url_id(),
+                config.url_id,
+            )));
+        }
+        if config.auth_type == LambdaFunctionUrlAuthType::AwsIam
+            && caller_identity.is_none()
+        {
+            return Err(function_url_access_denied_error());
+        }
+        if !permission_allows_function_url_invoke(
+            state.permissions.get(&permission_key(target.qualifier())),
+            caller_identity,
+            config.auth_type,
+        ) {
+            return Err(function_url_access_denied_error());
+        }
+
+        let payload = build_function_url_event(
+            target.scope(),
+            &config.url_id,
+            &input,
+            caller_identity,
+            self.now_epoch_millis()?,
+            self.next_revision_id()?,
+        )?;
+        let output = self.execute_request_response(
+            target.scope(),
+            target.function_name(),
+            target.qualifier(),
+            payload,
+        )?;
+
+        map_function_url_response(output.payload())
+    }
+
+    /// # Errors
+    ///
     /// Returns an error when the function URL cannot be resolved, URL
     /// permissions reject the caller, or Lambda execution fails.
     pub fn invoke_function_url(
@@ -1584,36 +1681,15 @@ impl LambdaService {
                     "located function URL parent state without config `{url_id}`"
                 ))
             })?;
-        if config.auth_type == LambdaFunctionUrlAuthType::AwsIam
-            && caller_identity.is_none()
-        {
-            return Err(function_url_access_denied_error());
-        }
-        let qualifier = function_url_config_qualifier(qualifier_key);
-        if !permission_allows_function_url_invoke(
-            state.permissions.get(&permission_key(qualifier)),
-            caller_identity,
+        let target = ResolvedFunctionUrlTarget::new(
+            scope.clone(),
+            state.function_name.clone(),
+            function_url_config_qualifier(qualifier_key).map(str::to_owned),
             config.auth_type,
-        ) {
-            return Err(function_url_access_denied_error());
-        }
+            config.url_id.clone(),
+        );
 
-        let payload = build_function_url_event(
-            scope,
-            &config.url_id,
-            &input,
-            caller_identity,
-            self.now_epoch_millis()?,
-            self.next_revision_id()?,
-        )?;
-        let output = self.execute_request_response(
-            scope,
-            &state.function_name,
-            qualifier,
-            payload,
-        )?;
-
-        map_function_url_response(output.payload())
+        self.invoke_resolved_function_url(&target, input, caller_identity)
     }
 
     /// # Errors
@@ -2000,6 +2076,63 @@ impl LambdaService {
             .filter(|character| *character != '-')
             .take(10)
             .collect())
+    }
+
+    fn next_unique_url_id(
+        &self,
+        region: &RegionId,
+    ) -> Result<String, LambdaError> {
+        for _ in 0..128 {
+            let url_id = self.next_url_id()?;
+            if !self.function_url_exists_in_region(region, &url_id) {
+                return Ok(url_id);
+            }
+        }
+
+        Err(internal_error(format!(
+            "failed to allocate a unique function URL id in region {}",
+            region.as_str(),
+        )))
+    }
+
+    fn function_url_exists_in_region(
+        &self,
+        region: &RegionId,
+        url_id: &str,
+    ) -> bool {
+        !self.matching_function_url_targets(region, url_id).is_empty()
+    }
+
+    fn matching_function_url_targets(
+        &self,
+        region: &RegionId,
+        url_id: &str,
+    ) -> Vec<ResolvedFunctionUrlTarget> {
+        self.function_store
+            .scan_all(|_| true)
+            .into_iter()
+            .filter(|(scope, _)| scope.region() == region)
+            .flat_map(|(scope, state)| {
+                state
+                    .function_url_configs
+                    .iter()
+                    .filter(|(_, config)| config.url_id == url_id)
+                    .map(move |(qualifier_key, config)| {
+                        ResolvedFunctionUrlTarget::new(
+                            LambdaScope::new(
+                                scope.account_id().clone(),
+                                scope.region().clone(),
+                            ),
+                            state.function_name.clone(),
+                            function_url_config_qualifier(qualifier_key)
+                                .map(str::to_owned),
+                            config.auth_type,
+                            config.url_id.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     fn function_url_config(
@@ -4086,6 +4219,7 @@ mod tests {
                 url_config.url_id(),
                 FunctionUrlInvocationInput {
                     body: br#"{"hello":"world"}"#.to_vec(),
+                    domain_name: "localhost:4566".to_owned(),
                     headers: vec![(
                         "user-agent".to_owned(),
                         "cloudish-tests".to_owned(),
@@ -4124,6 +4258,7 @@ mod tests {
                 url_config.url_id(),
                 FunctionUrlInvocationInput {
                     body: br#"{"hello":"world"}"#.to_vec(),
+                    domain_name: "localhost:4566".to_owned(),
                     headers: vec![(
                         "cookie".to_owned(),
                         "theme=light".to_owned(),
@@ -4158,6 +4293,7 @@ mod tests {
                 url_config.url_id(),
                 FunctionUrlInvocationInput {
                     body: br#"{"hello":"world"}"#.to_vec(),
+                    domain_name: "localhost:4566".to_owned(),
                     headers: Vec::new(),
                     method: "POST".to_owned(),
                     path: "/custom/path".to_owned(),
@@ -4200,6 +4336,7 @@ mod tests {
                 url_config.url_id(),
                 FunctionUrlInvocationInput {
                     body: br#"{"hello":"world"}"#.to_vec(),
+                    domain_name: "localhost:4566".to_owned(),
                     headers: vec![(
                         "user-agent".to_owned(),
                         "cloudish-tests".to_owned(),
@@ -4237,6 +4374,97 @@ mod tests {
             lambda.get_function_url_config(&scope(), "demo", Some("live")),
             Err(LambdaError::ResourceNotFound { .. })
         ));
+    }
+
+    #[test]
+    fn lambda_url_resolution_uses_the_owning_scope() {
+        let executor = Arc::new(RecordingExecutor::default());
+        executor.set_next_result(LambdaInvocationResult::new(
+            br#"{"statusCode":200,"headers":{"content-type":"text/plain"},"body":"ok"}"#
+                .to_vec(),
+            Option::<String>::None,
+        ));
+        let lambda =
+            service(executor.clone(), Arc::new(MemoryBlobStore::default()));
+        let alternate_scope = alternate_scope();
+
+        lambda
+            .create_function(
+                &alternate_scope,
+                CreateFunctionInput {
+                    code: inline_zip(),
+                    dead_letter_target_arn: None,
+                    description: None,
+                    environment: BTreeMap::new(),
+                    function_name: "alternate-demo".to_owned(),
+                    handler: Some("bootstrap.handler".to_owned()),
+                    memory_size: None,
+                    package_type: LambdaPackageType::Zip,
+                    publish: false,
+                    role: role_arn_for(&alternate_scope),
+                    runtime: Some("provided.al2".to_owned()),
+                    timeout: None,
+                },
+            )
+            .unwrap();
+        let url_config = lambda
+            .create_function_url_config(
+                &alternate_scope,
+                "alternate-demo",
+                None,
+                CreateFunctionUrlConfigInput {
+                    auth_type: LambdaFunctionUrlAuthType::None,
+                    invoke_mode: LambdaFunctionUrlInvokeMode::Buffered,
+                },
+            )
+            .unwrap();
+        lambda
+            .add_permission(
+                &alternate_scope,
+                "alternate-demo",
+                None,
+                AddPermissionInput {
+                    action: "lambda:InvokeFunctionUrl".to_owned(),
+                    function_url_auth_type: Some(
+                        LambdaFunctionUrlAuthType::None,
+                    ),
+                    principal: "*".to_owned(),
+                    revision_id: None,
+                    source_arn: None,
+                    statement_id: "allow-public".to_owned(),
+                },
+            )
+            .unwrap();
+
+        let target = lambda
+            .resolve_function_url(
+                alternate_scope.region(),
+                url_config.url_id(),
+            )
+            .unwrap();
+        assert_eq!(target.scope(), &alternate_scope);
+        assert_eq!(target.function_name(), "alternate-demo");
+        assert_eq!(target.qualifier(), None);
+
+        let response = lambda
+            .invoke_resolved_function_url(
+                &target,
+                FunctionUrlInvocationInput {
+                    body: br#"{"hello":"world"}"#.to_vec(),
+                    domain_name: "localhost:4566".to_owned(),
+                    headers: Vec::new(),
+                    method: "POST".to_owned(),
+                    path: "/custom/path".to_owned(),
+                    protocol: None,
+                    query_string: Some("mode=test".to_owned()),
+                    source_ip: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.body(), b"ok");
     }
 
     #[test]

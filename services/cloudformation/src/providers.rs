@@ -1027,6 +1027,7 @@ impl CloudFormationSecretsManagerPort for SecretsManagerService {
 /// supported resource-provider operations.
 #[derive(Clone, Default)]
 pub struct CloudFormationDependencies {
+    pub advertised_edge: aws::SharedAdvertisedEdge,
     pub dynamodb: Option<Arc<dyn CloudFormationDynamoDbPort>>,
     pub iam: Option<Arc<dyn CloudFormationIamPort>>,
     pub kms: Option<Arc<dyn CloudFormationKmsPort>>,

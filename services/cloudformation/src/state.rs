@@ -3601,8 +3601,11 @@ impl CloudFormationProviderEngine {
     ) -> Result<StoredStackResource, CloudFormationError> {
         let queue_name = optional_string_field(properties, "QueueName")?
             .unwrap_or_else(|| generated_queue_name(stack_name, logical_id));
-        let queue_url =
-            queue_ref(scope.account_id(), scope.region(), &queue_name);
+        let queue_url = queue_ref(
+            &self.dependencies.advertised_edge.current(),
+            scope.account_id(),
+            &queue_name,
+        );
         let sqs = require_dependency(&self.dependencies.sqs, "SQS")?;
         let scope =
             SqsScope::new(scope.account_id().clone(), scope.region().clone());
@@ -3642,8 +3645,11 @@ impl CloudFormationProviderEngine {
             )
             .map_err(map_sqs_error)?
         };
-        let queue_url =
-            queue_ref(scope.account_id(), scope.region(), queue.queue_name());
+        let queue_url = queue_ref(
+            &self.dependencies.advertised_edge.current(),
+            scope.account_id(),
+            queue.queue_name(),
+        );
         let queue_arn = format!(
             "arn:aws:sqs:{}:{}:{}",
             scope.region(),
@@ -5283,11 +5289,11 @@ fn generated_secret_name(stack_name: &str, logical_id: &str) -> String {
 }
 
 fn queue_ref(
+    advertised_edge: &aws::AdvertisedEdge,
     account_id: &AccountId,
-    region: &RegionId,
     queue_name: &str,
 ) -> String {
-    format!("https://sqs.{region}.amazonaws.com/{account_id}/{queue_name}")
+    advertised_edge.sqs_queue_url(account_id, queue_name)
 }
 
 fn queue_identity_from_ref(

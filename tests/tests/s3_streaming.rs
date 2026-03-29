@@ -19,6 +19,7 @@ use std::io::{ErrorKind, Read};
 use std::net::TcpStream;
 use tests::common::runtime;
 use tests::common::sdk;
+use time::OffsetDateTime;
 
 type HmacSha256 = Hmac<Sha256>;
 type SharedRuntimeLease = runtime::SharedRuntimeLease<'static>;
@@ -57,7 +58,7 @@ async fn given_a_signed_aws_chunked_put_object_when_sent_over_raw_http_then_the_
         "/sdk-s3-streaming/streamed.txt",
         "localhost",
         "us-east-1",
-        "20260325T120000Z",
+        &sigv4_timestamp_now(),
         payload,
     );
     let response = send_raw_request(runtime.address(), &request)
@@ -155,6 +156,19 @@ fn aws_chunked_put_object_request(
     .into_bytes();
     request.extend_from_slice(&body);
     request
+}
+
+fn sigv4_timestamp_now() -> String {
+    let now = OffsetDateTime::now_utc();
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+    )
 }
 
 fn aws_chunked_body(

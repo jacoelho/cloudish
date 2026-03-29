@@ -1,6 +1,6 @@
 use crate::runtime::EdgeRouter;
 use auth::Authenticator;
-use aws::{RuntimeDefaults, ServiceName};
+use aws::{RuntimeDefaults, ServiceName, SharedAdvertisedEdge};
 #[cfg(test)]
 pub(crate) use edge_runtime::FixedClock;
 #[cfg(any(feature = "apigateway", feature = "sns"))]
@@ -75,8 +75,13 @@ fn build_router_with_runtime(
     let authenticator = Authenticator::new(defaults.clone());
     let assembly = builder.build().expect("test runtime should build");
     let (services, runtime, _) = assembly.into_parts();
-    let router =
-        EdgeRouter::new(defaults, authenticator, services, runtime.clone());
+    let router = EdgeRouter::new(
+        defaults,
+        SharedAdvertisedEdge::default(),
+        authenticator,
+        services,
+        runtime.clone(),
+    );
 
     (router, runtime)
 }

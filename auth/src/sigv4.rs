@@ -20,6 +20,19 @@ use time::{Date, Month, PrimitiveDateTime, Time};
 
 pub const BOOTSTRAP_ACCESS_KEY_ID: &str = "test";
 pub const BOOTSTRAP_SECRET_ACCESS_KEY: &str = "test";
+const HEADER_SIGNATURE_MAX_SKEW_SECONDS: u64 = 300;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestTimestampPolicy {
+    HeaderSigned,
+    Presigned { expires_seconds: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedRequestTimestamp<'a> {
+    raw: &'a str,
+    epoch_seconds: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestHeader<'a> {
@@ -255,15 +268,18 @@ impl Authenticator {
         else {
             return Ok(None);
         };
-
-        let request_epoch =
-            parse_amz_date_epoch_seconds(&authorization.amz_date)?;
-        let now_epoch = epoch_seconds((self.time_source)())?;
-        if now_epoch
-            > request_epoch.saturating_add(authorization.expires_seconds)
-        {
-            return Err(access_denied_error("Request has expired."));
-        }
+        let request_timestamp = parse_request_timestamp(
+            &authorization.amz_date,
+            &authorization.credential.date,
+            "X-Amz-Date",
+        )?;
+        validate_request_timestamp(
+            epoch_seconds((self.time_source)())?,
+            request_timestamp,
+            RequestTimestampPolicy::Presigned {
+                expires_seconds: authorization.expires_seconds,
+            },
+        )?;
 
         let material = self.resolve_credential_material(
             access_keys,
@@ -320,12 +336,13 @@ impl Authenticator {
         }
 
         let authorization = AuthorizationFields::parse(authorization_header)?;
-        let amz_date = request.header("x-amz-date").ok_or_else(|| {
-            incomplete_signature_error(
-                "Signed requests must include an X-Amz-Date header.",
-            )
-        })?;
-        validate_amz_date(amz_date, &authorization.credential.date)?;
+        let request_timestamp =
+            signed_request_timestamp(request, &authorization.credential.date)?;
+        validate_request_timestamp(
+            epoch_seconds((self.time_source)())?,
+            request_timestamp,
+            RequestTimestampPolicy::HeaderSigned,
+        )?;
 
         let material = self.resolve_credential_material(
             access_keys,
@@ -345,7 +362,7 @@ impl Authenticator {
             &authorization.credential.date,
             authorization.credential.scope.region().as_str(),
             &authorization.credential.signing_service,
-            amz_date,
+            request_timestamp.raw,
             &canonical_request,
         );
 
@@ -358,7 +375,7 @@ impl Authenticator {
         let payload = payload.verified_payload(
             &material.secret_access_key,
             &authorization.credential,
-            amz_date,
+            request_timestamp.raw,
             &authorization.signature,
         );
 
@@ -560,7 +577,11 @@ impl PresignedAuthorization {
             &required_decoded_query_parameter(query, "X-Amz-Credential")?,
         )?;
         let amz_date = required_decoded_query_parameter(query, "X-Amz-Date")?;
-        validate_amz_date(&amz_date, &credential.date)?;
+        validate_request_timestamp_format(
+            &amz_date,
+            &credential.date,
+            "X-Amz-Date",
+        )?;
         let expires_seconds =
             required_decoded_query_parameter(query, "X-Amz-Expires")?
                 .parse::<u64>()
@@ -1104,11 +1125,44 @@ pub(crate) fn validate_hex_signature(value: &str) -> Result<(), AwsError> {
     Ok(())
 }
 
-fn validate_amz_date(
-    amz_date: &str,
+fn signed_request_timestamp<'a>(
+    request: &'a RequestAuth<'a>,
     scope_date: &str,
+) -> Result<ParsedRequestTimestamp<'a>, AwsError> {
+    if let Some(timestamp) = request.header("x-amz-date") {
+        return parse_request_timestamp(timestamp, scope_date, "X-Amz-Date");
+    }
+    if let Some(timestamp) = request.header("date") {
+        return parse_request_timestamp(timestamp, scope_date, "Date");
+    }
+
+    Err(incomplete_signature_error(
+        "Signed requests must include an X-Amz-Date or Date header.",
+    ))
+}
+
+fn parse_request_timestamp<'a>(
+    timestamp: &'a str,
+    scope_date: &str,
+    timestamp_name: &str,
+) -> Result<ParsedRequestTimestamp<'a>, AwsError> {
+    validate_request_timestamp_format(timestamp, scope_date, timestamp_name)?;
+
+    Ok(ParsedRequestTimestamp {
+        raw: timestamp,
+        epoch_seconds: parse_amz_date_epoch_seconds(
+            timestamp,
+            timestamp_name,
+        )?,
+    })
+}
+
+fn validate_request_timestamp_format(
+    timestamp: &str,
+    scope_date: &str,
+    timestamp_name: &str,
 ) -> Result<(), AwsError> {
-    let bytes = amz_date.as_bytes();
+    let bytes = timestamp.as_bytes();
     let valid = matches!(
         bytes,
         [
@@ -1135,54 +1189,101 @@ fn validate_amz_date(
         .all(u8::is_ascii_digit)
     );
     if !valid {
-        return Err(incomplete_signature_error(
-            "X-Amz-Date must use the SigV4 timestamp format YYYYMMDD'T'HHMMSS'Z'.",
-        ));
+        return Err(incomplete_signature_error(format!(
+            "{timestamp_name} must use the SigV4 timestamp format YYYYMMDD'T'HHMMSS'Z'.",
+        )));
     }
-    if amz_date.get(..8) != Some(scope_date) {
-        return Err(incomplete_signature_error(
-            "Authorization Credential scope date must match the X-Amz-Date header date.",
-        ));
+    if timestamp.get(..8) != Some(scope_date) {
+        return Err(incomplete_signature_error(format!(
+            "Authorization Credential scope date must match the {timestamp_name} header date.",
+        )));
     }
 
     Ok(())
 }
 
-fn parse_amz_date_epoch_seconds(amz_date: &str) -> Result<u64, AwsError> {
-    let year = amz_date[0..4].parse::<i32>().map_err(|_| {
-        incomplete_signature_error("X-Amz-Date must be valid.")
+fn validate_request_timestamp(
+    now_epoch_seconds: u64,
+    request_timestamp: ParsedRequestTimestamp<'_>,
+    policy: RequestTimestampPolicy,
+) -> Result<(), AwsError> {
+    if request_timestamp.epoch_seconds
+        > now_epoch_seconds.saturating_add(HEADER_SIGNATURE_MAX_SKEW_SECONDS)
+    {
+        return Err(access_denied_error(
+            "Request timestamp is too far in the future.",
+        ));
+    }
+
+    match policy {
+        RequestTimestampPolicy::HeaderSigned => {
+            if now_epoch_seconds
+                > request_timestamp
+                    .epoch_seconds
+                    .saturating_add(HEADER_SIGNATURE_MAX_SKEW_SECONDS)
+            {
+                return Err(access_denied_error(
+                    "Request timestamp is too old.",
+                ));
+            }
+        }
+        RequestTimestampPolicy::Presigned { expires_seconds } => {
+            if now_epoch_seconds
+                > request_timestamp
+                    .epoch_seconds
+                    .saturating_add(expires_seconds)
+            {
+                return Err(access_denied_error("Request has expired."));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_amz_date_epoch_seconds(
+    timestamp: &str,
+    timestamp_name: &str,
+) -> Result<u64, AwsError> {
+    let year = timestamp[0..4].parse::<i32>().map_err(|_| {
+        incomplete_signature_error(format!("{timestamp_name} must be valid."))
     })?;
-    let month = amz_date[4..6].parse::<u8>().map_err(|_| {
-        incomplete_signature_error("X-Amz-Date must be valid.")
+    let month = timestamp[4..6].parse::<u8>().map_err(|_| {
+        incomplete_signature_error(format!("{timestamp_name} must be valid."))
     })?;
-    let day = amz_date[6..8].parse::<u8>().map_err(|_| {
-        incomplete_signature_error("X-Amz-Date must be valid.")
+    let day = timestamp[6..8].parse::<u8>().map_err(|_| {
+        incomplete_signature_error(format!("{timestamp_name} must be valid."))
     })?;
-    let hour = amz_date[9..11].parse::<u8>().map_err(|_| {
-        incomplete_signature_error("X-Amz-Date must be valid.")
+    let hour = timestamp[9..11].parse::<u8>().map_err(|_| {
+        incomplete_signature_error(format!("{timestamp_name} must be valid."))
     })?;
-    let minute = amz_date[11..13].parse::<u8>().map_err(|_| {
-        incomplete_signature_error("X-Amz-Date must be valid.")
+    let minute = timestamp[11..13].parse::<u8>().map_err(|_| {
+        incomplete_signature_error(format!("{timestamp_name} must be valid."))
     })?;
-    let second = amz_date[13..15].parse::<u8>().map_err(|_| {
-        incomplete_signature_error("X-Amz-Date must be valid.")
+    let second = timestamp[13..15].parse::<u8>().map_err(|_| {
+        incomplete_signature_error(format!("{timestamp_name} must be valid."))
     })?;
     let date = Date::from_calendar_date(
         year,
         Month::try_from(month).map_err(|_| {
-            incomplete_signature_error("X-Amz-Date must be valid.")
+            incomplete_signature_error(format!(
+                "{timestamp_name} must be valid."
+            ))
         })?,
         day,
     )
-    .map_err(|_| incomplete_signature_error("X-Amz-Date must be valid."))?;
+    .map_err(|_| {
+        incomplete_signature_error(format!("{timestamp_name} must be valid."))
+    })?;
     let time = Time::from_hms(hour, minute, second).map_err(|_| {
-        incomplete_signature_error("X-Amz-Date must be valid.")
+        incomplete_signature_error(format!("{timestamp_name} must be valid."))
     })?;
     let timestamp =
         PrimitiveDateTime::new(date, time).assume_utc().unix_timestamp();
 
-    u64::try_from(timestamp)
-        .map_err(|_| incomplete_signature_error("X-Amz-Date must be valid."))
+    u64::try_from(timestamp).map_err(|_| {
+        incomplete_signature_error(format!("{timestamp_name} must be valid."))
+    })
 }
 
 fn epoch_seconds(time: SystemTime) -> Result<u64, AwsError> {
@@ -1353,11 +1454,16 @@ mod tests {
         )
     }
 
+    const REQUEST_TIME_EPOCH_SECONDS: u64 = 1_774_440_000;
+    const REQUEST_TIME_PLUS_150_SECONDS: u64 =
+        REQUEST_TIME_EPOCH_SECONDS + 150;
+    const REQUEST_TIME_PLUS_ONE_HOUR: u64 = REQUEST_TIME_EPOCH_SECONDS + 3_600;
+
     fn authorization_header(
         access_key_id: &str,
         secret_access_key: &str,
         date: &str,
-        amz_date: &str,
+        request_timestamp: &str,
         service: &str,
         headers: &[&str],
         body: &[u8],
@@ -1374,7 +1480,10 @@ mod tests {
                         "application/x-www-form-urlencoded",
                     ),
                     "host" => RequestHeader::new("Host", "localhost"),
-                    "x-amz-date" => RequestHeader::new("X-Amz-Date", amz_date),
+                    "date" => RequestHeader::new("Date", request_timestamp),
+                    "x-amz-date" => {
+                        RequestHeader::new("X-Amz-Date", request_timestamp)
+                    }
                     "x-amz-security-token" => {
                         RequestHeader::new("X-Amz-Security-Token", "token-1")
                     }
@@ -1400,7 +1509,7 @@ mod tests {
             date,
             "eu-west-2",
             service,
-            amz_date,
+            request_timestamp,
             &canonical,
         );
 
@@ -1410,10 +1519,17 @@ mod tests {
     }
 
     fn s3_presigned_get_path(path: &str, expires_seconds: u64) -> String {
+        s3_presigned_get_path_at(path, expires_seconds, "20260325T120000Z")
+    }
+
+    fn s3_presigned_get_path_at(
+        path: &str,
+        expires_seconds: u64,
+        amz_date: &str,
+    ) -> String {
         let method = "GET";
         let access_key_id = BOOTSTRAP_ACCESS_KEY_ID;
         let secret_access_key = BOOTSTRAP_SECRET_ACCESS_KEY;
-        let amz_date = "20260325T120000Z";
         let service = "s3";
         let signed_headers = ["host"];
         let signed_headers = signed_headers.join(";");
@@ -1533,7 +1649,7 @@ mod tests {
             body,
         );
 
-        let verified = authenticator(1_742_905_600)
+        let verified = authenticator(REQUEST_TIME_EPOCH_SECONDS)
             .verify(
                 &request,
                 &AccessKeyLookup::default(),
@@ -1592,7 +1708,7 @@ mod tests {
                         .expect("role ARN should parse"),
                     role_session_name: "session".to_owned(),
                 },
-                expires_at_epoch_seconds: 1_742_909_200,
+                expires_at_epoch_seconds: REQUEST_TIME_PLUS_ONE_HOUR,
                 principal_arn:
                     "arn:aws:sts::123456789012:assumed-role/demo/session"
                         .parse::<Arn>()
@@ -1608,7 +1724,7 @@ mod tests {
             }),
         };
 
-        let verified = authenticator(1_742_905_600)
+        let verified = authenticator(REQUEST_TIME_EPOCH_SECONDS)
             .verify(&request, &AccessKeyLookup::default(), &session_lookup)
             .expect("signature should verify")
             .expect("signed request should authenticate");
@@ -1682,7 +1798,7 @@ mod tests {
                         Some("alice".to_owned()),
                     ),
                 },
-                expires_at_epoch_seconds: 1_742_905_599,
+                expires_at_epoch_seconds: REQUEST_TIME_EPOCH_SECONDS - 1,
                 principal_arn:
                     "arn:aws:sts::123456789012:assumed-role/demo/session"
                         .parse::<Arn>()
@@ -1695,7 +1811,7 @@ mod tests {
             }),
         };
 
-        let error = authenticator(1_742_905_600)
+        let error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
             .verify(&request, &AccessKeyLookup::default(), &session_lookup)
             .expect_err("expired session token should fail");
 
@@ -1723,7 +1839,7 @@ mod tests {
             b"Action=GetCallerIdentity&Version=2011-06-15",
         );
 
-        let error = authenticator(1_742_905_600)
+        let error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
             .verify(
                 &request,
                 &AccessKeyLookup::default(),
@@ -1748,7 +1864,7 @@ mod tests {
             b"",
         );
 
-        let error = authenticator(1_742_905_600)
+        let error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
             .verify(
                 &request,
                 &AccessKeyLookup::default(),
@@ -1775,7 +1891,7 @@ mod tests {
             b"",
         );
 
-        let error = authenticator(1_742_905_600)
+        let error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
             .verify(
                 &request,
                 &AccessKeyLookup::default(),
@@ -1785,6 +1901,167 @@ mod tests {
 
         assert_eq!(error.code(), "IncompleteSignature");
         assert!(error.message().contains("Credential scope date must match"));
+    }
+
+    #[test]
+    fn auth_accepts_header_signed_requests_within_five_minutes() {
+        let amz_date = "20260325T120000Z";
+        let body = b"Action=GetCallerIdentity&Version=2011-06-15";
+        let authorization = authorization_header(
+            BOOTSTRAP_ACCESS_KEY_ID,
+            BOOTSTRAP_SECRET_ACCESS_KEY,
+            "20260325",
+            amz_date,
+            "sts",
+            &["content-type", "host", "x-amz-date"],
+            body,
+        );
+        let request = RequestAuth::new(
+            "POST",
+            "/",
+            vec![
+                RequestHeader::new("Host", "localhost"),
+                RequestHeader::new(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded",
+                ),
+                RequestHeader::new("X-Amz-Date", amz_date),
+                RequestHeader::new("Authorization", &authorization),
+            ],
+            body,
+        );
+
+        let verified = authenticator(REQUEST_TIME_PLUS_150_SECONDS)
+            .verify(
+                &request,
+                &AccessKeyLookup::default(),
+                &SessionLookup::default(),
+            )
+            .expect("request inside skew window should verify");
+
+        assert!(verified.is_some());
+    }
+
+    #[test]
+    fn auth_rejects_stale_header_signed_requests() {
+        let amz_date = "20260325T115400Z";
+        let body = b"Action=GetCallerIdentity&Version=2011-06-15";
+        let authorization = authorization_header(
+            BOOTSTRAP_ACCESS_KEY_ID,
+            BOOTSTRAP_SECRET_ACCESS_KEY,
+            "20260325",
+            amz_date,
+            "sts",
+            &["content-type", "host", "x-amz-date"],
+            body,
+        );
+        let request = RequestAuth::new(
+            "POST",
+            "/",
+            vec![
+                RequestHeader::new("Host", "localhost"),
+                RequestHeader::new(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded",
+                ),
+                RequestHeader::new("X-Amz-Date", amz_date),
+                RequestHeader::new("Authorization", &authorization),
+            ],
+            body,
+        );
+
+        let error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
+            .verify(
+                &request,
+                &AccessKeyLookup::default(),
+                &SessionLookup::default(),
+            )
+            .expect_err("stale request should fail");
+
+        assert_eq!(error.code(), "AccessDenied");
+        assert_eq!(error.message(), "Request timestamp is too old.");
+    }
+
+    #[test]
+    fn auth_rejects_future_dated_header_signed_requests() {
+        let amz_date = "20260325T120600Z";
+        let body = b"Action=GetCallerIdentity&Version=2011-06-15";
+        let authorization = authorization_header(
+            BOOTSTRAP_ACCESS_KEY_ID,
+            BOOTSTRAP_SECRET_ACCESS_KEY,
+            "20260325",
+            amz_date,
+            "sts",
+            &["content-type", "host", "x-amz-date"],
+            body,
+        );
+        let request = RequestAuth::new(
+            "POST",
+            "/",
+            vec![
+                RequestHeader::new("Host", "localhost"),
+                RequestHeader::new(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded",
+                ),
+                RequestHeader::new("X-Amz-Date", amz_date),
+                RequestHeader::new("Authorization", &authorization),
+            ],
+            body,
+        );
+
+        let error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
+            .verify(
+                &request,
+                &AccessKeyLookup::default(),
+                &SessionLookup::default(),
+            )
+            .expect_err("future-dated request should fail");
+
+        assert_eq!(error.code(), "AccessDenied");
+        assert_eq!(
+            error.message(),
+            "Request timestamp is too far in the future."
+        );
+    }
+
+    #[test]
+    fn auth_accepts_date_header_fallback_for_signed_requests() {
+        let timestamp = "20260325T120000Z";
+        let body = b"Action=GetCallerIdentity&Version=2011-06-15";
+        let authorization = authorization_header(
+            BOOTSTRAP_ACCESS_KEY_ID,
+            BOOTSTRAP_SECRET_ACCESS_KEY,
+            "20260325",
+            timestamp,
+            "sts",
+            &["content-type", "date", "host"],
+            body,
+        );
+        let request = RequestAuth::new(
+            "POST",
+            "/",
+            vec![
+                RequestHeader::new("Host", "localhost"),
+                RequestHeader::new(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded",
+                ),
+                RequestHeader::new("Date", timestamp),
+                RequestHeader::new("Authorization", &authorization),
+            ],
+            body,
+        );
+
+        let verified = authenticator(REQUEST_TIME_PLUS_150_SECONDS)
+            .verify(
+                &request,
+                &AccessKeyLookup::default(),
+                &SessionLookup::default(),
+            )
+            .expect("date header fallback should verify");
+
+        assert!(verified.is_some());
     }
 
     #[test]
@@ -1856,7 +2133,7 @@ mod tests {
             }),
         };
 
-        let verified = authenticator(1_742_905_600)
+        let verified = authenticator(REQUEST_TIME_EPOCH_SECONDS)
             .verify(&request, &access_key_lookup, &SessionLookup::default())
             .expect("signature should verify")
             .expect("signed request should authenticate");
@@ -1881,7 +2158,7 @@ mod tests {
             b"",
         );
 
-        let verified = authenticator(1_742_905_750)
+        let verified = authenticator(REQUEST_TIME_PLUS_150_SECONDS)
             .verify(
                 &request,
                 &AccessKeyLookup::default(),
@@ -1915,5 +2192,35 @@ mod tests {
         assert_eq!(error.code(), "AccessDenied");
         assert_eq!(error.status_code(), 403);
         assert_eq!(error.message(), "Request has expired.");
+    }
+
+    #[test]
+    fn auth_rejects_future_dated_presigned_requests() {
+        let path = s3_presigned_get_path_at(
+            "/demo/object.txt",
+            300,
+            "20260325T120600Z",
+        );
+        let request = RequestAuth::new(
+            "GET",
+            &path,
+            vec![RequestHeader::new("Host", "localhost")],
+            b"",
+        );
+
+        let error = authenticator(REQUEST_TIME_EPOCH_SECONDS)
+            .verify(
+                &request,
+                &AccessKeyLookup::default(),
+                &SessionLookup::default(),
+            )
+            .expect_err("future-dated pre-signed request should fail");
+
+        assert_eq!(error.code(), "AccessDenied");
+        assert_eq!(error.status_code(), 403);
+        assert_eq!(
+            error.message(),
+            "Request timestamp is too far in the future."
+        );
     }
 }

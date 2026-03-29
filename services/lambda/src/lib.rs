@@ -44,6 +44,7 @@ pub use urls::{
     CreateFunctionUrlConfigInput, FunctionUrlInvocationInput,
     FunctionUrlInvocationOutput, LambdaFunctionUrlAuthType,
     LambdaFunctionUrlConfig, LambdaFunctionUrlInvokeMode,
-    ListFunctionUrlConfigsOutput, UpdateFunctionUrlConfigInput,
+    ListFunctionUrlConfigsOutput, ResolvedFunctionUrlTarget,
+    UpdateFunctionUrlConfigInput,
 };
 pub use versions::{ListVersionsByFunctionOutput, PublishVersionInput};

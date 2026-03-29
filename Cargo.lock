@@ -191,6 +191,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
+ "urlencoding",
 ]
 
 [[package]]
@@ -2171,6 +2172,7 @@ dependencies = [
  "edge-runtime",
  "elasticache",
  "eventbridge",
+ "hmac",
  "httpdate",
  "iam",
  "kinesis",
@@ -2182,6 +2184,7 @@ dependencies = [
  "secrets-manager",
  "serde",
  "serde_json",
+ "sha2",
  "sns",
  "sqs",
  "ssm",

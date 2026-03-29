@@ -73,7 +73,10 @@ use crate::{S3InitError, S3Service};
 use crate::{StepFunctionsService, StepFunctionsServiceDependencies};
 use auth::{Authenticator, RequestAuth, RequestHeader};
 use aws::InfrastructureError;
-use aws::{AccountId, Endpoint, RegionId, RuntimeDefaults, ServiceName};
+use aws::{
+    AccountId, Endpoint, RegionId, RuntimeDefaults, ServiceName,
+    SharedAdvertisedEdge,
+};
 #[cfg(feature = "elasticache")]
 use elasticache::ElastiCacheReplicationGroupId;
 use std::sync::Arc;
@@ -133,6 +136,7 @@ pub enum RuntimeBuildError {
 }
 
 pub struct LocalRuntimeBuilder {
+    advertised_edge: SharedAdvertisedEdge,
     authenticator: Authenticator,
     defaults: RuntimeDefaults,
     enabled_services: EnabledServices,
@@ -144,10 +148,19 @@ impl LocalRuntimeBuilder {
         authenticator: Authenticator,
     ) -> Self {
         Self {
+            advertised_edge: SharedAdvertisedEdge::default(),
             authenticator,
             defaults,
             enabled_services: EnabledServices::all(),
         }
+    }
+
+    pub fn with_advertised_edge(
+        mut self,
+        advertised_edge: SharedAdvertisedEdge,
+    ) -> Self {
+        self.advertised_edge = advertised_edge;
+        self
     }
 
     pub fn with_enabled_services<I>(mut self, enabled_services: I) -> Self
@@ -167,6 +180,7 @@ impl LocalRuntimeBuilder {
     /// Returns a build error when a stateful service cannot initialize from
     /// disk or when a required runtime adapter fails to start.
     pub fn build(self) -> Result<RuntimeAssembly, RuntimeBuildError> {
+        let advertised_edge = self.advertised_edge;
         let defaults = self.defaults;
         let enabled_services = self.enabled_services;
         let authenticator = self.authenticator;
@@ -189,8 +203,11 @@ impl LocalRuntimeBuilder {
         #[cfg(feature = "sqs")]
         let sqs = SqsService::new();
         #[cfg(feature = "apigateway")]
-        let apigateway =
-            ApiGatewayService::new(&factory, Arc::new(SystemClock));
+        let apigateway = ApiGatewayService::with_advertised_edge(
+            &factory,
+            Arc::new(SystemClock),
+            advertised_edge.clone(),
+        );
         #[cfg(feature = "dynamodb")]
         let dynamodb = DynamoDbService::new(&factory)
             .map_err(RuntimeBuildError::DynamoDbState)?;
@@ -198,7 +215,11 @@ impl LocalRuntimeBuilder {
         let cloudwatch =
             CloudWatchService::new(&factory, Arc::new(SystemClock));
         #[cfg(feature = "cognito")]
-        let cognito = CognitoService::new(&factory, Arc::new(SystemClock));
+        let cognito = CognitoService::with_advertised_edge(
+            &factory,
+            Arc::new(SystemClock),
+            advertised_edge.clone(),
+        );
         #[cfg(feature = "kinesis")]
         let kinesis = KinesisService::new(&factory, Arc::new(SystemClock));
         #[cfg(feature = "kms")]
@@ -244,9 +265,11 @@ impl LocalRuntimeBuilder {
         > = None;
         #[cfg(feature = "sns")]
         let sns = build_sns_service(
+            advertised_edge.clone(),
             Arc::new(SystemTime::now),
             Arc::new(SequentialSnsIdentifierSource::default()),
             SnsServiceDependencies {
+                advertised_edge: advertised_edge.clone(),
                 http_forwarder: http_forwarder.clone(),
                 lambda: Some(lambda.clone()),
                 sqs: Some(sqs.clone()),
@@ -319,6 +342,7 @@ impl LocalRuntimeBuilder {
         let cloudformation = CloudFormationService::with_dependencies(
             Arc::new(SystemTime::now),
             CloudFormationDependencies {
+                advertised_edge: advertised_edge.clone(),
                 dynamodb: Some(Arc::new(dynamodb.clone())),
                 iam: Some(Arc::new(iam.clone())),
                 kms: Some(Arc::new(kms.clone())),
@@ -387,6 +411,7 @@ impl LocalRuntimeBuilder {
 }
 
 pub struct TestRuntimeBuilder {
+    advertised_edge: SharedAdvertisedEdge,
     enabled_services: EnabledServices,
     label: String,
     #[cfg(any(feature = "apigateway", feature = "sns"))]
@@ -399,6 +424,7 @@ impl TestRuntimeBuilder {
     pub fn new(label: impl Into<String>) -> Self {
         let label = label.into();
         Self {
+            advertised_edge: SharedAdvertisedEdge::default(),
             enabled_services: EnabledServices::all(),
             label: label.clone(),
             #[cfg(any(feature = "apigateway", feature = "sns"))]
@@ -416,6 +442,14 @@ impl TestRuntimeBuilder {
     {
         self.enabled_services =
             EnabledServices::from_enabled_services(enabled_services);
+        self
+    }
+
+    pub fn with_advertised_edge(
+        mut self,
+        advertised_edge: SharedAdvertisedEdge,
+    ) -> Self {
+        self.advertised_edge = advertised_edge;
         self
     }
 
@@ -444,6 +478,7 @@ impl TestRuntimeBuilder {
     /// Returns a build error when a service cannot initialize its in-memory
     /// state or when the required test fixture role cannot be seeded.
     pub fn build(self) -> Result<RuntimeAssembly, RuntimeBuildError> {
+        let advertised_edge = self.advertised_edge;
         let label = self.label;
         let enabled_services = self.enabled_services;
         #[cfg(any(feature = "apigateway", feature = "sns"))]
@@ -471,9 +506,12 @@ impl TestRuntimeBuilder {
             Arc::new(FixedClock::new(UNIX_EPOCH)),
         );
         #[cfg(feature = "cognito")]
-        let cognito = CognitoService::new(
-            &memory_factory(&label, "cognito"),
+        let cognito_factory = memory_factory(&label, "cognito");
+        #[cfg(feature = "cognito")]
+        let cognito = CognitoService::with_advertised_edge(
+            &cognito_factory,
             Arc::new(FixedClock::new(UNIX_EPOCH)),
+            advertised_edge.clone(),
         );
         #[cfg(feature = "kinesis")]
         let kinesis = KinesisService::new(
@@ -496,9 +534,10 @@ impl TestRuntimeBuilder {
             Arc::new(FixedClock::new(UNIX_EPOCH)),
         );
         #[cfg(feature = "apigateway")]
-        let apigateway = ApiGatewayService::new(
+        let apigateway = ApiGatewayService::with_advertised_edge(
             &memory_factory(&label, "apigateway"),
             Arc::new(FixedClock::new(UNIX_EPOCH)),
+            advertised_edge.clone(),
         );
         #[cfg(feature = "lambda")]
         let lambda = LambdaService::new(
@@ -522,9 +561,11 @@ impl TestRuntimeBuilder {
         > = None;
         #[cfg(feature = "sns")]
         let sns = build_sns_service(
+            advertised_edge.clone(),
             Arc::new(|| UNIX_EPOCH),
             Arc::new(SequentialSnsIdentifierSource::default()),
             SnsServiceDependencies {
+                advertised_edge: advertised_edge.clone(),
                 http_forwarder: http_forwarder.clone(),
                 lambda: Some(lambda.clone()),
                 sqs: Some(sqs.clone()),
@@ -593,6 +634,7 @@ impl TestRuntimeBuilder {
         let cloudformation = CloudFormationService::with_dependencies(
             Arc::new(|| UNIX_EPOCH),
             CloudFormationDependencies {
+                advertised_edge: advertised_edge.clone(),
                 dynamodb: Some(Arc::new(dynamodb.clone())),
                 iam: Some(Arc::new(iam.clone())),
                 kms: Some(Arc::new(kms.clone())),

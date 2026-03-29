@@ -30,7 +30,6 @@ pub(crate) fn handle_json(
 ) -> Result<Vec<u8>, AwsError> {
     let operation = operation_from_target(request.header("x-amz-target"))
         .map_err(|error| error.to_aws_error())?;
-    let request_host = request.header("host").unwrap_or("localhost:4566");
     let scope = CognitoScope::new(
         context.account_id().clone(),
         context.region().clone(),
@@ -354,7 +353,6 @@ pub(crate) fn handle_json(
                 &cognito
                     .initiate_auth(
                         &scope,
-                        request_host,
                         CognitoInitiateAuthInput {
                             auth_flow: request.auth_flow,
                             auth_parameters: request
@@ -374,7 +372,6 @@ pub(crate) fn handle_json(
                 &cognito
                     .admin_initiate_auth(
                         &scope,
-                        request_host,
                         CognitoAdminInitiateAuthInput {
                             auth_flow: request.auth_flow,
                             auth_parameters: request
@@ -396,7 +393,6 @@ pub(crate) fn handle_json(
                 &cognito
                     .respond_to_auth_challenge(
                         &scope,
-                        request_host,
                         CognitoRespondToAuthChallengeInput {
                             challenge_name: request.challenge_name,
                             challenge_responses: request
@@ -815,28 +811,26 @@ where
 
 pub(crate) fn open_id_configuration(
     cognito: &CognitoService,
-    host: &str,
     user_pool_id: &str,
 ) -> Result<Vec<u8>, AwsError> {
     let user_pool_id = CognitoUserPoolId::new(user_pool_id)
         .map_err(|error| error.to_aws_error())?;
     json_response(
         &cognito
-            .open_id_configuration(host, &user_pool_id)
+            .open_id_configuration(&user_pool_id)
             .map_err(|error| error.to_aws_error())?,
     )
 }
 
 pub(crate) fn jwks_document(
     cognito: &CognitoService,
-    host: &str,
     user_pool_id: &str,
 ) -> Result<Vec<u8>, AwsError> {
     let user_pool_id = CognitoUserPoolId::new(user_pool_id)
         .map_err(|error| error.to_aws_error())?;
     json_response(
         &cognito
-            .jwks_document(host, &user_pool_id)
+            .jwks_document(&user_pool_id)
             .map_err(|error| error.to_aws_error())?,
     )
 }
@@ -1240,16 +1234,18 @@ mod tests {
         )
         .expect("change password should succeed");
 
-        let open_id = open_id_configuration(&cognito, "localhost", &pool_id)
+        let open_id = open_id_configuration(&cognito, &pool_id)
             .expect("openid configuration should render");
         let open_id_json: serde_json::Value = serde_json::from_slice(&open_id)
             .expect("openid JSON should decode");
         assert_eq!(
             open_id_json["issuer"],
-            serde_json::Value::String(format!("http://localhost/{pool_id}"))
+            serde_json::Value::String(format!(
+                "http://localhost:4566/{pool_id}"
+            ))
         );
-        let jwks = jwks_document(&cognito, "localhost", &pool_id)
-            .expect("jwks should render");
+        let jwks =
+            jwks_document(&cognito, &pool_id).expect("jwks should render");
         let jwks_json: serde_json::Value =
             serde_json::from_slice(&jwks).expect("jwks JSON should decode");
         assert_eq!(jwks_json["keys"][0]["kid"], pool_id);

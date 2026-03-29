@@ -18,7 +18,7 @@ mod transport;
 use auth::Authenticator;
 use aws::{
     DEFAULT_ACCOUNT_ENV, DEFAULT_REGION_ENV, RuntimeDefaults,
-    RuntimeDefaultsError, STATE_DIRECTORY_ENV,
+    RuntimeDefaultsError, STATE_DIRECTORY_ENV, SharedAdvertisedEdge,
 };
 #[cfg(feature = "dynamodb")]
 use edge_runtime::DynamoDbInitError;
@@ -45,15 +45,20 @@ use storage::StorageRuntime;
 use tokio::net::TcpListener;
 
 pub use hosting::{
-    EDGE_HOST_ENV, EDGE_MAX_REQUEST_BYTES_ENV, EDGE_PORT_ENV, HostingPlanError,
+    EDGE_HOST_ENV, EDGE_MAX_REQUEST_BYTES_ENV, EDGE_PORT_ENV,
+    EDGE_PUBLIC_HOST_ENV, EDGE_PUBLIC_PORT_ENV, EDGE_PUBLIC_SCHEME_ENV,
+    EDGE_READY_FILE_ENV, HostingPlanError,
 };
 
 #[derive(Clone)]
 pub struct CloudishApp {
     address: SocketAddr,
+    advertised_edge: SharedAdvertisedEdge,
+    advertised_edge_template: aws::AdvertisedEdgeTemplate,
     max_request_bytes: usize,
     #[cfg(feature = "lambda")]
     _lambda_background_tasks: Arc<ManagedBackgroundTasks>,
+    ready_file: Option<PathBuf>,
     router: EdgeRouter,
 }
 
@@ -108,21 +113,33 @@ impl CloudishApp {
         )?;
 
         let authenticator = Authenticator::new(defaults.clone());
+        let advertised_edge = SharedAdvertisedEdge::new(
+            hosting.advertised_edge().resolve(hosting.edge_address().port()),
+        );
         let (services, runtime, background_tasks) =
             LocalRuntimeBuilder::new(defaults.clone(), authenticator.clone())
+                .with_advertised_edge(advertised_edge.clone())
                 .build()
                 .map_err(StartupError::from)
                 .map(|assembly| assembly.into_parts())?;
         #[cfg(not(feature = "lambda"))]
         let _ = background_tasks;
-        let router =
-            EdgeRouter::new(defaults, authenticator, services, runtime);
+        let router = EdgeRouter::new(
+            defaults,
+            advertised_edge.clone(),
+            authenticator,
+            services,
+            runtime,
+        );
 
         Ok(Self {
             address: hosting.edge_address(),
+            advertised_edge,
+            advertised_edge_template: hosting.advertised_edge().clone(),
             max_request_bytes: hosting.max_request_bytes(),
             #[cfg(feature = "lambda")]
             _lambda_background_tasks: Arc::new(background_tasks),
+            ready_file: hosting.ready_file().cloned(),
             router,
         })
     }
@@ -167,6 +184,15 @@ impl CloudishApp {
     where
         F: Future<Output = ()>,
     {
+        let local_address = listener
+            .local_addr()
+            .map_err(|source| StartupError::ListenerAddress { source })?;
+        self.advertised_edge.update(
+            self.advertised_edge_template.resolve(local_address.port()),
+        );
+        if let Some(path) = self.ready_file.as_ref() {
+            write_ready_file(path, local_address)?;
+        }
         transport::serve_listener_with_shutdown(
             listener,
             self.router,
@@ -224,6 +250,20 @@ where
     HostingPlan::from_env(read_env).map_err(StartupError::HostingConfig)
 }
 
+fn write_ready_file(
+    path: &PathBuf,
+    address: SocketAddr,
+) -> Result<(), StartupError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| {
+            StartupError::StateDirectory { path: parent.to_path_buf(), source }
+        })?;
+    }
+    std::fs::write(path, address.to_string()).map_err(|source| {
+        StartupError::StateDirectory { path: path.clone(), source }
+    })
+}
+
 #[derive(Debug)]
 pub enum StartupError {
     Accept {
@@ -236,6 +276,9 @@ pub enum StartupError {
     BuildConfiguration(String),
     Config(RuntimeDefaultsError),
     HostingConfig(HostingPlanError),
+    ListenerAddress {
+        source: io::Error,
+    },
     #[cfg(feature = "dynamodb")]
     DynamoDbState(DynamoDbInitError),
     #[cfg(feature = "eventbridge")]
@@ -274,6 +317,9 @@ impl fmt::Display for StartupError {
             Self::HostingConfig(source) => {
                 write!(formatter, "startup configuration error: {source}")
             }
+            Self::ListenerAddress { source } => {
+                write!(formatter, "failed to inspect edge listener: {source}")
+            }
             #[cfg(feature = "dynamodb")]
             Self::DynamoDbState(source) => {
                 write!(formatter, "failed to load DynamoDB state: {source}")
@@ -310,6 +356,7 @@ impl Error for StartupError {
         match self {
             Self::Accept { source }
             | Self::Bind { source, .. }
+            | Self::ListenerAddress { source }
             | Self::StateDirectory { source, .. } => Some(source),
             #[cfg(feature = "dynamodb")]
             Self::DynamoDbState(source) => Some(source),

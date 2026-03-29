@@ -166,6 +166,33 @@ impl ExecuteApiInvocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedExecuteApiTarget {
+    invocation: ExecuteApiInvocation,
+    scope: ApiGatewayScope,
+}
+
+impl ResolvedExecuteApiTarget {
+    pub fn new(
+        scope: ApiGatewayScope,
+        invocation: ExecuteApiInvocation,
+    ) -> Self {
+        Self { invocation, scope }
+    }
+
+    pub fn invocation(&self) -> &ExecuteApiInvocation {
+        &self.invocation
+    }
+
+    pub fn scope(&self) -> &ApiGatewayScope {
+        &self.scope
+    }
+
+    pub fn into_parts(self) -> (ApiGatewayScope, ExecuteApiInvocation) {
+        (self.scope, self.invocation)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecuteApiIntegrationPlan {
     Http(HttpForwardRequest),
     LambdaProxy(Box<ExecuteApiLambdaProxyPlan>),
@@ -295,6 +322,78 @@ impl ExecuteApiError {
 }
 
 impl ApiGatewayService {
+    pub fn has_execute_api_host(&self, host: &str) -> bool {
+        let host = normalize_authority(host);
+        if let Some(default_host) = parse_default_execute_api_host(&host) {
+            return self.all_states().into_iter().any(|(_, state)| {
+                state.rest_apis.contains_key(&default_host.api_id)
+                    || state.http_apis.contains_key(&default_host.api_id)
+            });
+        }
+
+        self.all_states()
+            .into_iter()
+            .any(|(_, state)| find_domain_name(&state, &host).is_some())
+    }
+
+    pub fn resolve_execute_api(
+        &self,
+        request: &ExecuteApiRequest,
+        caller_identity: Option<&CallerIdentity>,
+    ) -> Option<Result<ResolvedExecuteApiTarget, ExecuteApiError>> {
+        let host = normalize_authority(request.host());
+        if let Some(default_host) = parse_default_execute_api_host(&host) {
+            return self.resolve_default_execute_api(
+                &default_host,
+                request,
+                caller_identity,
+            );
+        }
+
+        self.resolve_custom_domain_execute_api(&host, request, caller_identity)
+    }
+
+    pub fn resolve_execute_api_by_api_id(
+        &self,
+        api_id: &str,
+        request: &ExecuteApiRequest,
+        caller_identity: Option<&CallerIdentity>,
+    ) -> Option<Result<ResolvedExecuteApiTarget, ExecuteApiError>> {
+        let mut matches =
+            self.all_states().into_iter().filter(|(_, state)| {
+                state.rest_apis.contains_key(api_id)
+                    || state.http_apis.contains_key(api_id)
+            });
+        let (scope, state) = matches.next()?;
+        if matches.next().is_some() {
+            return Some(Err(ambiguous_execute_api_target_error(format!(
+                "multiple execute-api targets matched api id {api_id}",
+            ))));
+        }
+
+        Some(if state.http_apis.contains_key(api_id) {
+            super::v2::prepare_http_api_execute_api(
+                &scope,
+                &state,
+                api_id,
+                request,
+                caller_identity,
+            )
+            .map(|invocation| ResolvedExecuteApiTarget::new(scope, invocation))
+        } else {
+            let default_host =
+                DefaultExecuteApiHost { api_id: api_id.to_owned() };
+            self.prepare_default_host_execute_api(
+                &scope,
+                &state,
+                &default_host,
+                request,
+                caller_identity,
+            )
+            .map(|invocation| ResolvedExecuteApiTarget::new(scope, invocation))
+        })
+    }
+
     pub fn prepare_execute_api(
         &self,
         scope: &ApiGatewayScope,
@@ -331,6 +430,73 @@ impl ApiGatewayService {
                     caller_identity,
                 ),
         })
+    }
+
+    fn resolve_default_execute_api(
+        &self,
+        host: &DefaultExecuteApiHost,
+        request: &ExecuteApiRequest,
+        caller_identity: Option<&CallerIdentity>,
+    ) -> Option<Result<ResolvedExecuteApiTarget, ExecuteApiError>> {
+        let mut matches =
+            self.all_states().into_iter().filter(|(_, state)| {
+                state.rest_apis.contains_key(&host.api_id)
+                    || state.http_apis.contains_key(&host.api_id)
+            });
+        let (scope, state) = matches.next()?;
+        if matches.next().is_some() {
+            return Some(Err(ambiguous_execute_api_target_error(format!(
+                "multiple execute-api targets matched host {}",
+                request.host(),
+            ))));
+        }
+
+        Some(
+            self.prepare_default_host_execute_api(
+                &scope,
+                &state,
+                host,
+                request,
+                caller_identity,
+            )
+            .map(|invocation| {
+                ResolvedExecuteApiTarget::new(scope, invocation)
+            }),
+        )
+    }
+
+    fn resolve_custom_domain_execute_api(
+        &self,
+        host: &str,
+        request: &ExecuteApiRequest,
+        caller_identity: Option<&CallerIdentity>,
+    ) -> Option<Result<ResolvedExecuteApiTarget, ExecuteApiError>> {
+        let mut matches =
+            self.all_states().into_iter().filter_map(|(scope, state)| {
+                let domain_name =
+                    find_domain_name(&state, host).map(str::to_owned);
+                domain_name.map(|domain_name| (scope, state, domain_name))
+            });
+        let (scope, state, domain_name) = matches.next()?;
+        if matches.next().is_some() {
+            return Some(Err(ambiguous_execute_api_target_error(format!(
+                "multiple execute-api custom domains matched host {}",
+                request.host(),
+            ))));
+        }
+
+        Some(
+            self.prepare_custom_domain_execute_api(
+                &scope,
+                &state,
+                &domain_name,
+                request,
+                caller_identity,
+            )
+            .map(|invocation| {
+                ResolvedExecuteApiTarget::new(scope, invocation)
+            }),
+        )
     }
 }
 
@@ -900,6 +1066,10 @@ fn runtime_error(error: ApiGatewayError) -> ExecuteApiError {
     }
 }
 
+fn ambiguous_execute_api_target_error(message: String) -> ExecuteApiError {
+    ExecuteApiError::IntegrationFailure { message, status_code: 500 }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DefaultExecuteApiHost {
     api_id: String,
@@ -1398,16 +1568,38 @@ mod tests {
         )
     }
 
+    fn alternate_scope() -> ApiGatewayScope {
+        ApiGatewayScope::new(
+            "111111111111".parse().expect("account should parse"),
+            "eu-west-2".parse().expect("region should parse"),
+        )
+    }
+
     fn deploy_http_api(
         service: &ApiGatewayService,
         integration_type: &str,
         uri: &str,
         disable_default: bool,
     ) -> (String, String, String) {
-        let scope = scope();
+        deploy_http_api_in_scope(
+            service,
+            &scope(),
+            integration_type,
+            uri,
+            disable_default,
+        )
+    }
+
+    fn deploy_http_api_in_scope(
+        service: &ApiGatewayService,
+        scope: &ApiGatewayScope,
+        integration_type: &str,
+        uri: &str,
+        disable_default: bool,
+    ) -> (String, String, String) {
         let api = service
             .create_rest_api(
-                &scope,
+                scope,
                 CreateRestApiInput {
                     binary_media_types: Vec::new(),
                     description: None,
@@ -1420,7 +1612,7 @@ mod tests {
             .expect("api should create");
         let resource = service
             .create_resource(
-                &scope,
+                scope,
                 &api.id,
                 &api.root_resource_id,
                 CreateResourceInput { path_part: "pets".to_owned() },
@@ -1428,7 +1620,7 @@ mod tests {
             .expect("resource should create");
         service
             .put_method(
-                &scope,
+                scope,
                 &api.id,
                 &resource.id,
                 "GET",
@@ -1445,7 +1637,7 @@ mod tests {
             .expect("method should create");
         service
             .put_integration(
-                &scope,
+                scope,
                 &api.id,
                 &resource.id,
                 "GET",
@@ -1469,7 +1661,7 @@ mod tests {
             .expect("integration should create");
         let deployment = service
             .create_deployment(
-                &scope,
+                scope,
                 &api.id,
                 CreateDeploymentInput {
                     description: None,
@@ -1481,7 +1673,7 @@ mod tests {
             .expect("deployment should create");
         service
             .create_stage(
-                &scope,
+                scope,
                 &api.id,
                 CreateStageInput {
                     cache_cluster_enabled: None,
@@ -1539,6 +1731,68 @@ mod tests {
     }
 
     #[test]
+    fn apigw_runtime_execute_api_ids_are_unique_across_accounts() {
+        let service = service("global-api-ids");
+
+        let default_api = service
+            .create_rest_api(
+                &scope(),
+                CreateRestApiInput {
+                    binary_media_types: Vec::new(),
+                    description: None,
+                    disable_execute_api_endpoint: None,
+                    endpoint_configuration: None,
+                    name: "default".to_owned(),
+                    tags: BTreeMap::new(),
+                },
+            )
+            .expect("default-scope API should create");
+        let alternate_api = service
+            .create_rest_api(
+                &alternate_scope(),
+                CreateRestApiInput {
+                    binary_media_types: Vec::new(),
+                    description: None,
+                    disable_execute_api_endpoint: None,
+                    endpoint_configuration: None,
+                    name: "alternate".to_owned(),
+                    tags: BTreeMap::new(),
+                },
+            )
+            .expect("alternate-scope API should create");
+
+        assert_ne!(default_api.id, alternate_api.id);
+    }
+
+    #[test]
+    fn apigw_runtime_resolve_execute_api_returns_the_owning_scope() {
+        let service = service("cross-scope-default-host");
+        let alternate_scope = alternate_scope();
+        let (api_id, _, _) = deploy_http_api_in_scope(
+            &service,
+            &alternate_scope,
+            "HTTP_PROXY",
+            "http://127.0.0.1:8080/backend",
+            false,
+        );
+
+        let resolved = service
+            .resolve_execute_api(
+                &ExecuteApiRequest::new(
+                    format!("{api_id}.execute-api.localhost"),
+                    "GET",
+                    "/dev/pets",
+                ),
+                None,
+            )
+            .expect("execute-api host should be recognized")
+            .expect("alternate-scope invocation should resolve");
+
+        assert_eq!(resolved.scope(), &alternate_scope);
+        assert_eq!(resolved.invocation().api_id(), api_id);
+    }
+
+    #[test]
     fn apigw_v1_runtime_custom_domain_longest_base_path_wins() {
         let service = service("custom-domain");
         let scope = scope();
@@ -1592,6 +1846,40 @@ mod tests {
             .expect("invocation should resolve");
         assert_eq!(invocation.api_id(), api_id);
         assert_eq!(invocation.request_path(), "/pets");
+    }
+
+    #[test]
+    fn apigw_runtime_rejects_duplicate_custom_domains_across_accounts() {
+        let service = service("duplicate-custom-domain");
+
+        service
+            .create_domain_name(
+                &scope(),
+                CreateDomainNameInput {
+                    certificate_arn: None,
+                    certificate_name: None,
+                    domain_name: "api.example.test".to_owned(),
+                    endpoint_configuration: None,
+                    security_policy: None,
+                    tags: BTreeMap::new(),
+                },
+            )
+            .expect("default-scope custom domain should create");
+        let error = service
+            .create_domain_name(
+                &alternate_scope(),
+                CreateDomainNameInput {
+                    certificate_arn: None,
+                    certificate_name: None,
+                    domain_name: "API.example.test".to_owned(),
+                    endpoint_configuration: None,
+                    security_policy: None,
+                    tags: BTreeMap::new(),
+                },
+            )
+            .expect_err("custom domain should be globally unique");
+
+        assert!(matches!(error, ApiGatewayError::Conflict { .. }));
     }
 
     #[test]

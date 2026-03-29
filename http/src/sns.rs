@@ -115,25 +115,20 @@ pub(crate) fn handle_query(
         }
         "Subscribe" => {
             let subscribed = sns
-                .subscribe(
-                    SubscribeInput {
-                        attributes: query_map_field(
-                            &params,
-                            &["Attributes.entry."],
-                            "key",
-                            "value",
-                        ),
-                        endpoint: params.required("Endpoint")?.to_owned(),
-                        protocol: params.required("Protocol")?.to_owned(),
-                        return_subscription_arn: params
-                            .optional("ReturnSubscriptionArn")
-                            .is_some_and(parse_query_bool),
-                        topic_arn: required_sns_arn_query(
-                            &params, "TopicArn",
-                        )?,
-                    },
-                    Some(&confirmation_base_url(request)),
-                )
+                .subscribe(SubscribeInput {
+                    attributes: query_map_field(
+                        &params,
+                        &["Attributes.entry."],
+                        "key",
+                        "value",
+                    ),
+                    endpoint: params.required("Endpoint")?.to_owned(),
+                    protocol: params.required("Protocol")?.to_owned(),
+                    return_subscription_arn: params
+                        .optional("ReturnSubscriptionArn")
+                        .is_some_and(parse_query_bool),
+                    topic_arn: required_sns_arn_query(&params, "TopicArn")?,
+                })
                 .map_err(|error| error.to_aws_error())?;
 
             Ok(response_with_result(
@@ -359,23 +354,17 @@ pub(crate) fn handle_json(
         }
         "Subscribe" => {
             let subscribed = sns
-                .subscribe(
-                    SubscribeInput {
-                        attributes: json_string_map_field(
-                            &body,
-                            "Attributes",
-                        )?,
-                        endpoint: required_string_json(&body, "Endpoint")?,
-                        protocol: required_string_json(&body, "Protocol")?,
-                        return_subscription_arn: optional_bool_json(
-                            &body,
-                            "ReturnSubscriptionArn",
-                        )?
-                        .unwrap_or(false),
-                        topic_arn: required_sns_arn_json(&body, "TopicArn")?,
-                    },
-                    Some(&confirmation_base_url(request)),
-                )
+                .subscribe(SubscribeInput {
+                    attributes: json_string_map_field(&body, "Attributes")?,
+                    endpoint: required_string_json(&body, "Endpoint")?,
+                    protocol: required_string_json(&body, "Protocol")?,
+                    return_subscription_arn: optional_bool_json(
+                        &body,
+                        "ReturnSubscriptionArn",
+                    )?
+                    .unwrap_or(false),
+                    topic_arn: required_sns_arn_json(&body, "TopicArn")?,
+                })
                 .map_err(|error| error.to_aws_error())?;
 
             json!({ "SubscriptionArn": subscribed.response_subscription_arn })
@@ -957,10 +946,6 @@ fn invalid_query_parameter(field: &str) -> AwsError {
     .to_aws_error()
 }
 
-fn confirmation_base_url(request: &HttpRequest<'_>) -> String {
-    format!("http://{}/", request.header("host").unwrap_or("localhost"))
-}
-
 fn parse_query_bool(value: &str) -> bool {
     matches!(value, "true" | "True" | "1")
 }
@@ -968,8 +953,8 @@ fn parse_query_bool(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        confirmation_base_url, handle_json, handle_query, is_sns_action,
-        query_map_field, query_string_list, response_without_result,
+        handle_json, handle_query, is_sns_action, query_map_field,
+        query_string_list, response_without_result,
     };
     use crate::runtime::EdgeRouter;
     use crate::test_runtime;
@@ -1325,15 +1310,11 @@ mod tests {
     }
 
     #[test]
-    fn sns_core_internal_helpers_parse_query_structures_and_base_url() {
+    fn sns_core_internal_helpers_parse_query_structures() {
         let params = crate::query::QueryParameters::parse(
             b"Tags.member.1.Key=env&Tags.member.1.Value=dev&TagKeys.member.1=env&Attributes.entry.1.key=DisplayName&Attributes.entry.1.value=Orders",
         )
         .expect("params should parse");
-        let request = crate::request::HttpRequest::parse(
-            b"POST / HTTP/1.1\r\nHost: localhost:4566\r\n\r\n",
-        )
-        .expect("request should parse");
 
         assert!(is_sns_action("CreateTopic"));
         assert_eq!(
@@ -1344,7 +1325,6 @@ mod tests {
             query_string_list(&params, &["TagKeys.member."]),
             vec!["env".to_owned()]
         );
-        assert_eq!(confirmation_base_url(&request), "http://localhost:4566/");
         assert!(
             response_without_result("DeleteTopic")
                 .contains("ResponseMetadata")

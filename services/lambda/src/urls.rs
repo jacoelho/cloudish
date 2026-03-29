@@ -85,6 +85,7 @@ impl ListFunctionUrlConfigsOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionUrlInvocationInput {
     pub body: Vec<u8>,
+    pub domain_name: String,
     pub headers: Vec<(String, String)>,
     pub method: String,
     pub path: String,
@@ -111,6 +112,47 @@ impl FunctionUrlInvocationOutput {
 
     pub fn status_code(&self) -> u16 {
         self.status_code
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFunctionUrlTarget {
+    auth_type: LambdaFunctionUrlAuthType,
+    function_name: String,
+    qualifier: Option<String>,
+    scope: LambdaScope,
+    url_id: String,
+}
+
+impl ResolvedFunctionUrlTarget {
+    pub fn new(
+        scope: LambdaScope,
+        function_name: String,
+        qualifier: Option<String>,
+        auth_type: LambdaFunctionUrlAuthType,
+        url_id: String,
+    ) -> Self {
+        Self { auth_type, function_name, qualifier, scope, url_id }
+    }
+
+    pub fn auth_type(&self) -> LambdaFunctionUrlAuthType {
+        self.auth_type
+    }
+
+    pub fn function_name(&self) -> &str {
+        &self.function_name
+    }
+
+    pub fn qualifier(&self) -> Option<&str> {
+        self.qualifier.as_deref()
+    }
+
+    pub fn scope(&self) -> &LambdaScope {
+        &self.scope
+    }
+
+    pub fn url_id(&self) -> &str {
+        &self.url_id
     }
 }
 
@@ -272,11 +314,7 @@ pub(crate) fn build_function_url_event(
                 "userId": caller_identity.principal_id(),
             }
         })).unwrap_or(serde_json::Value::Null),
-        "domainName": format!(
-            "{}.lambda-url.{}.localhost",
-            url_id,
-            scope.region().as_str(),
-        ),
+        "domainName": input.domain_name,
         "domainPrefix": url_id,
         "http": {
             "method": input.method,
@@ -664,6 +702,7 @@ mod tests {
             "abc123",
             &FunctionUrlInvocationInput {
                 body: br#"{"hello":"world"}"#.to_vec(),
+                domain_name: "localhost:4566".to_owned(),
                 headers: vec![
                     ("User-Agent".to_owned(), "cloudish-tests".to_owned()),
                     ("Cookie".to_owned(), "a=1; b=2".to_owned()),
@@ -706,7 +745,7 @@ mod tests {
                     "apiId": "abc123",
                     "authentication": serde_json::Value::Null,
                     "authorizer": serde_json::Value::Null,
-                    "domainName": "abc123.lambda-url.eu-west-2.localhost",
+                    "domainName": "localhost:4566",
                     "domainPrefix": "abc123",
                     "http": {
                         "method": "POST",
@@ -742,6 +781,7 @@ mod tests {
             "url-1",
             &FunctionUrlInvocationInput {
                 body: vec![0, 159, 146, 150],
+                domain_name: "api.example.test".to_owned(),
                 headers: Vec::new(),
                 method: "GET".to_owned(),
                 path: "/".to_owned(),

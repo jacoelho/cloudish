@@ -1,7 +1,7 @@
 pub(crate) use crate::aws_error_shape::AwsErrorShape;
 use crate::request::HttpRequest;
 use crate::runtime::EdgeResponse;
-use aws::{AwsError, RequestContext};
+use aws::{AdvertisedEdge, AwsError, RequestContext};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
@@ -23,6 +23,7 @@ use time::format_description::well_known::Rfc3339;
 
 pub(crate) fn handle_rest_json(
     lambda: &LambdaService,
+    advertised_edge: &AdvertisedEdge,
     request: &HttpRequest<'_>,
     context: &RequestContext,
 ) -> Result<EdgeResponse, AwsError> {
@@ -89,7 +90,7 @@ pub(crate) fn handle_rest_json(
                     },
                 )
                 .map_err(|error| error.to_aws_error())?;
-            let body = function_url_config_response(request, &output)
+            let body = function_url_config_response(advertised_edge, &output)
                 .map_err(|error| error.to_aws_error())?;
 
             json_response(201, &body)
@@ -102,7 +103,7 @@ pub(crate) fn handle_rest_json(
                     qualifier.as_deref(),
                 )
                 .map_err(|error| error.to_aws_error())?;
-            let body = function_url_config_response(request, &output)
+            let body = function_url_config_response(advertised_edge, &output)
                 .map_err(|error| error.to_aws_error())?;
 
             json_response(200, &body)
@@ -120,8 +121,9 @@ pub(crate) fn handle_rest_json(
                     max_items,
                 )
                 .map_err(|error| error.to_aws_error())?;
-            let body = function_url_config_list_response(request, &output)
-                .map_err(|error| error.to_aws_error())?;
+            let body =
+                function_url_config_list_response(advertised_edge, &output)
+                    .map_err(|error| error.to_aws_error())?;
 
             json_response(200, &body)
         }
@@ -146,7 +148,7 @@ pub(crate) fn handle_rest_json(
                     },
                 )
                 .map_err(|error| error.to_aws_error())?;
-            let body = function_url_config_response(request, &output)
+            let body = function_url_config_response(advertised_edge, &output)
                 .map_err(|error| error.to_aws_error())?;
 
             json_response(200, &body)
@@ -539,7 +541,7 @@ fn json_response<T: Serialize>(
 }
 
 fn function_url_config_response(
-    request: &HttpRequest<'_>,
+    advertised_edge: &AdvertisedEdge,
     config: &LambdaFunctionUrlConfig,
 ) -> Result<FunctionUrlConfigResponse, LambdaError> {
     let last_modified_time =
@@ -549,7 +551,7 @@ fn function_url_config_response(
         auth_type: function_url_auth_type_name(config.auth_type()).to_owned(),
         creation_time: last_modified_time.clone(),
         function_arn: config.function_arn().to_owned(),
-        function_url: function_url_endpoint(request, config),
+        function_url: function_url_endpoint(advertised_edge, config),
         invoke_mode: function_url_invoke_mode_name(config.invoke_mode())
             .to_owned(),
         last_modified_time,
@@ -557,40 +559,33 @@ fn function_url_config_response(
 }
 
 fn function_url_config_list_response(
-    request: &HttpRequest<'_>,
+    advertised_edge: &AdvertisedEdge,
     output: &services::ListFunctionUrlConfigsOutput,
 ) -> Result<ListFunctionUrlConfigsResponse, LambdaError> {
     Ok(ListFunctionUrlConfigsResponse {
         function_url_configs: output
             .function_url_configs()
             .iter()
-            .map(|config| function_url_config_response(request, config))
+            .map(|config| {
+                function_url_config_response(advertised_edge, config)
+            })
             .collect::<Result<Vec<_>, _>>()?,
         next_marker: output.next_marker().map(str::to_owned),
     })
 }
 
 fn function_url_endpoint(
-    request: &HttpRequest<'_>,
+    advertised_edge: &AdvertisedEdge,
     config: &LambdaFunctionUrlConfig,
 ) -> String {
-    let suffix =
-        request.header("host").and_then(host_port_suffix).unwrap_or_default();
     let region =
         config.function_arn().split(':').nth(3).unwrap_or("us-east-1");
 
     format!(
-        "http://{}.lambda-url.{region}.localhost{suffix}/",
-        config.url_id()
+        "{}/__aws/lambda-url/{region}/{}/",
+        advertised_edge.origin(),
+        config.url_id(),
     )
-}
-
-fn host_port_suffix(host: &str) -> Option<String> {
-    let host = host.trim();
-    let (_, port) = host.rsplit_once(':')?;
-    port.parse::<u16>().ok()?;
-
-    Some(format!(":{port}"))
 }
 
 fn format_function_url_time(
@@ -1626,7 +1621,9 @@ mod tests {
             .to_owned();
         assert_eq!(create_status, "HTTP/1.1 201 Created");
         assert!(
-            function_url.contains(".lambda-url.eu-west-2.localhost:4566/")
+            function_url.starts_with(
+                "http://localhost:4566/__aws/lambda-url/eu-west-2/"
+            )
         );
         assert_eq!(create_json["AuthType"], "NONE");
         assert_eq!(create_json["InvokeMode"], "BUFFERED");

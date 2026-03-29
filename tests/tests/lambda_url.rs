@@ -64,7 +64,7 @@ async fn lambda_url_control_plane_async_destinations_and_sqs_mapping_round_trip(
         .await
         .expect("function URL config should be created");
     assert!(
-        url_config.function_url().contains(".lambda-url.eu-west-2.localhost:")
+        url_config.function_url().contains("/__aws/lambda-url/eu-west-2/")
     );
     assert_eq!(url_config.auth_type().as_str(), "NONE");
     assert_eq!(

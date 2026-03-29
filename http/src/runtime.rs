@@ -47,17 +47,18 @@ use auth::{
 };
 use aws::{
     AwsError, AwsErrorFamily, CredentialScope, ProtocolFamily, RegionId,
-    RequestContext, RuntimeDefaults, ServiceName,
+    RequestContext, RuntimeDefaults, ServiceName, SharedAdvertisedEdge,
+    parse_reserved_execute_api_path, parse_reserved_lambda_function_url_path,
 };
 use ciborium::into_writer;
 use edge_runtime::{EnabledServices, RuntimeServices};
 use httpdate::fmt_http_date;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(feature = "lambda")]
+use services::FunctionUrlInvocationInput;
 #[cfg(feature = "s3")]
 use services::S3Scope;
-#[cfg(feature = "lambda")]
-use services::{FunctionUrlInvocationInput, LambdaScope};
 use std::time::SystemTime;
 
 const REQUEST_ID: &str = "0000000000000000";
@@ -95,6 +96,7 @@ const QUERY_ACTION_FALLBACKS: [(&str, ServiceName); 9] = [
 
 #[derive(Clone)]
 pub struct EdgeRouter {
+    advertised_edge: SharedAdvertisedEdge,
     defaults: RuntimeDefaults,
     authenticator: Authenticator,
     runtime: RuntimeServices,
@@ -104,11 +106,12 @@ pub struct EdgeRouter {
 impl EdgeRouter {
     pub fn new(
         defaults: RuntimeDefaults,
+        advertised_edge: SharedAdvertisedEdge,
         authenticator: Authenticator,
         services: EnabledServices,
         runtime: RuntimeServices,
     ) -> Self {
-        Self { defaults, authenticator, runtime, services }
+        Self { advertised_edge, defaults, authenticator, runtime, services }
     }
 
     pub fn handle_bytes(&self, request: &[u8]) -> EdgeResponse {
@@ -127,6 +130,16 @@ impl EdgeRouter {
 
     fn route(&self, request: EdgeRequest) -> EdgeResponse {
         if let Some(response) = self.internal_route(&request) {
+            return response;
+        }
+
+        if let Some(response) =
+            self.route_reserved_lambda_function_url(&request)
+        {
+            return response;
+        }
+
+        if let Some(response) = self.route_reserved_execute_api(&request) {
             return response;
         }
 
@@ -185,6 +198,30 @@ impl EdgeRouter {
     }
 
     #[cfg(feature = "lambda")]
+    fn route_reserved_lambda_function_url(
+        &self,
+        request: &HttpRequest<'_>,
+    ) -> Option<EdgeResponse> {
+        let function_url = parse_reserved_lambda_function_url_path(
+            request.path_without_query(),
+        )?;
+        self.route_lambda_function_url_request(
+            request,
+            function_url.region(),
+            function_url.url_id(),
+            function_url.request_path(),
+        )
+    }
+
+    #[cfg(not(feature = "lambda"))]
+    fn route_reserved_lambda_function_url(
+        &self,
+        _request: &HttpRequest<'_>,
+    ) -> Option<EdgeResponse> {
+        None
+    }
+
+    #[cfg(feature = "lambda")]
     fn route_function_url(
         &self,
         request: &HttpRequest<'_>,
@@ -192,6 +229,22 @@ impl EdgeRouter {
         let host = request.header("host")?;
         let function_url = parse_function_url_host(host)?;
 
+        self.route_lambda_function_url_request(
+            request,
+            &function_url.region,
+            &function_url.url_id,
+            request.path_without_query(),
+        )
+    }
+
+    #[cfg(feature = "lambda")]
+    fn route_lambda_function_url_request(
+        &self,
+        request: &HttpRequest<'_>,
+        region: &RegionId,
+        url_id: &str,
+        request_path: &str,
+    ) -> Option<EdgeResponse> {
         if !self.services.is_enabled(ServiceName::Lambda) {
             return Some(EdgeResponse::json(
                 404,
@@ -212,27 +265,25 @@ impl EdgeRouter {
                     )),
                 ));
             }
-            if verified_request.scope().region() != &function_url.region {
+            if verified_request.scope().region() != region {
                 return Some(function_url_error_response(
                     &signature_scope_mismatch_error(format!(
                         "Credential scope region {} does not match Lambda function URL region {}.",
                         verified_request.scope().region().as_str(),
-                        function_url.region.as_str(),
+                        region.as_str(),
                     )),
                 ));
             }
         }
-
-        let scope = LambdaScope::new(
-            verified_request
-                .as_ref()
-                .map(|verified_request| verified_request.account_id().clone())
-                .unwrap_or_else(|| self.defaults.default_account_id().clone()),
-            function_url.region.clone(),
-        );
-        let output = match self.runtime.lambda().invoke_function_url(
-            &scope,
-            &function_url.url_id,
+        let resolved =
+            match self.runtime.lambda().resolve_function_url(region, url_id) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return Some(function_url_lambda_error_response(&error));
+                }
+            };
+        let output = match self.runtime.lambda().invoke_resolved_function_url(
+            &resolved,
             FunctionUrlInvocationInput {
                 body: request.body().to_vec(),
                 headers: request
@@ -240,10 +291,14 @@ impl EdgeRouter {
                     .map(|(name, value)| (name.to_owned(), value.to_owned()))
                     .collect(),
                 method: request.method().to_owned(),
-                path: request.path_without_query().to_owned(),
+                path: request_path.to_owned(),
                 protocol: None,
                 query_string: request.query_string().map(str::to_owned),
                 source_ip: None,
+                domain_name: self
+                    .advertised_edge
+                    .current()
+                    .lambda_function_domain_name(),
             },
             verified_request.as_ref().map(VerifiedRequest::caller_identity),
         ) {
@@ -288,20 +343,52 @@ impl EdgeRouter {
     }
 
     #[cfg(feature = "apigateway")]
+    fn route_reserved_execute_api(
+        &self,
+        request: &HttpRequest<'_>,
+    ) -> Option<EdgeResponse> {
+        let execute_api =
+            parse_reserved_execute_api_path(request.path_without_query())?;
+        self.route_execute_api_request(
+            request,
+            Some(execute_api.api_id()),
+            execute_api.request_path(),
+        )
+    }
+
+    #[cfg(not(feature = "apigateway"))]
+    fn route_reserved_execute_api(
+        &self,
+        _request: &HttpRequest<'_>,
+    ) -> Option<EdgeResponse> {
+        None
+    }
+
+    #[cfg(feature = "apigateway")]
     fn route_execute_api(
         &self,
         request: &HttpRequest<'_>,
     ) -> Option<EdgeResponse> {
-        let execute_request = build_execute_api_request(request);
-        let mut scope = services::ApiGatewayScope::new(
-            self.defaults.default_account_id().clone(),
-            self.defaults.default_region_id().clone(),
-        );
-        let mut invocation = self.runtime.apigateway().prepare_execute_api(
-            &scope,
-            &execute_request,
+        let host = request.header("host")?;
+        if !self.runtime.apigateway().has_execute_api_host(host) {
+            return None;
+        }
+
+        self.route_execute_api_request(
+            request,
             None,
-        )?;
+            request.path_without_query(),
+        )
+    }
+
+    #[cfg(feature = "apigateway")]
+    fn route_execute_api_request(
+        &self,
+        request: &HttpRequest<'_>,
+        api_id: Option<&str>,
+        request_path: &str,
+    ) -> Option<EdgeResponse> {
+        let execute_request = build_execute_api_request(request, request_path);
 
         if !self.services.is_enabled(ServiceName::ApiGateway) {
             return Some(EdgeResponse::json(
@@ -316,33 +403,51 @@ impl EdgeRouter {
                 return Some(execute_api_auth_error_response(&error));
             }
         };
-        if let Some(verified_request) = verified_request.as_ref() {
-            if verified_request.scope().service() != ServiceName::ApiGateway {
-                return Some(execute_api_auth_error_response(
-                    &signature_scope_mismatch_error(format!(
-                        "Credential scope service {} does not match execute-api requests.",
-                        verified_request.scope().service().as_str(),
-                    )),
-                ));
-            }
-
-            scope = services::ApiGatewayScope::new(
-                verified_request.account_id().clone(),
-                verified_request.scope().region().clone(),
-            );
-            invocation = self
-                .runtime
-                .apigateway()
-                .prepare_execute_api(
-                    &scope,
+        if let Some(verified_request) = verified_request.as_ref()
+            && verified_request.scope().service() != ServiceName::ApiGateway
+        {
+            return Some(execute_api_auth_error_response(
+                &signature_scope_mismatch_error(format!(
+                    "Credential scope service {} does not match execute-api requests.",
+                    verified_request.scope().service().as_str(),
+                )),
+            ));
+        }
+        let resolved = match api_id {
+            Some(api_id) => {
+                self.runtime.apigateway().resolve_execute_api_by_api_id(
+                    api_id,
                     &execute_request,
-                    Some(verified_request.caller_identity()),
+                    verified_request
+                        .as_ref()
+                        .map(VerifiedRequest::caller_identity),
                 )
-                .unwrap_or(Err(services::ExecuteApiError::NotFound));
+            }
+            None => self.runtime.apigateway().resolve_execute_api(
+                &execute_request,
+                verified_request
+                    .as_ref()
+                    .map(VerifiedRequest::caller_identity),
+            ),
+        }?;
+        let (scope, invocation) = match resolved {
+            Ok(target) => target.into_parts(),
+            Err(error) => return Some(execute_api_error_response(&error)),
+        };
+        if let Some(verified_request) = verified_request.as_ref()
+            && verified_request.scope().region() != scope.region()
+        {
+            return Some(execute_api_auth_error_response(
+                &signature_scope_mismatch_error(format!(
+                    "Credential scope region {} does not match execute-api region {}.",
+                    verified_request.scope().region().as_str(),
+                    scope.region().as_str(),
+                )),
+            ));
         }
 
-        Some(match invocation {
-            Ok(invocation) => match self
+        Some(
+            match self
                 .runtime
                 .execute_api_executor()
                 .execute(&scope, &invocation)
@@ -376,8 +481,7 @@ impl EdgeRouter {
                 }
                 Err(error) => execute_api_error_response(&error),
             },
-            Err(error) => execute_api_error_response(&error),
-        })
+        )
     }
 
     #[cfg(not(feature = "apigateway"))]
@@ -413,18 +517,15 @@ impl EdgeRouter {
                 ));
             }
 
-            let host = request.header("host").unwrap_or("localhost:4566");
             let response = match document {
                 CognitoWellKnownDocument::OpenIdConfiguration => {
                     cognito::open_id_configuration(
                         self.runtime.cognito(),
-                        host,
                         user_pool_id,
                     )
                 }
                 CognitoWellKnownDocument::Jwks => cognito::jwks_document(
                     self.runtime.cognito(),
-                    host,
                     user_pool_id,
                 ),
             };
@@ -566,8 +667,10 @@ impl EdgeRouter {
 
         #[cfg(feature = "sqs")]
         if service == ServiceName::Sqs {
+            let advertised_edge = self.advertised_edge.current();
             return match sqs::handle_query(
                 self.runtime.sqs(),
+                &advertised_edge,
                 &normalized_request,
                 &context,
             ) {
@@ -686,8 +789,10 @@ impl EdgeRouter {
 
         #[cfg(feature = "sqs")]
         if route.service == ServiceName::Sqs && route.operation.is_some() {
+            let advertised_edge = self.advertised_edge.current();
             return match sqs::handle_json(
                 self.runtime.sqs(),
+                &advertised_edge,
                 request,
                 &context,
             ) {
@@ -1004,8 +1109,10 @@ impl EdgeRouter {
         match service {
             #[cfg(feature = "lambda")]
             ServiceName::Lambda => {
+                let advertised_edge = self.advertised_edge.current();
                 match lambda::handle_rest_json(
                     self.runtime.lambda(),
+                    &advertised_edge,
                     request,
                     &context,
                 ) {
@@ -1462,11 +1569,12 @@ fn should_skip_function_url_response_header(name: &str) -> bool {
 #[cfg(feature = "apigateway")]
 fn build_execute_api_request(
     request: &HttpRequest<'_>,
+    request_path: &str,
 ) -> services::ExecuteApiRequest {
     let mut execute_request = services::ExecuteApiRequest::new(
         request.header("host").unwrap_or_default().to_owned(),
         request.method().to_owned(),
-        request.path_without_query().to_owned(),
+        request_path.to_owned(),
     )
     .with_body(request.body().to_vec())
     .with_protocol("HTTP/1.1");
@@ -1973,26 +2081,38 @@ mod tests {
     use ciborium::value::Value as CborValue;
     use ciborium::{from_reader, into_writer};
     use edge_runtime::RuntimeServices;
+    use hmac::{Hmac, Mac};
     use httpdate::parse_http_date;
+    use iam::{CreateRoleInput, CreateUserInput, IamScope};
     use serde_json::{Value, json};
     use services::{
         AddLambdaPermissionInput, ApiGatewayScope, CreateDeploymentInput,
         CreateDomainNameInput, CreateFunctionInput,
-        CreateHttpApiDeploymentInput, CreateHttpApiInput,
-        CreateHttpApiIntegrationInput, CreateHttpApiRouteInput,
-        CreateHttpApiStageInput, CreateQueueInput, CreateResourceInput,
-        CreateRestApiInput, CreateStageInput, CreateTopicInput,
-        LambdaCodeInput, LambdaExecutor, LambdaInvocationRequest,
-        LambdaInvocationResult, LambdaPackageType, ReceiveMessageInput,
-        SnsScope, SqsScope,
+        CreateFunctionUrlConfigInput, CreateHttpApiDeploymentInput,
+        CreateHttpApiInput, CreateHttpApiIntegrationInput,
+        CreateHttpApiRouteInput, CreateHttpApiStageInput, CreateQueueInput,
+        CreateResourceInput, CreateRestApiInput, CreateStageInput,
+        CreateTopicInput, LambdaCodeInput, LambdaExecutor,
+        LambdaFunctionUrlAuthType, LambdaFunctionUrlInvokeMode,
+        LambdaInvocationRequest, LambdaInvocationResult, LambdaPackageType,
+        LambdaScope, ReceiveMessageInput, SnsScope, SqsScope,
     };
+    use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
+    use time::OffsetDateTime;
 
     const PROVIDED_BOOTSTRAP_ZIP_BASE64: &str = "UEsDBBQAAAAAAAAAIQCEK9lNDgAAAA4AAAAJAAAAYm9vdHN0cmFwIyEvYmluL3NoCmNhdApQSwECFAMUAAAAAAAAACEAhCvZTQ4AAAAOAAAACQAAAAAAAAAAAAAA7QEAAAAAYm9vdHN0cmFwUEsFBgAAAAABAAEANwAAADUAAAAAAA==";
+
+    fn provided_bootstrap_zip() -> Vec<u8> {
+        BASE64_STANDARD
+            .decode(PROVIDED_BOOTSTRAP_ZIP_BASE64)
+            .expect("provided bootstrap ZIP fixture should decode")
+    }
 
     fn router() -> EdgeRouter {
         test_runtime::router("http-runtime")
@@ -2020,6 +2140,32 @@ mod tests {
         )
     }
 
+    fn alternate_apigateway_scope() -> ApiGatewayScope {
+        ApiGatewayScope::new(
+            "111111111111".parse().expect("account should parse"),
+            "eu-west-2".parse().expect("region should parse"),
+        )
+    }
+
+    fn alternate_lambda_scope() -> LambdaScope {
+        LambdaScope::new(
+            "111111111111".parse().expect("account should parse"),
+            "us-east-1".parse().expect("region should parse"),
+        )
+    }
+
+    fn iam_scope(scope: &ApiGatewayScope) -> IamScope {
+        IamScope::new(scope.account_id().clone(), scope.region().clone())
+    }
+
+    fn lambda_iam_scope(scope: &LambdaScope) -> IamScope {
+        IamScope::new(scope.account_id().clone(), scope.region().clone())
+    }
+
+    fn role_arn_for(scope: &LambdaScope) -> String {
+        format!("arn:aws:iam::{}:role/lambda-role", scope.account_id())
+    }
+
     fn deploy_execute_api(
         runtime: &RuntimeServices,
         integration_type: &str,
@@ -2027,9 +2173,26 @@ mod tests {
         request_templates: BTreeMap<String, String>,
         disable_default_endpoint: bool,
     ) -> String {
-        let scope = apigateway_scope();
+        deploy_execute_api_in_scope(
+            runtime,
+            &apigateway_scope(),
+            integration_type,
+            uri,
+            request_templates,
+            disable_default_endpoint,
+        )
+    }
+
+    fn deploy_execute_api_in_scope(
+        runtime: &RuntimeServices,
+        scope: &ApiGatewayScope,
+        integration_type: &str,
+        uri: Option<String>,
+        request_templates: BTreeMap<String, String>,
+        disable_default_endpoint: bool,
+    ) -> String {
         let api = runtime.apigateway().create_rest_api(
-            &scope,
+            scope,
             CreateRestApiInput {
                 binary_media_types: Vec::new(),
                 description: None,
@@ -2041,14 +2204,14 @@ mod tests {
         );
         let api = api.expect("REST API should create");
         let resource = runtime.apigateway().create_resource(
-            &scope,
+            scope,
             &api.id,
             &api.root_resource_id,
             CreateResourceInput { path_part: "pets".to_owned() },
         );
         let resource = resource.expect("resource should create");
         let method = runtime.apigateway().put_method(
-            &scope,
+            scope,
             &api.id,
             &resource.id,
             "GET",
@@ -2064,7 +2227,7 @@ mod tests {
         );
         method.expect("method should create");
         let integration = runtime.apigateway().put_integration(
-            &scope,
+            scope,
             &api.id,
             &resource.id,
             "GET",
@@ -2094,7 +2257,7 @@ mod tests {
         );
         integration.expect("integration should create");
         let deployment = runtime.apigateway().create_deployment(
-            &scope,
+            scope,
             &api.id,
             CreateDeploymentInput {
                 description: None,
@@ -2105,7 +2268,7 @@ mod tests {
         );
         let deployment = deployment.expect("deployment should create");
         let stage = runtime.apigateway().create_stage(
-            &scope,
+            scope,
             &api.id,
             CreateStageInput {
                 cache_cluster_enabled: None,
@@ -2301,6 +2464,154 @@ mod tests {
         request.extend_from_slice(body);
 
         request
+    }
+
+    fn create_access_key_for_scope(
+        runtime: &RuntimeServices,
+        scope: &ApiGatewayScope,
+        user_name: &str,
+    ) -> (String, String) {
+        runtime
+            .iam()
+            .create_user(
+                &iam_scope(scope),
+                CreateUserInput {
+                    path: "/".to_owned(),
+                    tags: Vec::new(),
+                    user_name: user_name.to_owned(),
+                },
+            )
+            .expect("IAM user should create");
+        let access_key = runtime
+            .iam()
+            .create_access_key(&iam_scope(scope), user_name)
+            .expect("access key should create");
+
+        (access_key.access_key_id, access_key.secret_access_key)
+    }
+
+    fn ensure_lambda_role(runtime: &RuntimeServices, scope: &LambdaScope) {
+        runtime
+            .iam()
+            .create_role(
+                &lambda_iam_scope(scope),
+                CreateRoleInput {
+                    assume_role_policy_document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#.to_owned(),
+                    description: String::new(),
+                    max_session_duration: 3_600,
+                    path: "/".to_owned(),
+                    role_name: "lambda-role".to_owned(),
+                    tags: Vec::new(),
+                },
+            )
+            .expect("lambda execution role should create");
+    }
+
+    fn signed_execute_api_request(
+        host: &str,
+        path: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        region: &str,
+    ) -> Vec<u8> {
+        let now = OffsetDateTime::now_utc();
+        let amz_date = format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+            now.year(),
+            u8::from(now.month()),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second(),
+        );
+        let scope_date = &amz_date[..8];
+        let request_target = path.split_once('?');
+        let canonical_uri = request_target.map(|(uri, _)| uri).unwrap_or(path);
+        let canonical_query =
+            request_target.map(|(_, query)| query).unwrap_or("");
+        let signed_headers = "host;x-amz-date";
+        let canonical_request = format!(
+            "GET\n{canonical_uri}\n{canonical_query}\nhost:{host}\nx-amz-date:{amz_date}\n\n{signed_headers}\n{}",
+            hash_hex(b""),
+        );
+        let signature = build_signature(
+            secret_access_key,
+            scope_date,
+            region,
+            "apigateway",
+            &amz_date,
+            &canonical_request,
+        );
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/{scope_date}/{region}/apigateway/aws4_request, SignedHeaders={signed_headers}, Signature={signature}",
+        );
+
+        execute_api_request(
+            "GET",
+            host,
+            path,
+            &[
+                ("X-Amz-Date", amz_date.as_str()),
+                ("Authorization", &authorization),
+            ],
+            b"",
+        )
+    }
+
+    fn build_signature(
+        secret_access_key: &str,
+        date: &str,
+        region: &str,
+        service: &str,
+        amz_date: &str,
+        canonical_request: &str,
+    ) -> String {
+        let scope = format!("{date}/{region}/{service}/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            hash_hex(canonical_request.as_bytes()),
+        );
+        let signing_key =
+            signing_key(secret_access_key, date, region, service);
+
+        hex_encode(&hmac_bytes(&signing_key, string_to_sign.as_bytes()))
+    }
+
+    fn signing_key(
+        secret_access_key: &str,
+        date: &str,
+        region: &str,
+        service: &str,
+    ) -> [u8; 32] {
+        let date_key = hmac_bytes(
+            format!("AWS4{secret_access_key}").as_bytes(),
+            date.as_bytes(),
+        );
+        let region_key = hmac_bytes(&date_key, region.as_bytes());
+        let service_key = hmac_bytes(&region_key, service.as_bytes());
+        hmac_bytes(&service_key, b"aws4_request")
+    }
+
+    fn hmac_bytes(key: &[u8], data: &[u8]) -> [u8; 32] {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key");
+        mac.update(data);
+        mac.finalize().into_bytes().into()
+    }
+
+    fn hash_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex_encode(&hasher.finalize())
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}")
+                .expect("hex encoding should write to String");
+        }
+        encoded
     }
 
     fn lambda_integration_uri(function_name: &str) -> String {
@@ -3302,6 +3613,84 @@ mod tests {
     }
 
     #[test]
+    fn apigw_runtime_signed_requests_resolve_execute_api_hosts_outside_the_default_account()
+     {
+        let backend = CapturingHttpServer::spawn(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Upstream: scoped\r\nContent-Length: 6\r\nConnection: close\r\n\r\nscoped".to_vec(),
+        );
+        let (router, runtime) =
+            router_with_runtime("apigw-runtime-cross-account-signed");
+        let alternate_scope = alternate_apigateway_scope();
+        let (access_key_id, secret_access_key) =
+            create_access_key_for_scope(&runtime, &alternate_scope, "scoped");
+        let api_id = deploy_execute_api_in_scope(
+            &runtime,
+            &alternate_scope,
+            "HTTP_PROXY",
+            Some(format!(
+                "http://127.0.0.1:{}/backend",
+                backend.address().port()
+            )),
+            BTreeMap::new(),
+            false,
+        );
+
+        let response = router.handle_bytes(&signed_execute_api_request(
+            &format!("{api_id}.execute-api.localhost"),
+            "/dev/pets",
+            &access_key_id,
+            &secret_access_key,
+            "eu-west-2",
+        ));
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+        let captured = backend.join();
+
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(header_value(&headers, "x-upstream"), Some("scoped"));
+        assert_eq!(body, b"scoped");
+        assert!(captured.starts_with("GET /backend HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn apigw_runtime_unsigned_requests_resolve_execute_api_hosts_outside_the_default_account()
+     {
+        let backend = CapturingHttpServer::spawn(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Upstream: public\r\nContent-Length: 6\r\nConnection: close\r\n\r\npublic".to_vec(),
+        );
+        let (router, runtime) =
+            router_with_runtime("apigw-runtime-cross-account-unsigned");
+        let alternate_scope = alternate_apigateway_scope();
+        let api_id = deploy_execute_api_in_scope(
+            &runtime,
+            &alternate_scope,
+            "HTTP_PROXY",
+            Some(format!(
+                "http://127.0.0.1:{}/backend",
+                backend.address().port()
+            )),
+            BTreeMap::new(),
+            false,
+        );
+
+        let response = router.handle_bytes(&execute_api_request(
+            "GET",
+            &format!("{api_id}.execute-api.localhost"),
+            "/dev/pets",
+            &[],
+            b"",
+        ));
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+        let captured = backend.join();
+
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(header_value(&headers, "x-upstream"), Some("public"));
+        assert_eq!(body, b"public");
+        assert!(captured.starts_with("GET /backend HTTP/1.1\r\n"));
+    }
+
+    #[test]
     fn apigw_v2_runtime_route_precedence_and_default_stage_forward_requests() {
         let exact_server = CapturingHttpServer::spawn(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Upstream: exact\r\nContent-Length: 5\r\nConnection: close\r\n\r\nexact".to_vec(),
@@ -3389,7 +3778,7 @@ mod tests {
             "apigw-v1-runtime-lambda",
             executor.clone(),
         );
-        let lambda_scope = services::LambdaScope::new(
+        let lambda_scope = LambdaScope::new(
             "000000000000".parse().expect("account should parse"),
             "eu-west-2".parse().expect("region should parse"),
         );
@@ -3484,6 +3873,94 @@ mod tests {
     }
 
     #[test]
+    fn lambda_url_runtime_public_hosts_resolve_the_owning_scope() {
+        let executor = Arc::new(RecordingLambdaExecutor::default());
+        let (router, runtime) = router_with_lambda_executor(
+            "lambda-url-runtime-cross-account",
+            executor,
+        );
+        let alternate_scope = alternate_lambda_scope();
+        ensure_lambda_role(&runtime, &alternate_scope);
+        runtime
+            .lambda()
+            .create_function(
+                &alternate_scope,
+                CreateFunctionInput {
+                    code: LambdaCodeInput::InlineZip {
+                        archive: provided_bootstrap_zip(),
+                    },
+                    dead_letter_target_arn: None,
+                    description: None,
+                    environment: BTreeMap::new(),
+                    function_name: "public-url".to_owned(),
+                    handler: Some("bootstrap.handler".to_owned()),
+                    memory_size: None,
+                    package_type: LambdaPackageType::Zip,
+                    publish: false,
+                    role: role_arn_for(&alternate_scope),
+                    runtime: Some("provided.al2".to_owned()),
+                    timeout: None,
+                },
+            )
+            .expect("lambda should create");
+        let url_config = runtime
+            .lambda()
+            .create_function_url_config(
+                &alternate_scope,
+                "public-url",
+                None,
+                CreateFunctionUrlConfigInput {
+                    auth_type: LambdaFunctionUrlAuthType::None,
+                    invoke_mode: LambdaFunctionUrlInvokeMode::Buffered,
+                },
+            )
+            .expect("function URL should create");
+        runtime
+            .lambda()
+            .add_permission(
+                &alternate_scope,
+                "public-url",
+                None,
+                AddLambdaPermissionInput {
+                    action: "lambda:InvokeFunctionUrl".to_owned(),
+                    function_url_auth_type: Some(
+                        LambdaFunctionUrlAuthType::None,
+                    ),
+                    principal: "*".to_owned(),
+                    revision_id: None,
+                    source_arn: None,
+                    statement_id: "allow-public".to_owned(),
+                },
+            )
+            .expect("function URL permission should create");
+
+        let response = router.handle_bytes(&execute_api_request(
+            "POST",
+            &format!(
+                "{}.lambda-url.{}.localhost",
+                url_config.url_id(),
+                alternate_scope.region().as_str(),
+            ),
+            "/custom/path?mode=test",
+            &[],
+            br#"{"hello":"world"}"#,
+        ));
+        let response_bytes = response.to_http_bytes();
+        let (status, _, body) = split_response(&response_bytes);
+        let event: Value = serde_json::from_slice(body)
+            .expect("function URL body should decode");
+
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(event["rawPath"], "/custom/path");
+        assert_eq!(event["rawQueryString"], "mode=test");
+        assert_eq!(event["requestContext"]["accountId"], "111111111111");
+        assert_eq!(
+            event["requestContext"]["domainPrefix"],
+            url_config.url_id()
+        );
+    }
+
+    #[test]
     fn runtime_health_and_status_endpoints_return_internal_json() {
         let health = router().handle_bytes(
             b"GET /__cloudish/health HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -3546,7 +4023,7 @@ mod tests {
     }
 
     #[test]
-    fn lambda_url_runtime_host_based_invocation_round_trips_plain_http() {
+    fn lambda_url_runtime_reserved_path_invocation_round_trips_plain_http() {
         let router = router();
         let create_function_body = json!({
             "Code": {
@@ -3582,8 +4059,8 @@ mod tests {
             .as_str()
             .expect("function URL should be returned")
             .to_owned();
-        let function_url_host = function_url
-            .trim_start_matches("http://")
+        let function_url_path = function_url
+            .trim_start_matches("http://localhost:4566")
             .trim_end_matches('/')
             .to_owned();
 
@@ -3598,7 +4075,7 @@ mod tests {
         assert_eq!(permission_status, "HTTP/1.1 201 Created");
 
         let invoke_request = format!(
-            "POST /custom/path?mode=test HTTP/1.1\r\nHost: {function_url_host}\r\nContent-Type: application/json\r\nCookie: theme=light\r\nContent-Length: 17\r\n\r\n{{\"hello\":\"world\"}}"
+            "POST {function_url_path}/custom/path?mode=test HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/json\r\nCookie: theme=light\r\nContent-Length: 17\r\n\r\n{{\"hello\":\"world\"}}"
         )
         .into_bytes();
         let invoke = router.handle_bytes(&invoke_request);
@@ -3615,10 +4092,7 @@ mod tests {
         assert_eq!(event["rawPath"], "/custom/path");
         assert_eq!(event["rawQueryString"], "mode=test");
         assert_eq!(event["cookies"][0], "theme=light");
-        assert_eq!(
-            event["requestContext"]["domainName"],
-            function_url_host.split(':').next().unwrap()
-        );
+        assert_eq!(event["requestContext"]["domainName"], "localhost:4566");
         assert_eq!(event["queryStringParameters"]["mode"], "test");
     }
 

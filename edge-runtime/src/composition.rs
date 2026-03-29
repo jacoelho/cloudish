@@ -8,7 +8,7 @@ use apigateway::{
     map_lambda_proxy_response_v2,
 };
 use aws::ServiceName;
-use aws::{Arn, HttpForwardRequest, HttpForwarder};
+use aws::{Arn, HttpForwardRequest, HttpForwarder, SharedAdvertisedEdge};
 #[cfg(feature = "lambda")]
 use aws::{BackgroundScheduler, InfrastructureError};
 #[cfg(feature = "eventbridge")]
@@ -164,6 +164,7 @@ impl ExecuteApiIntegrationExecutor for ApiGatewayIntegrationExecutor {
 #[cfg(feature = "sns")]
 #[derive(Clone, Default)]
 pub struct SnsServiceDependencies {
+    pub advertised_edge: SharedAdvertisedEdge,
     pub http_forwarder: Option<Arc<dyn HttpForwarder + Send + Sync>>,
     pub lambda: Option<LambdaService>,
     pub sqs: Option<SqsService>,
@@ -171,10 +172,12 @@ pub struct SnsServiceDependencies {
 
 #[cfg(feature = "sns")]
 pub fn build_sns_service(
+    advertised_edge: SharedAdvertisedEdge,
     time_source: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     identifier_source: Arc<dyn SnsIdentifierSource + Send + Sync>,
-    dependencies: SnsServiceDependencies,
+    mut dependencies: SnsServiceDependencies,
 ) -> SnsService {
+    dependencies.advertised_edge = advertised_edge;
     SnsService::with_transport(
         time_source,
         identifier_source,
@@ -298,25 +301,21 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
     fn deliver_confirmation(
         &self,
         delivery: &ConfirmationDelivery,
-        confirmation_base_url: Option<&str>,
         message_id: String,
         timestamp: String,
     ) {
         let Some(forwarder) = self.dependencies.http_forwarder.as_ref() else {
             return;
         };
+        let advertised_edge = self.dependencies.advertised_edge.current();
         let body = serde_json::json!({
             "Type": "SubscriptionConfirmation",
             "MessageId": message_id,
             "Token": delivery.token,
             "TopicArn": delivery.topic_arn,
             "Timestamp": timestamp,
-            "SubscribeURL": format!(
-                "{}/?Action=ConfirmSubscription&TopicArn={}&Token={}",
-                confirmation_base_url.unwrap_or("http://localhost:4566"),
-                urlencoding::encode(&delivery.topic_arn.to_string()),
-                urlencoding::encode(&delivery.token),
-            ),
+            "SubscribeURL": advertised_edge
+                .sns_confirm_subscription_url(&delivery.topic_arn, &delivery.token),
         })
         .to_string()
         .into_bytes();
@@ -332,6 +331,7 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
     }
 
     fn deliver_notification(&self, delivery: &PlannedDelivery) {
+        let advertised_edge = self.dependencies.advertised_edge.current();
         match &delivery.endpoint {
             DeliveryEndpoint::Http(parsed) => {
                 let Some(forwarder) =
@@ -347,9 +347,10 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
                     )
                     .with_header("Content-Type", "text/plain; charset=UTF-8")
                     .with_body(
-                        delivery
-                            .payload
-                            .http_body(delivery.raw_message_delivery),
+                        delivery.payload.http_body(
+                            delivery.raw_message_delivery,
+                            &advertised_edge,
+                        ),
                     ),
                 );
             }
@@ -369,7 +370,9 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
                     None,
                     InvokeInput {
                         invocation_type: LambdaInvocationType::Event,
-                        payload: delivery.payload.lambda_event(),
+                        payload: delivery
+                            .payload
+                            .lambda_event(&advertised_edge),
                     },
                 );
             }
@@ -384,9 +387,10 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
                 let _ = sqs.send_message(
                     &queue,
                     SendMessageInput {
-                        body: delivery
-                            .payload
-                            .sqs_body(delivery.raw_message_delivery),
+                        body: delivery.payload.sqs_body(
+                            delivery.raw_message_delivery,
+                            &advertised_edge,
+                        ),
                         delay_seconds: None,
                         message_deduplication_id: delivery
                             .payload
@@ -753,6 +757,7 @@ mod tests {
         AccountId, Arn, BackgroundScheduler, HttpForwardResponse,
         HttpForwarder, InfrastructureError, LambdaExecutor,
         LambdaInvocationRequest, LambdaInvocationResult, RegionId,
+        SharedAdvertisedEdge,
     };
     use iam::{CreateRoleInput, IamScope, IamService};
     use lambda::{
@@ -1117,9 +1122,11 @@ mod tests {
         )
         .expect("lambda service should build");
         let sns = build_sns_service(
+            SharedAdvertisedEdge::default(),
             Arc::new(|| UNIX_EPOCH + Duration::from_secs(1)),
             Arc::new(sns::SequentialSnsIdentifierSource::default()),
             SnsServiceDependencies {
+                advertised_edge: SharedAdvertisedEdge::default(),
                 http_forwarder: Some(Arc::clone(&forwarder)
                     as Arc<dyn HttpForwarder + Send + Sync>),
                 lambda: Some(lambda),
@@ -1136,16 +1143,13 @@ mod tests {
             )
             .expect("topic should create");
 
-        sns.subscribe(
-            SubscribeInput {
-                attributes: BTreeMap::new(),
-                endpoint: "http://example.com/hooks".to_owned(),
-                protocol: "http".to_owned(),
-                return_subscription_arn: false,
-                topic_arn: topic_arn.clone(),
-            },
-            None,
-        )
+        sns.subscribe(SubscribeInput {
+            attributes: BTreeMap::new(),
+            endpoint: "http://example.com/hooks".to_owned(),
+            protocol: "http".to_owned(),
+            return_subscription_arn: false,
+            topic_arn: topic_arn.clone(),
+        })
         .expect("http subscription should create");
         let confirmation = forwarder.bodies();
         let confirmation_body =

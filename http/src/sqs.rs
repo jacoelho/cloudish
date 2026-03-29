@@ -5,7 +5,8 @@ use crate::query::{
 use crate::request::HttpRequest;
 use crate::xml::XmlBuilder;
 use aws::{
-    AccountId, Arn, AwsError, AwsErrorFamily, RequestContext, ServiceName,
+    AccountId, AdvertisedEdge, Arn, AwsError, AwsErrorFamily, RequestContext,
+    ServiceName,
 };
 use serde_json::{Map, Value, json};
 use services::{
@@ -52,6 +53,7 @@ pub(crate) fn is_sqs_action(action: &str) -> bool {
 
 pub(crate) fn handle_query(
     sqs: &SqsService,
+    advertised_edge: &AdvertisedEdge,
     request: &HttpRequest<'_>,
     context: &RequestContext,
 ) -> Result<String, AwsError> {
@@ -77,7 +79,7 @@ pub(crate) fn handle_query(
             Ok(response_with_result(
                 action,
                 &XmlBuilder::new()
-                    .elem("QueueUrl", &queue_url(request, &queue))
+                    .elem("QueueUrl", &queue_url(advertised_edge, &queue))
                     .build(),
             ))
         }
@@ -99,7 +101,7 @@ pub(crate) fn handle_query(
             Ok(response_with_result(
                 action,
                 &XmlBuilder::new()
-                    .elem("QueueUrl", &queue_url(request, &queue))
+                    .elem("QueueUrl", &queue_url(advertised_edge, &queue))
                     .build(),
             ))
         }
@@ -143,7 +145,8 @@ pub(crate) fn handle_query(
                 sqs.list_queues(&scope, params.optional("QueueNamePrefix"));
             let mut xml = XmlBuilder::new();
             for queue in queues {
-                xml = xml.elem("QueueUrl", &queue_url(request, &queue));
+                xml =
+                    xml.elem("QueueUrl", &queue_url(advertised_edge, &queue));
             }
 
             Ok(response_with_result(action, &xml.build()))
@@ -308,7 +311,8 @@ pub(crate) fn handle_query(
                 .map_err(|error| error.to_aws_error())?;
             let mut xml = XmlBuilder::new();
             for source in sources {
-                xml = xml.elem("QueueUrl", &queue_url(request, &source));
+                xml =
+                    xml.elem("QueueUrl", &queue_url(advertised_edge, &source));
             }
 
             Ok(response_with_result(action, &xml.build()))
@@ -398,6 +402,7 @@ pub(crate) fn handle_query(
 
 pub(crate) fn handle_json(
     sqs: &SqsService,
+    advertised_edge: &AdvertisedEdge,
     request: &HttpRequest<'_>,
     context: &RequestContext,
 ) -> Result<Vec<u8>, AwsError> {
@@ -423,7 +428,7 @@ pub(crate) fn handle_json(
                 )
                 .map_err(|error| error.to_aws_error())?;
 
-            json!({ "QueueUrl": queue_url(request, &queue) })
+            json!({ "QueueUrl": queue_url(advertised_edge, &queue) })
         }
         "DeleteQueue" => {
             let queue = queue_identity_from_request(
@@ -443,7 +448,7 @@ pub(crate) fn handle_json(
                 )
                 .map_err(|error| error.to_aws_error())?;
 
-            json!({ "QueueUrl": queue_url(request, &queue) })
+            json!({ "QueueUrl": queue_url(advertised_edge, &queue) })
         }
         "GetQueueAttributes" => {
             let queue = queue_identity_from_request(
@@ -480,7 +485,7 @@ pub(crate) fn handle_json(
             );
             let urls = queues
                 .into_iter()
-                .map(|queue| Value::String(queue_url(request, &queue)))
+                .map(|queue| Value::String(queue_url(advertised_edge, &queue)))
                 .collect::<Vec<_>>();
 
             json!({ "QueueUrls": urls })
@@ -641,7 +646,7 @@ pub(crate) fn handle_json(
                 .map_err(|error| error.to_aws_error())?;
             let queue_urls = sources
                 .into_iter()
-                .map(|queue| Value::String(queue_url(request, &queue)))
+                .map(|queue| Value::String(queue_url(advertised_edge, &queue)))
                 .collect::<Vec<_>>();
 
             json!({ "queueUrls": queue_urls })
@@ -782,9 +787,11 @@ fn queue_path<'a>(request: &'a HttpRequest<'_>) -> Option<&'a str> {
     if path == "/" || path.is_empty() { None } else { Some(path) }
 }
 
-fn queue_url(request: &HttpRequest<'_>, queue: &SqsQueueIdentity) -> String {
-    let host = request.header("host").unwrap_or("localhost:4566").trim();
-    format!("http://{host}/{}/{}", queue.account_id(), queue.queue_name())
+fn queue_url(
+    advertised_edge: &AdvertisedEdge,
+    queue: &SqsQueueIdentity,
+) -> String {
+    advertised_edge.sqs_queue_url(queue.account_id(), queue.queue_name())
 }
 
 fn query_list(params: &QueryParameters, prefix: &str) -> Vec<String> {
@@ -1614,11 +1621,9 @@ mod tests {
     }
 
     #[test]
-    fn sqs_standard_queue_url_helper_uses_host_header() {
-        let request = crate::request::HttpRequest::parse(
-            b"POST / HTTP/1.1\r\nHost: localhost:9999\r\n\r\n",
-        )
-        .expect("request should parse");
+    fn sqs_standard_queue_url_helper_uses_advertised_edge() {
+        let advertised_edge =
+            aws::AdvertisedEdge::new("http", "localhost", 9999);
         let queue = SqsQueueIdentity::new(
             "000000000000".parse().expect("account should parse"),
             "eu-west-2".parse().expect("region should parse"),
@@ -1627,7 +1632,7 @@ mod tests {
         .expect("queue identity should build");
 
         assert_eq!(
-            queue_url(&request, &queue),
+            queue_url(&advertised_edge, &queue),
             "http://localhost:9999/000000000000/orders"
         );
         assert!(matches!(
@@ -1856,6 +1861,7 @@ mod tests {
 
     #[test]
     fn sqs_standard_internal_helpers_report_explicit_errors() {
+        let advertised_edge = aws::AdvertisedEdge::default();
         let query_context = context(ProtocolFamily::Query, "MissingAction");
         let json_context = context(ProtocolFamily::AwsJson10, "ListQueues");
 
@@ -1865,6 +1871,7 @@ mod tests {
                 .expect("request should parse");
         let missing_action = super::handle_query(
             &SqsService::default(),
+            &advertised_edge,
             &missing_action_request,
             &query_context,
         )
@@ -1877,6 +1884,7 @@ mod tests {
                 .expect("request should parse");
         let unsupported_query = super::handle_query(
             &SqsService::default(),
+            &advertised_edge,
             &unsupported_query_request,
             &query_context,
         )
@@ -1889,6 +1897,7 @@ mod tests {
         .expect("request should parse");
         let missing_target = super::handle_json(
             &SqsService::default(),
+            &advertised_edge,
             &missing_target_request,
             &json_context,
         )
@@ -1901,6 +1910,7 @@ mod tests {
         .expect("request should parse");
         let invalid_json = super::handle_json(
             &SqsService::default(),
+            &advertised_edge,
             &invalid_json_request,
             &json_context,
         )

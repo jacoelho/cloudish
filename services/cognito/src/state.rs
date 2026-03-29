@@ -37,7 +37,7 @@ use crate::{
         ListUsersInput, ListUsersOutput, SignUpInput, SignUpOutput,
     },
 };
-use aws::{AccountId, Clock, RegionId};
+use aws::{AccountId, Clock, RegionId, SharedAdvertisedEdge};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ring::{rand::SystemRandom, rsa, signature};
@@ -69,20 +69,50 @@ static SIGNING_PUBLIC_KEY_MODULUS: OnceLock<Result<Vec<u8>, String>> =
 
 #[derive(Clone)]
 pub struct CognitoService {
+    advertised_edge: SharedAdvertisedEdge,
     clock: Arc<dyn Clock>,
     state_store: StorageHandle<CognitoStateKey, StoredCognitoState>,
 }
 
 impl CognitoService {
     pub fn new(factory: &StorageFactory, clock: Arc<dyn Clock>) -> Self {
-        Self::with_store(clock, factory.create("cognito", "control-plane"))
+        Self::with_advertised_edge(
+            factory,
+            clock,
+            SharedAdvertisedEdge::default(),
+        )
     }
 
+    pub fn with_advertised_edge(
+        factory: &StorageFactory,
+        clock: Arc<dyn Clock>,
+        advertised_edge: SharedAdvertisedEdge,
+    ) -> Self {
+        Self::with_store_and_advertised_edge(
+            clock,
+            factory.create("cognito", "control-plane"),
+            advertised_edge,
+        )
+    }
+
+    #[cfg(test)]
     fn with_store(
         clock: Arc<dyn Clock>,
         state_store: StorageHandle<CognitoStateKey, StoredCognitoState>,
     ) -> Self {
-        Self { clock, state_store }
+        Self::with_store_and_advertised_edge(
+            clock,
+            state_store,
+            SharedAdvertisedEdge::default(),
+        )
+    }
+
+    fn with_store_and_advertised_edge(
+        clock: Arc<dyn Clock>,
+        state_store: StorageHandle<CognitoStateKey, StoredCognitoState>,
+        advertised_edge: SharedAdvertisedEdge,
+    ) -> Self {
+        Self { advertised_edge, clock, state_store }
     }
 
     /// # Errors
@@ -622,7 +652,6 @@ impl CognitoService {
     pub fn initiate_auth(
         &self,
         scope: &CognitoScope,
-        host: &str,
         input: InitiateAuthInput,
     ) -> Result<InitiateAuthOutput, CognitoError> {
         let auth_flow = parse_auth_flow(&input.auth_flow)?;
@@ -643,7 +672,6 @@ impl CognitoService {
         let output = self.finalize_auth_transition(
             scope,
             &mut state,
-            host,
             &input.client_id,
             transition,
         )?;
@@ -659,7 +687,6 @@ impl CognitoService {
     pub fn admin_initiate_auth(
         &self,
         scope: &CognitoScope,
-        host: &str,
         input: AdminInitiateAuthInput,
     ) -> Result<AdminInitiateAuthOutput, CognitoError> {
         let auth_flow = parse_auth_flow(&input.auth_flow)?;
@@ -683,7 +710,6 @@ impl CognitoService {
         let output = self.finalize_auth_transition(
             scope,
             &mut state,
-            host,
             &input.client_id,
             transition,
         )?;
@@ -699,7 +725,6 @@ impl CognitoService {
     pub fn respond_to_auth_challenge(
         &self,
         scope: &CognitoScope,
-        host: &str,
         input: RespondToAuthChallengeInput,
     ) -> Result<RespondToAuthChallengeOutput, CognitoError> {
         validate_non_empty("Session", &input.session)?;
@@ -770,7 +795,6 @@ impl CognitoService {
         let output = self.finalize_auth_transition(
             scope,
             &mut state,
-            host,
             &input.client_id,
             transition,
         )?;
@@ -874,13 +898,12 @@ impl CognitoService {
     /// its issuer metadata cannot be persisted.
     pub fn open_id_configuration(
         &self,
-        host: &str,
         user_pool_id: &CognitoUserPoolId,
     ) -> Result<CognitoOpenIdConfiguration, CognitoError> {
         let (scope, mut state) = self.load_state_for_pool_id(user_pool_id)?;
         let issuer = {
             let pool = user_pool_mut(&mut state, user_pool_id)?;
-            ensure_pool_issuer(pool, host)?
+            ensure_pool_issuer(pool, &self.advertised_edge.current())?
         };
         let configuration = CognitoOpenIdConfiguration {
             claims_supported: vec![
@@ -898,7 +921,10 @@ impl CognitoService {
             ],
             id_token_signing_alg_values_supported: vec!["RS256".to_owned()],
             issuer: issuer.clone(),
-            jwks_uri: format!("{issuer}/.well-known/jwks.json"),
+            jwks_uri: self
+                .advertised_edge
+                .current()
+                .cognito_jwks_uri(user_pool_id.as_str()),
             subject_types_supported: vec!["public".to_owned()],
         };
         self.state_store.put(scope, state).map_err(CognitoError::from)?;
@@ -912,13 +938,12 @@ impl CognitoService {
     /// its issuer metadata cannot be persisted.
     pub fn jwks_document(
         &self,
-        host: &str,
         user_pool_id: &CognitoUserPoolId,
     ) -> Result<CognitoJwksDocument, CognitoError> {
         let (scope, mut state) = self.load_state_for_pool_id(user_pool_id)?;
         {
             let pool = user_pool_mut(&mut state, user_pool_id)?;
-            let _ = ensure_pool_issuer(pool, host)?;
+            let _ = ensure_pool_issuer(pool, &self.advertised_edge.current())?;
         }
         let document = CognitoJwksDocument {
             keys: vec![CognitoJwk {
@@ -1021,7 +1046,6 @@ impl CognitoService {
         &self,
         scope: &CognitoScope,
         state: &mut StoredCognitoState,
-        host: &str,
         client_id: &CognitoUserPoolClientId,
         transition: AuthTransition,
     ) -> Result<InitiateAuthOutput, CognitoError> {
@@ -1065,7 +1089,7 @@ impl CognitoService {
             AuthTransition::Authenticated { user_pool_id, username } => {
                 let issuer = {
                     let pool = user_pool_mut(state, &user_pool_id)?;
-                    ensure_pool_issuer(pool, host)?
+                    ensure_pool_issuer(pool, &self.advertised_edge.current())?
                 };
                 let user = user(state, &user_pool_id, &username)?.clone();
                 let tokens = self.issue_auth_tokens(
@@ -1218,13 +1242,13 @@ impl CognitoService {
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
 )]
-struct CognitoStateKey {
+pub(crate) struct CognitoStateKey {
     account_id: AccountId,
     region: RegionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-struct StoredCognitoState {
+pub(crate) struct StoredCognitoState {
     auth_sessions: BTreeMap<String, StoredAuthSession>,
     issued_tokens: BTreeMap<String, StoredIssuedToken>,
     next_auth_session_sequence: u64,
@@ -1717,17 +1741,16 @@ fn required_parameter<'a>(
 
 fn ensure_pool_issuer(
     pool: &mut StoredUserPool,
-    host: &str,
+    advertised_edge: &aws::AdvertisedEdge,
 ) -> Result<String, CognitoError> {
     if let Some(issuer_origin) = pool.issuer_origin.clone() {
         return Ok(format!("{issuer_origin}/{}", pool.id));
     }
 
-    validate_non_empty("Host", host)?;
-    let origin = format!("http://{}", host.trim());
+    let origin = advertised_edge.origin();
     pool.issuer_origin = Some(origin.clone());
 
-    Ok(format!("{origin}/{}", pool.id))
+    Ok(advertised_edge.cognito_issuer(pool.id.as_str()))
 }
 
 fn build_session_id(
@@ -2347,7 +2370,6 @@ mod tests {
         let auth = service
             .initiate_auth(
                 &scope,
-                "127.0.0.1:4566",
                 InitiateAuthInput {
                     auth_flow: "USER_PASSWORD_AUTH".to_owned(),
                     auth_parameters: BTreeMap::from([
@@ -2388,15 +2410,15 @@ mod tests {
             .expect("change password should succeed");
 
         let open_id = service
-            .open_id_configuration("127.0.0.1:4566", &pool_id)
+            .open_id_configuration(&pool_id)
             .expect("openid configuration should resolve");
-        assert_eq!(open_id.issuer, format!("http://127.0.0.1:4566/{pool_id}"));
+        assert_eq!(open_id.issuer, format!("http://localhost:4566/{pool_id}"));
         assert_eq!(
             open_id.jwks_uri,
-            format!("http://127.0.0.1:4566/{pool_id}/.well-known/jwks.json")
+            format!("http://localhost:4566/{pool_id}/.well-known/jwks.json")
         );
         let jwks = service
-            .jwks_document("127.0.0.1:4566", &pool_id)
+            .jwks_document(&pool_id)
             .expect("jwks document should resolve");
         assert_eq!(jwks.keys.len(), 1);
         assert_eq!(pool_id.to_string(), jwks.keys[0].kid);
@@ -2404,7 +2426,6 @@ mod tests {
         let old_password_error = service
             .initiate_auth(
                 &scope,
-                "127.0.0.1:4566",
                 InitiateAuthInput {
                     auth_flow: "USER_PASSWORD_AUTH".to_owned(),
                     auth_parameters: BTreeMap::from([
@@ -2422,7 +2443,6 @@ mod tests {
         let updated_password = service
             .initiate_auth(
                 &scope,
-                "127.0.0.1:4566",
                 InitiateAuthInput {
                     auth_flow: "USER_PASSWORD_AUTH".to_owned(),
                     auth_parameters: BTreeMap::from([
@@ -2479,7 +2499,6 @@ mod tests {
         let challenge = service
             .admin_initiate_auth(
                 &scope,
-                "127.0.0.1:4566",
                 AdminInitiateAuthInput {
                     auth_flow: "ADMIN_USER_PASSWORD_AUTH".to_owned(),
                     auth_parameters: BTreeMap::from([
@@ -2501,7 +2520,6 @@ mod tests {
         let completed = service
             .respond_to_auth_challenge(
                 &scope,
-                "127.0.0.1:4566",
                 RespondToAuthChallengeInput {
                     challenge_name: "NEW_PASSWORD_REQUIRED".to_owned(),
                     challenge_responses: BTreeMap::from([
@@ -2582,7 +2600,6 @@ mod tests {
         let unsupported = service
             .initiate_auth(
                 &scope,
-                "127.0.0.1:4566",
                 InitiateAuthInput {
                     auth_flow: "REFRESH_TOKEN_AUTH".to_owned(),
                     auth_parameters: BTreeMap::from([(
