@@ -3848,28 +3848,24 @@ mod tests {
 
     fn assert_lambda_proxy_invocation(
         service: &ApiGatewayService,
-        scope: &ApiGatewayScope,
+        _scope: &ApiGatewayScope,
         api_id: &str,
     ) {
         let invocation = service
-            .prepare_execute_api(
-                scope,
-                &ExecuteApiRequest::new(
-                    format!("{api_id}.execute-api.localhost:443"),
-                    "GET",
-                    "/items/42",
-                )
-                .with_query_string("first=1&second=two")
-                .with_header("Cookie", "session=a; theme=dark")
-                .with_header("User-Agent", "sdk-test")
-                .with_header("X-Test", "true")
-                .with_protocol("HTTP/2")
-                .with_source_ip("203.0.113.10")
-                .with_body([0xff, 0x00]),
+            .resolve_execute_api_by_api_id(
+                api_id,
+                &ExecuteApiRequest::new("localhost:443", "GET", "/items/42")
+                    .with_query_string("first=1&second=two")
+                    .with_header("Cookie", "session=a; theme=dark")
+                    .with_header("User-Agent", "sdk-test")
+                    .with_header("X-Test", "true")
+                    .with_protocol("HTTP/2")
+                    .with_source_ip("203.0.113.10")
+                    .with_body([0xff, 0x00]),
                 None,
             )
-            .expect("host should match")
             .expect("lambda route should resolve");
+        let invocation = invocation.invocation();
 
         match invocation.integration() {
             ExecuteApiIntegrationPlan::LambdaProxy(plan) => {
@@ -3897,10 +3893,7 @@ mod tests {
                     event["requestContext"]["http"]["protocol"],
                     "HTTP/2"
                 );
-                assert_eq!(
-                    event["requestContext"]["domainName"],
-                    format!("{api_id}.execute-api.localhost")
-                );
+                assert_eq!(event["requestContext"]["domainName"], "localhost");
                 assert!(
                     event["isBase64Encoded"]
                         .as_bool()
@@ -3959,11 +3952,7 @@ mod tests {
                 scope,
                 &disabled_state,
                 "disabled12345",
-                &ExecuteApiRequest::new(
-                    "disabled12345.execute-api.localhost",
-                    "GET",
-                    "/"
-                ),
+                &ExecuteApiRequest::new("localhost", "GET", "/"),
                 None,
             ),
             Err(ExecuteApiError::Forbidden)
@@ -3993,17 +3982,14 @@ mod tests {
             stored_stage("$default", true, None),
         );
 
-        let request = ExecuteApiRequest::new(
-            "runtime12345.execute-api.localhost:8443",
-            "POST",
-            "/files/a%2Fb",
-        )
-        .with_query_string("q=2")
-        .with_header("Host", "ignore")
-        .with_header("Content-Length", "99")
-        .with_header("Connection", "keep-alive")
-        .with_header("X-Test", "value")
-        .with_body("ok");
+        let request =
+            ExecuteApiRequest::new("localhost:8443", "POST", "/files/a%2Fb")
+                .with_query_string("q=2")
+                .with_header("Host", "ignore")
+                .with_header("Content-Length", "99")
+                .with_header("Connection", "keep-alive")
+                .with_header("X-Test", "value")
+                .with_body("ok");
         let invocation = prepare_http_api_execute_api(
             scope,
             &StoredApiGatewayState {
@@ -4043,11 +4029,7 @@ mod tests {
                     ..StoredApiGatewayState::default()
                 },
                 "missing-stage",
-                &ExecuteApiRequest::new(
-                    "missing-stage.execute-api.localhost",
-                    "GET",
-                    "/",
-                ),
+                &ExecuteApiRequest::new("localhost", "GET", "/",),
                 None,
             ),
             Err(ExecuteApiError::NotFound)
@@ -4063,11 +4045,7 @@ mod tests {
                     ..StoredApiGatewayState::default()
                 },
                 "badpath123456",
-                &ExecuteApiRequest::new(
-                    "badpath123456.execute-api.localhost",
-                    "GET",
-                    "/bad/%FF",
-                ),
+                &ExecuteApiRequest::new("localhost", "GET", "/bad/%FF",),
                 None,
             ),
             Err(ExecuteApiError::BadRequest { .. })
@@ -4680,54 +4658,48 @@ mod tests {
             .expect("default stage should create");
 
         let exact_invocation = service
-            .prepare_execute_api(
-                &scope,
-                &ExecuteApiRequest::new(
-                    format!("{api_id}.execute-api.localhost"),
-                    "GET",
-                    "/pets/dog/1",
-                ),
+            .resolve_execute_api_by_api_id(
+                &api_id,
+                &ExecuteApiRequest::new("localhost", "GET", "/pets/dog/1"),
                 None,
             )
-            .expect("host should match")
             .expect("exact route should resolve");
         let greedy_invocation = service
-            .prepare_execute_api(
-                &scope,
-                &ExecuteApiRequest::new(
-                    format!("{api_id}.execute-api.localhost"),
-                    "GET",
-                    "/pets/cat/2",
-                ),
+            .resolve_execute_api_by_api_id(
+                &api_id,
+                &ExecuteApiRequest::new("localhost", "GET", "/pets/cat/2"),
                 None,
             )
-            .expect("host should match")
             .expect("greedy route should resolve");
         let default_invocation = service
-            .prepare_execute_api(
-                &scope,
-                &ExecuteApiRequest::new(
-                    format!("{api_id}.execute-api.localhost"),
-                    "POST",
-                    "/orders/5",
-                ),
+            .resolve_execute_api_by_api_id(
+                &api_id,
+                &ExecuteApiRequest::new("localhost", "POST", "/orders/5"),
                 None,
             )
-            .expect("host should match")
             .expect("default route should resolve");
 
-        assert_eq!(exact_invocation.resource_path(), "GET /pets/dog/1");
-        assert_eq!(greedy_invocation.resource_path(), "GET /pets/{proxy+}");
-        assert_eq!(default_invocation.resource_path(), "$default");
+        assert_eq!(
+            exact_invocation.invocation().resource_path(),
+            "GET /pets/dog/1"
+        );
+        assert_eq!(
+            greedy_invocation.invocation().resource_path(),
+            "GET /pets/{proxy+}"
+        );
+        assert_eq!(
+            default_invocation.invocation().resource_path(),
+            "$default"
+        );
 
-        match greedy_invocation.integration() {
+        match greedy_invocation.invocation().integration() {
             ExecuteApiIntegrationPlan::Http(request) => {
                 assert_eq!(request.endpoint().host(), "greedy.example");
                 assert_eq!(request.path(), "/base/cat%2F2");
             }
             other => panic!("expected HTTP integration, got {other:?}"),
         }
-        match default_invocation.integration() {
+        match default_invocation.invocation().integration() {
             ExecuteApiIntegrationPlan::Http(request) => {
                 assert_eq!(request.endpoint().host(), "default.example");
                 assert_eq!(request.path(), "/orders/5");

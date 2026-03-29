@@ -14,7 +14,6 @@ use tests::common::sdk;
 
 use aws_sdk_apigatewayv2::Client as ApiGatewayV2Client;
 use aws_sdk_apigatewayv2::types::{IntegrationType, ProtocolType};
-use reqwest::header::HOST;
 use runtime::RuntimeServer;
 use sdk::SdkSmokeTarget;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -139,20 +138,26 @@ async fn apigw_v2_runtime_exact_greedy_and_default_routes_resolve_in_order() {
         .expect("default stage should create");
 
     let exact_response = reqwest::Client::new()
-        .get(format!("http://{}/pets/dog/1", runtime.address()))
-        .header(HOST, format!("{api_id}.execute-api.localhost"))
+        .get(format!(
+            "http://{}/__aws/execute-api/{api_id}/pets/dog/1",
+            runtime.address()
+        ))
         .send()
         .await
         .expect("exact execute-api request should succeed");
     let greedy_response = reqwest::Client::new()
-        .get(format!("http://{}/pets/cat/2?view=full", runtime.address()))
-        .header(HOST, format!("{api_id}.execute-api.localhost"))
+        .get(format!(
+            "http://{}/__aws/execute-api/{api_id}/pets/cat/2?view=full",
+            runtime.address()
+        ))
         .send()
         .await
         .expect("greedy execute-api request should succeed");
     let default_response = reqwest::Client::new()
-        .post(format!("http://{}/orders/5", runtime.address()))
-        .header(HOST, format!("{api_id}.execute-api.localhost"))
+        .post(format!(
+            "http://{}/__aws/execute-api/{api_id}/orders/5",
+            runtime.address()
+        ))
         .body(r#"{"ok":true}"#)
         .send()
         .await

@@ -143,15 +143,28 @@ impl EdgeRouter {
             return response;
         }
 
+        if let Some(response) = self.route_custom_domain_execute_api(&request)
+        {
+            return response;
+        }
+
         if let Some(response) = self.route_function_url(&request) {
             return response;
         }
 
-        if let Some(response) = self.route_execute_api(&request) {
-            return response;
-        }
+        let Some(protocol) = detect_generic_protocol(&request) else {
+            #[cfg(feature = "s3")]
+            if s3::is_rest_xml_request(&request) {
+                let verified_signature =
+                    match self.authenticate_details(&request) {
+                        Ok(verified_signature) => verified_signature,
+                        Err(error) => return s3::s3_error_response(&error),
+                    };
 
-        let Some(protocol) = detect_protocol(&request) else {
+                return self
+                    .route_rest_xml(request, verified_signature.as_ref());
+            }
+
             return EdgeResponse::json(404, json!({ "message": "not found" }));
         };
 
@@ -349,11 +362,11 @@ impl EdgeRouter {
     ) -> Option<EdgeResponse> {
         let execute_api =
             parse_reserved_execute_api_path(request.path_without_query())?;
-        self.route_execute_api_request(
+        Some(self.route_execute_api_request(
             request,
             Some(execute_api.api_id()),
             execute_api.request_path(),
-        )
+        ))
     }
 
     #[cfg(not(feature = "apigateway"))]
@@ -365,20 +378,21 @@ impl EdgeRouter {
     }
 
     #[cfg(feature = "apigateway")]
-    fn route_execute_api(
+    fn route_custom_domain_execute_api(
         &self,
         request: &HttpRequest<'_>,
     ) -> Option<EdgeResponse> {
         let host = request.header("host")?;
-        if !self.runtime.apigateway().has_execute_api_host(host) {
+        if !self.runtime.apigateway().has_custom_domain_execute_api_host(host)
+        {
             return None;
         }
 
-        self.route_execute_api_request(
+        Some(self.route_execute_api_request(
             request,
             None,
             request.path_without_query(),
-        )
+        ))
     }
 
     #[cfg(feature = "apigateway")]
@@ -387,31 +401,28 @@ impl EdgeRouter {
         request: &HttpRequest<'_>,
         api_id: Option<&str>,
         request_path: &str,
-    ) -> Option<EdgeResponse> {
+    ) -> EdgeResponse {
         let execute_request = build_execute_api_request(request, request_path);
 
         if !self.services.is_enabled(ServiceName::ApiGateway) {
-            return Some(EdgeResponse::json(
-                404,
-                json!({ "message": "not found" }),
-            ));
+            return EdgeResponse::json(404, json!({ "message": "not found" }));
         }
 
         let verified_request = match self.authenticate(request) {
             Ok(verified_request) => verified_request,
             Err(error) => {
-                return Some(execute_api_auth_error_response(&error));
+                return execute_api_auth_error_response(&error);
             }
         };
         if let Some(verified_request) = verified_request.as_ref()
             && verified_request.scope().service() != ServiceName::ApiGateway
         {
-            return Some(execute_api_auth_error_response(
+            return execute_api_auth_error_response(
                 &signature_scope_mismatch_error(format!(
                     "Credential scope service {} does not match execute-api requests.",
                     verified_request.scope().service().as_str(),
                 )),
-            ));
+            );
         }
         let resolved = match api_id {
             Some(api_id) => {
@@ -423,69 +434,66 @@ impl EdgeRouter {
                         .map(VerifiedRequest::caller_identity),
                 )
             }
-            None => self.runtime.apigateway().resolve_execute_api(
-                &execute_request,
-                verified_request
-                    .as_ref()
-                    .map(VerifiedRequest::caller_identity),
-            ),
-        }?;
+            None => self
+                .runtime
+                .apigateway()
+                .resolve_execute_api(
+                    &execute_request,
+                    verified_request
+                        .as_ref()
+                        .map(VerifiedRequest::caller_identity),
+                )
+                .unwrap_or(Err(services::ExecuteApiError::NotFound)),
+        };
         let (scope, invocation) = match resolved {
             Ok(target) => target.into_parts(),
-            Err(error) => return Some(execute_api_error_response(&error)),
+            Err(error) => return execute_api_error_response(&error),
         };
         if let Some(verified_request) = verified_request.as_ref()
             && verified_request.scope().region() != scope.region()
         {
-            return Some(execute_api_auth_error_response(
+            return execute_api_auth_error_response(
                 &signature_scope_mismatch_error(format!(
                     "Credential scope region {} does not match execute-api region {}.",
                     verified_request.scope().region().as_str(),
                     scope.region().as_str(),
                 )),
-            ));
+            );
         }
 
-        Some(
-            match self
-                .runtime
-                .execute_api_executor()
-                .execute(&scope, &invocation)
-            {
-                Ok(response) => {
-                    let content_type = response
-                        .headers()
-                        .iter()
-                        .find_map(|(name, value)| {
-                            name.eq_ignore_ascii_case("content-type")
-                                .then_some(value.as_str())
-                        })
-                        .unwrap_or("application/json");
-                    let mut edge = EdgeResponse::bytes(
-                        response.status_code(),
-                        content_type,
-                        response.body().to_vec(),
-                    );
-                    for (name, value) in response.headers() {
-                        if name.eq_ignore_ascii_case("content-type") {
-                            edge = edge.set_header(name, value);
-                        } else if should_skip_function_url_response_header(
-                            name,
-                        ) {
-                            continue;
-                        } else {
-                            edge = edge.with_header(name, value);
-                        }
+        match self.runtime.execute_api_executor().execute(&scope, &invocation)
+        {
+            Ok(response) => {
+                let content_type = response
+                    .headers()
+                    .iter()
+                    .find_map(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-type")
+                            .then_some(value.as_str())
+                    })
+                    .unwrap_or("application/json");
+                let mut edge = EdgeResponse::bytes(
+                    response.status_code(),
+                    content_type,
+                    response.body().to_vec(),
+                );
+                for (name, value) in response.headers() {
+                    if name.eq_ignore_ascii_case("content-type") {
+                        edge = edge.set_header(name, value);
+                    } else if should_skip_function_url_response_header(name) {
+                        continue;
+                    } else {
+                        edge = edge.with_header(name, value);
                     }
-                    edge
                 }
-                Err(error) => execute_api_error_response(&error),
-            },
-        )
+                edge
+            }
+            Err(error) => execute_api_error_response(&error),
+        }
     }
 
     #[cfg(not(feature = "apigateway"))]
-    fn route_execute_api(
+    fn route_custom_domain_execute_api(
         &self,
         _request: &HttpRequest<'_>,
     ) -> Option<EdgeResponse> {
@@ -1439,17 +1447,36 @@ struct FunctionUrlHost {
     url_id: String,
 }
 
-fn detect_protocol(request: &HttpRequest<'_>) -> Option<ProtocolFamily> {
+fn detect_generic_protocol(
+    request: &HttpRequest<'_>,
+) -> Option<ProtocolFamily> {
     let content_type = request.header("content-type").unwrap_or_default();
     let smithy_protocol =
         request.header("smithy-protocol").unwrap_or_default();
     let target = request.header("x-amz-target");
+    let path = request.path_without_query();
+    #[cfg(feature = "s3")]
+    let s3_candidate = s3::is_rest_xml_request(request);
+    #[cfg(not(feature = "s3"))]
+    let s3_candidate = false;
 
     if smithy_path(request.path_without_query()).is_some()
         || content_type.eq_ignore_ascii_case("application/cbor")
         || smithy_protocol.eq_ignore_ascii_case("rpc-v2-cbor")
     {
         return Some(ProtocolFamily::SmithyRpcV2Cbor);
+    }
+
+    if rest_json_service(request).is_some() {
+        return Some(ProtocolFamily::RestJson);
+    }
+
+    if is_query_request(request) {
+        return Some(ProtocolFamily::Query);
+    }
+
+    if s3_candidate && path != "/" {
+        return None;
     }
 
     if content_type.contains("application/x-amz-json-1.0") {
@@ -1464,10 +1491,6 @@ fn detect_protocol(request: &HttpRequest<'_>) -> Option<ProtocolFamily> {
         return Some(ProtocolFamily::Query);
     }
 
-    if rest_json_service(request).is_some() {
-        return Some(ProtocolFamily::RestJson);
-    }
-
     if let Some(target) = target {
         if json_target(ProtocolFamily::AwsJson10, target).is_some() {
             return Some(ProtocolFamily::AwsJson10);
@@ -1475,15 +1498,6 @@ fn detect_protocol(request: &HttpRequest<'_>) -> Option<ProtocolFamily> {
         if json_target(ProtocolFamily::AwsJson11, target).is_some() {
             return Some(ProtocolFamily::AwsJson11);
         }
-    }
-
-    if is_query_request(request) {
-        return Some(ProtocolFamily::Query);
-    }
-
-    #[cfg(feature = "s3")]
-    if s3::is_rest_xml_request(request) {
-        return Some(ProtocolFamily::RestXml);
     }
 
     None
@@ -2466,6 +2480,26 @@ mod tests {
         request
     }
 
+    fn reserved_execute_api_path(api_id: &str, path: &str) -> String {
+        format!("/__aws/execute-api/{api_id}{path}")
+    }
+
+    fn reserved_execute_api_request(
+        method: &str,
+        api_id: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        execute_api_request(
+            method,
+            "localhost",
+            &reserved_execute_api_path(api_id, path),
+            headers,
+            body,
+        )
+    }
+
     fn create_access_key_for_scope(
         runtime: &RuntimeServices,
         scope: &ApiGatewayScope,
@@ -2507,8 +2541,8 @@ mod tests {
             .expect("lambda execution role should create");
     }
 
-    fn signed_execute_api_request(
-        host: &str,
+    fn signed_reserved_execute_api_request(
+        api_id: &str,
         path: &str,
         access_key_id: &str,
         secret_access_key: &str,
@@ -2525,8 +2559,12 @@ mod tests {
             now.second(),
         );
         let scope_date = &amz_date[..8];
-        let request_target = path.split_once('?');
-        let canonical_uri = request_target.map(|(uri, _)| uri).unwrap_or(path);
+        let host = "localhost";
+        let reserved_path = reserved_execute_api_path(api_id, path);
+        let request_target = reserved_path.split_once('?');
+        let canonical_uri = request_target
+            .map(|(uri, _)| uri)
+            .unwrap_or(reserved_path.as_str());
         let canonical_query =
             request_target.map(|(_, query)| query).unwrap_or("");
         let signed_headers = "host;x-amz-date";
@@ -2549,7 +2587,7 @@ mod tests {
         execute_api_request(
             "GET",
             host,
-            path,
+            &reserved_path,
             &[
                 ("X-Amz-Date", amz_date.as_str()),
                 ("Authorization", &authorization),
@@ -3515,9 +3553,9 @@ mod tests {
             false,
         );
 
-        let response = router.handle_bytes(&execute_api_request(
+        let response = router.handle_bytes(&reserved_execute_api_request(
             "GET",
-            &format!("{api_id}.execute-api.localhost"),
+            &api_id,
             "/dev/pets?mode=test",
             &[("X-Test", "true")],
             b"",
@@ -3565,20 +3603,21 @@ mod tests {
             )
             .expect("domain should create");
 
-        let mock = router.handle_bytes(&execute_api_request(
+        let mock = router.handle_bytes(&reserved_execute_api_request(
             "GET",
-            &format!("{api_id}.execute-api.localhost"),
+            &api_id,
             "/dev/pets",
             &[("Content-Type", "application/json")],
             b"",
         ));
-        let missing_stage = router.handle_bytes(&execute_api_request(
-            "GET",
-            &format!("{api_id}.execute-api.localhost"),
-            "/missing/pets",
-            &[],
-            b"",
-        ));
+        let missing_stage =
+            router.handle_bytes(&reserved_execute_api_request(
+                "GET",
+                &api_id,
+                "/missing/pets",
+                &[],
+                b"",
+            ));
         let missing_mapping = router.handle_bytes(&execute_api_request(
             "GET",
             "api.example.test",
@@ -3613,6 +3652,27 @@ mod tests {
     }
 
     #[test]
+    fn apigw_runtime_missing_reserved_api_ids_stay_on_the_execute_api_surface()
+    {
+        let (router, _) = router_with_runtime("apigw-runtime-missing-api");
+
+        let missing = router.handle_bytes(&reserved_execute_api_request(
+            "GET",
+            "missing12345",
+            "/dev/pets",
+            &[],
+            b"",
+        ));
+        let missing_bytes = missing.to_http_bytes();
+        let (status, _, body) = split_response(&missing_bytes);
+        let body: Value =
+            serde_json::from_slice(body).expect("body should decode");
+
+        assert_eq!(status, "HTTP/1.1 404 Not Found");
+        assert_eq!(body["message"], "Not Found");
+    }
+
+    #[test]
     fn apigw_runtime_signed_requests_resolve_execute_api_hosts_outside_the_default_account()
      {
         let backend = CapturingHttpServer::spawn(
@@ -3635,13 +3695,14 @@ mod tests {
             false,
         );
 
-        let response = router.handle_bytes(&signed_execute_api_request(
-            &format!("{api_id}.execute-api.localhost"),
-            "/dev/pets",
-            &access_key_id,
-            &secret_access_key,
-            "eu-west-2",
-        ));
+        let response =
+            router.handle_bytes(&signed_reserved_execute_api_request(
+                &api_id,
+                "/dev/pets",
+                &access_key_id,
+                &secret_access_key,
+                "eu-west-2",
+            ));
         let response_bytes = response.to_http_bytes();
         let (status, headers, body) = split_response(&response_bytes);
         let captured = backend.join();
@@ -3673,9 +3734,9 @@ mod tests {
             false,
         );
 
-        let response = router.handle_bytes(&execute_api_request(
+        let response = router.handle_bytes(&reserved_execute_api_request(
             "GET",
-            &format!("{api_id}.execute-api.localhost"),
+            &api_id,
             "/dev/pets",
             &[],
             b"",
@@ -3715,23 +3776,23 @@ mod tests {
             format!("http://127.0.0.1:{}", default_server.address().port()),
         );
 
-        let exact = router.handle_bytes(&execute_api_request(
+        let exact = router.handle_bytes(&reserved_execute_api_request(
             "GET",
-            &format!("{api_id}.execute-api.localhost"),
+            &api_id,
             "/pets/dog/1",
             &[],
             b"",
         ));
-        let greedy = router.handle_bytes(&execute_api_request(
+        let greedy = router.handle_bytes(&reserved_execute_api_request(
             "GET",
-            &format!("{api_id}.execute-api.localhost"),
+            &api_id,
             "/pets/cat/2?view=full",
             &[("X-Test", "true")],
             b"",
         ));
-        let fallback = router.handle_bytes(&execute_api_request(
+        let fallback = router.handle_bytes(&reserved_execute_api_request(
             "POST",
-            &format!("{api_id}.execute-api.localhost"),
+            &api_id,
             "/orders/5",
             &[],
             br#"{"ok":true}"#,
@@ -3812,9 +3873,9 @@ mod tests {
             BTreeMap::new(),
             false,
         );
-        let request = execute_api_request(
+        let request = reserved_execute_api_request(
             "GET",
-            &format!("{api_id}.execute-api.localhost"),
+            &api_id,
             "/dev/pets?view=full",
             &[("User-Agent", "runtime-test"), ("X-Test", "true")],
             b"",
@@ -4169,6 +4230,49 @@ mod tests {
             std::str::from_utf8(list_body).expect("list body should be UTF-8");
         assert!(list_body.contains("<Key>reports/data.txt</Key>"));
         assert!(list_body.contains("<Key>reports/data-copy.txt</Key>"));
+    }
+
+    #[test]
+    fn s3_core_rest_xml_put_object_ignores_jsonish_object_content_types() {
+        let router = router();
+
+        let create = router.handle_bytes(
+            b"PUT /jsonish-content HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        );
+        let put = router.handle_bytes(
+            b"PUT /jsonish-content/object.bin HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-amz-json-1.0\r\nContent-Length: 7\r\n\r\npayload",
+        );
+        let head = router.handle_bytes(
+            b"HEAD /jsonish-content/object.bin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        let get = router.handle_bytes(
+            b"GET /jsonish-content/object.bin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+
+        let create_bytes = create.to_http_bytes();
+        let put_bytes = put.to_http_bytes();
+        let head_bytes = head.to_http_bytes();
+        let get_bytes = get.to_http_bytes();
+
+        let (create_status, _, _) = split_response(&create_bytes);
+        let (put_status, _, put_body) = split_response(&put_bytes);
+        let (head_status, head_headers, _) = split_response(&head_bytes);
+        let (get_status, get_headers, get_body) = split_response(&get_bytes);
+
+        assert_eq!(create_status, "HTTP/1.1 200 OK");
+        assert_eq!(put_status, "HTTP/1.1 200 OK");
+        assert!(put_body.is_empty());
+        assert_eq!(head_status, "HTTP/1.1 200 OK");
+        assert_eq!(
+            header_value(&head_headers, "content-type"),
+            Some("application/x-amz-json-1.0")
+        );
+        assert_eq!(get_status, "HTTP/1.1 200 OK");
+        assert_eq!(
+            header_value(&get_headers, "content-type"),
+            Some("application/x-amz-json-1.0")
+        );
+        assert_eq!(get_body, b"payload");
     }
 
     #[test]

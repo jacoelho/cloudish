@@ -150,8 +150,10 @@ async fn apigw_v1_runtime_lambda_proxy_round_trip() {
         .expect("API Gateway permission should be added");
 
     let response = reqwest::Client::new()
-        .get(format!("http://{}/dev/pets?view=full", runtime.address()))
-        .header(HOST, format!("{api_id}.execute-api.localhost"))
+        .get(format!(
+            "http://{}/__aws/execute-api/{api_id}/dev/pets?view=full",
+            runtime.address()
+        ))
         .header("X-Test", "true")
         .send()
         .await

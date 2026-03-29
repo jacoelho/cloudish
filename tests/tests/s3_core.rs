@@ -56,7 +56,7 @@ async fn s3_core_put_get_head_copy_and_list_objects() {
         .put_object()
         .bucket("sdk-s3-core-flow")
         .key("reports/data.txt")
-        .content_type("text/plain")
+        .content_type("application/x-amz-json-1.0")
         .metadata("trace", "abc123")
         .body(ByteStream::from_static(b"payload"))
         .send()
@@ -110,8 +110,11 @@ async fn s3_core_put_get_head_copy_and_list_objects() {
     );
     assert_eq!(head.e_tag(), copied_head.e_tag());
     assert_eq!(head.content_length(), Some(7));
-    assert_eq!(get_content_type.as_deref(), Some("text/plain"));
-    assert_eq!(head.content_type(), Some("text/plain"));
+    assert_eq!(
+        get_content_type.as_deref(),
+        Some("application/x-amz-json-1.0")
+    );
+    assert_eq!(head.content_type(), Some("application/x-amz-json-1.0"));
     assert_eq!(
         head.metadata().and_then(|metadata| metadata.get("trace")),
         Some(&"abc123".to_owned())

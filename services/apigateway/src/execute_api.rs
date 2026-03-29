@@ -322,15 +322,8 @@ impl ExecuteApiError {
 }
 
 impl ApiGatewayService {
-    pub fn has_execute_api_host(&self, host: &str) -> bool {
+    pub fn has_custom_domain_execute_api_host(&self, host: &str) -> bool {
         let host = normalize_authority(host);
-        if let Some(default_host) = parse_default_execute_api_host(&host) {
-            return self.all_states().into_iter().any(|(_, state)| {
-                state.rest_apis.contains_key(&default_host.api_id)
-                    || state.http_apis.contains_key(&default_host.api_id)
-            });
-        }
-
         self.all_states()
             .into_iter()
             .any(|(_, state)| find_domain_name(&state, &host).is_some())
@@ -342,56 +335,41 @@ impl ApiGatewayService {
         caller_identity: Option<&CallerIdentity>,
     ) -> Option<Result<ResolvedExecuteApiTarget, ExecuteApiError>> {
         let host = normalize_authority(request.host());
-        if let Some(default_host) = parse_default_execute_api_host(&host) {
-            return self.resolve_default_execute_api(
-                &default_host,
-                request,
-                caller_identity,
-            );
-        }
-
         self.resolve_custom_domain_execute_api(&host, request, caller_identity)
     }
 
+    /// # Errors
+    ///
+    /// Returns [`ExecuteApiError`] when the API id is missing, ambiguous, or
+    /// the resolved API cannot prepare an invocation for the request.
     pub fn resolve_execute_api_by_api_id(
         &self,
         api_id: &str,
         request: &ExecuteApiRequest,
         caller_identity: Option<&CallerIdentity>,
-    ) -> Option<Result<ResolvedExecuteApiTarget, ExecuteApiError>> {
+    ) -> Result<ResolvedExecuteApiTarget, ExecuteApiError> {
         let mut matches =
             self.all_states().into_iter().filter(|(_, state)| {
                 state.rest_apis.contains_key(api_id)
                     || state.http_apis.contains_key(api_id)
             });
-        let (scope, state) = matches.next()?;
+        let Some((scope, state)) = matches.next() else {
+            return Err(ExecuteApiError::NotFound);
+        };
         if matches.next().is_some() {
-            return Some(Err(ambiguous_execute_api_target_error(format!(
+            return Err(ambiguous_execute_api_target_error(format!(
                 "multiple execute-api targets matched api id {api_id}",
-            ))));
+            )));
         }
 
-        Some(if state.http_apis.contains_key(api_id) {
-            super::v2::prepare_http_api_execute_api(
-                &scope,
-                &state,
-                api_id,
-                request,
-                caller_identity,
-            )
-            .map(|invocation| ResolvedExecuteApiTarget::new(scope, invocation))
-        } else {
-            let default_host =
-                DefaultExecuteApiHost { api_id: api_id.to_owned() };
-            self.prepare_default_host_execute_api(
-                &scope,
-                &state,
-                &default_host,
-                request,
-                caller_identity,
-            )
-            .map(|invocation| ResolvedExecuteApiTarget::new(scope, invocation))
-        })
+        self.prepare_api_id_execute_api(
+            &scope,
+            &state,
+            api_id,
+            request,
+            caller_identity,
+        )
+        .map(|invocation| ResolvedExecuteApiTarget::new(scope, invocation))
     }
 
     pub fn prepare_execute_api(
@@ -402,67 +380,60 @@ impl ApiGatewayService {
     ) -> Option<Result<ExecuteApiInvocation, ExecuteApiError>> {
         let state = self.load_state(scope);
         let host = normalize_authority(request.host());
-        let host = if let Some(default_host) =
-            parse_default_execute_api_host(&host)
-        {
-            ExecuteApiHost::Default(default_host)
-        } else if let Some(domain_name) = find_domain_name(&state, &host) {
-            ExecuteApiHost::CustomDomain(domain_name.to_owned())
-        } else {
-            return None;
-        };
+        let domain_name = find_domain_name(&state, &host)?;
 
-        Some(match host {
-            ExecuteApiHost::Default(host) => self
-                .prepare_default_host_execute_api(
-                    scope,
-                    &state,
-                    &host,
-                    request,
-                    caller_identity,
-                ),
-            ExecuteApiHost::CustomDomain(domain_name) => self
-                .prepare_custom_domain_execute_api(
-                    scope,
-                    &state,
-                    &domain_name,
-                    request,
-                    caller_identity,
-                ),
-        })
+        Some(self.prepare_custom_domain_execute_api(
+            scope,
+            &state,
+            domain_name,
+            request,
+            caller_identity,
+        ))
     }
 
-    fn resolve_default_execute_api(
+    fn prepare_api_id_execute_api(
         &self,
-        host: &DefaultExecuteApiHost,
+        scope: &ApiGatewayScope,
+        state: &StoredApiGatewayState,
+        api_id: &str,
         request: &ExecuteApiRequest,
         caller_identity: Option<&CallerIdentity>,
-    ) -> Option<Result<ResolvedExecuteApiTarget, ExecuteApiError>> {
-        let mut matches =
-            self.all_states().into_iter().filter(|(_, state)| {
-                state.rest_apis.contains_key(&host.api_id)
-                    || state.http_apis.contains_key(&host.api_id)
-            });
-        let (scope, state) = matches.next()?;
-        if matches.next().is_some() {
-            return Some(Err(ambiguous_execute_api_target_error(format!(
-                "multiple execute-api targets matched host {}",
-                request.host(),
-            ))));
-        }
-
-        Some(
-            self.prepare_default_host_execute_api(
-                &scope,
-                &state,
-                host,
+    ) -> Result<ExecuteApiInvocation, ExecuteApiError> {
+        if state.http_apis.contains_key(api_id) {
+            return super::v2::prepare_http_api_execute_api(
+                scope,
+                state,
+                api_id,
                 request,
                 caller_identity,
-            )
-            .map(|invocation| {
-                ResolvedExecuteApiTarget::new(scope, invocation)
-            }),
-        )
+            );
+        }
+
+        let api = rest_api(state, api_id).map_err(not_found_error)?;
+        if api.disable_execute_api_endpoint {
+            return Err(ExecuteApiError::Forbidden);
+        }
+
+        let path = normalize_path(request.path())?;
+        let Some((stage_name, resource_path)) = api_id_request_target(&path)
+        else {
+            return Err(ExecuteApiError::NotFound);
+        };
+        let stage = stage(api, &stage_name).map_err(not_found_error)?;
+        let deployment_id =
+            stage.deployment_id.as_deref().ok_or(ExecuteApiError::NotFound)?;
+        let deployment =
+            deployment(api, deployment_id).map_err(not_found_error)?;
+        let context = ExecuteApiRequestContext {
+            scope,
+            api_id,
+            stage,
+            request,
+            caller_identity,
+            host: &normalize_authority(request.host()),
+        };
+
+        build_execute_api_invocation(&context, deployment, &resource_path)
     }
 
     fn resolve_custom_domain_execute_api(
@@ -569,51 +540,6 @@ pub fn map_lambda_proxy_response(
 }
 
 impl ApiGatewayService {
-    fn prepare_default_host_execute_api(
-        &self,
-        scope: &ApiGatewayScope,
-        state: &StoredApiGatewayState,
-        host: &DefaultExecuteApiHost,
-        request: &ExecuteApiRequest,
-        caller_identity: Option<&CallerIdentity>,
-    ) -> Result<ExecuteApiInvocation, ExecuteApiError> {
-        if state.http_apis.contains_key(&host.api_id) {
-            return super::v2::prepare_http_api_execute_api(
-                scope,
-                state,
-                &host.api_id,
-                request,
-                caller_identity,
-            );
-        }
-        let api = rest_api(state, &host.api_id).map_err(not_found_error)?;
-        if api.disable_execute_api_endpoint {
-            return Err(ExecuteApiError::Forbidden);
-        }
-
-        let path = normalize_path(request.path())?;
-        let Some((stage_name, resource_path)) =
-            default_host_request_target(&path)
-        else {
-            return Err(ExecuteApiError::NotFound);
-        };
-        let stage = stage(api, &stage_name).map_err(not_found_error)?;
-        let deployment_id =
-            stage.deployment_id.as_deref().ok_or(ExecuteApiError::NotFound)?;
-        let deployment =
-            deployment(api, deployment_id).map_err(not_found_error)?;
-        let context = ExecuteApiRequestContext {
-            scope,
-            api_id: &host.api_id,
-            stage,
-            request,
-            caller_identity,
-            host: &normalize_authority(request.host()),
-        };
-
-        build_execute_api_invocation(&context, deployment, &resource_path)
-    }
-
     fn prepare_custom_domain_execute_api(
         &self,
         scope: &ApiGatewayScope,
@@ -1071,32 +997,10 @@ fn ambiguous_execute_api_target_error(message: String) -> ExecuteApiError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DefaultExecuteApiHost {
-    api_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ExecuteApiHost {
-    CustomDomain(String),
-    Default(DefaultExecuteApiHost),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct MatchedResource<'a> {
     path_parameters: BTreeMap<String, String>,
     request_path: String,
     resource: &'a StoredApiResource,
-}
-
-fn parse_default_execute_api_host(
-    host: &str,
-) -> Option<DefaultExecuteApiHost> {
-    let (api_id, _) = host.split_once(".execute-api")?;
-    if api_id.is_empty() {
-        return None;
-    }
-
-    Some(DefaultExecuteApiHost { api_id: api_id.to_owned() })
 }
 
 fn find_domain_name<'a>(
@@ -1110,7 +1014,7 @@ fn find_domain_name<'a>(
         .map(String::as_str)
 }
 
-fn default_host_request_target(path: &str) -> Option<(String, String)> {
+fn api_id_request_target(path: &str) -> Option<(String, String)> {
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
         return None;
@@ -1694,27 +1598,22 @@ mod tests {
     }
 
     #[test]
-    fn apigw_v1_runtime_default_host_resolves_http_proxy_plan() {
-        let service = service("default-host");
-        let scope = scope();
+    fn apigw_v1_runtime_api_id_route_resolves_http_proxy_plan() {
+        let service = service("api-id-route");
         let (api_id, _, _) = deploy_http_api(
             &service,
             "HTTP_PROXY",
             "http://127.0.0.1:8080/backend",
             false,
         );
-        let request = ExecuteApiRequest::new(
-            format!("{api_id}.execute-api.localhost"),
-            "GET",
-            "/dev/pets",
-        )
-        .with_query_string("mode=test")
-        .with_header("Accept", "application/json");
+        let request = ExecuteApiRequest::new("localhost", "GET", "/dev/pets")
+            .with_query_string("mode=test")
+            .with_header("Accept", "application/json");
 
-        let invocation = service
-            .prepare_execute_api(&scope, &request, None)
-            .expect("execute-api host should be recognized")
+        let resolved = service
+            .resolve_execute_api_by_api_id(&api_id, &request, None)
             .expect("invocation should resolve");
+        let invocation = resolved.invocation();
 
         assert_eq!(invocation.api_id(), api_id);
         assert_eq!(invocation.resource_path(), "/pets");
@@ -1766,7 +1665,7 @@ mod tests {
 
     #[test]
     fn apigw_runtime_resolve_execute_api_returns_the_owning_scope() {
-        let service = service("cross-scope-default-host");
+        let service = service("cross-scope-api-id");
         let alternate_scope = alternate_scope();
         let (api_id, _, _) = deploy_http_api_in_scope(
             &service,
@@ -1777,15 +1676,11 @@ mod tests {
         );
 
         let resolved = service
-            .resolve_execute_api(
-                &ExecuteApiRequest::new(
-                    format!("{api_id}.execute-api.localhost"),
-                    "GET",
-                    "/dev/pets",
-                ),
+            .resolve_execute_api_by_api_id(
+                &api_id,
+                &ExecuteApiRequest::new("localhost", "GET", "/dev/pets"),
                 None,
             )
-            .expect("execute-api host should be recognized")
             .expect("alternate-scope invocation should resolve");
 
         assert_eq!(resolved.scope(), &alternate_scope);
@@ -1846,6 +1741,57 @@ mod tests {
             .expect("invocation should resolve");
         assert_eq!(invocation.api_id(), api_id);
         assert_eq!(invocation.request_path(), "/pets");
+    }
+
+    #[test]
+    fn apigw_runtime_custom_domains_with_execute_api_in_the_name_remain_exact_matches()
+     {
+        let service = service("custom-domain-execute-api-substring");
+        let scope = scope();
+        let (api_id, _, _) = deploy_http_api(
+            &service,
+            "HTTP",
+            "http://127.0.0.1:8080/api",
+            false,
+        );
+        let domain_name = "api.execute-api.dev.example.com";
+        service
+            .create_domain_name(
+                &scope,
+                CreateDomainNameInput {
+                    certificate_arn: None,
+                    certificate_name: None,
+                    domain_name: domain_name.to_owned(),
+                    endpoint_configuration: None,
+                    security_policy: None,
+                    tags: BTreeMap::new(),
+                },
+            )
+            .expect("domain should create");
+        service
+            .create_base_path_mapping(
+                &scope,
+                domain_name,
+                CreateBasePathMappingInput {
+                    base_path: Some("(none)".to_owned()),
+                    rest_api_id: api_id.clone(),
+                    stage: "dev".to_owned(),
+                },
+            )
+            .expect("base path mapping should create");
+
+        assert!(service.has_custom_domain_execute_api_host(domain_name));
+        let invocation = service
+            .resolve_execute_api(
+                &ExecuteApiRequest::new(domain_name, "GET", "/pets"),
+                None,
+            )
+            .expect("custom domain should be recognized")
+            .expect("invocation should resolve");
+
+        assert_eq!(invocation.scope(), &scope);
+        assert_eq!(invocation.invocation().api_id(), api_id);
+        assert_eq!(invocation.invocation().request_path(), "/pets");
     }
 
     #[test]
@@ -2039,39 +1985,28 @@ mod tests {
             .expect("stage should create");
 
         let exact = service
-            .prepare_execute_api(
-                &scope,
-                &ExecuteApiRequest::new(
-                    format!("{}.execute-api.localhost", api.id),
-                    "GET",
-                    "/dev/pets/list",
-                ),
+            .resolve_execute_api_by_api_id(
+                &api.id,
+                &ExecuteApiRequest::new("localhost", "GET", "/dev/pets/list"),
                 None,
             )
-            .expect("host should resolve")
             .expect("exact resource should resolve");
-        assert_eq!(exact.resource_path(), "/pets/list");
+        assert_eq!(exact.invocation().resource_path(), "/pets/list");
 
         let fallback = service
-            .prepare_execute_api(
-                &scope,
-                &ExecuteApiRequest::new(
-                    format!("{}.execute-api.localhost", api.id),
-                    "PATCH",
-                    "/dev/pets/123",
-                ),
+            .resolve_execute_api_by_api_id(
+                &api.id,
+                &ExecuteApiRequest::new("localhost", "PATCH", "/dev/pets/123"),
                 None,
             )
-            .expect("host should resolve")
             .expect("ANY resource should resolve");
-        assert_eq!(fallback.resource_path(), "/pets/{id}");
+        assert_eq!(fallback.invocation().resource_path(), "/pets/{id}");
     }
 
     #[test]
     fn apigw_v1_runtime_disabled_default_endpoint_and_missing_method_are_explicit()
      {
         let disabled_service = service("negative-paths");
-        let disabled_scope = scope();
         let (api_id, _, _) = deploy_http_api(
             &disabled_service,
             "HTTP_PROXY",
@@ -2079,21 +2014,15 @@ mod tests {
             true,
         );
         let disabled = disabled_service
-            .prepare_execute_api(
-                &disabled_scope,
-                &ExecuteApiRequest::new(
-                    format!("{api_id}.execute-api.localhost"),
-                    "GET",
-                    "/dev/pets",
-                ),
+            .resolve_execute_api_by_api_id(
+                &api_id,
+                &ExecuteApiRequest::new("localhost", "GET", "/dev/pets"),
                 None,
             )
-            .expect("execute-api host should be recognized")
             .expect_err("disabled endpoint should fail");
         assert_eq!(disabled, ExecuteApiError::Forbidden);
 
         let missing_method_service = service("missing-method");
-        let missing_method_scope = scope();
         let (api_id, _, _) = deploy_http_api(
             &missing_method_service,
             "HTTP_PROXY",
@@ -2101,16 +2030,11 @@ mod tests {
             false,
         );
         let missing_method = missing_method_service
-            .prepare_execute_api(
-                &missing_method_scope,
-                &ExecuteApiRequest::new(
-                    format!("{api_id}.execute-api.localhost"),
-                    "POST",
-                    "/dev/pets",
-                ),
+            .resolve_execute_api_by_api_id(
+                &api_id,
+                &ExecuteApiRequest::new("localhost", "POST", "/dev/pets"),
                 None,
             )
-            .expect("execute-api host should be recognized")
             .expect_err("missing method should fail");
         assert_eq!(missing_method, ExecuteApiError::MethodNotAllowed);
     }
@@ -2148,16 +2072,11 @@ mod tests {
             .expect("state update should persist");
 
         let error = service
-            .prepare_execute_api(
-                &scope,
-                &ExecuteApiRequest::new(
-                    format!("{api_id}.execute-api.localhost"),
-                    "GET",
-                    "/dev/pets",
-                ),
+            .resolve_execute_api_by_api_id(
+                &api_id,
+                &ExecuteApiRequest::new("localhost", "GET", "/dev/pets"),
                 None,
             )
-            .expect("execute-api host should be recognized")
             .expect_err("unsupported integration should fail");
 
         assert_eq!(
