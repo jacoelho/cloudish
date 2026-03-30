@@ -8,6 +8,7 @@ use aws::{
     AccountId, AdvertisedEdge, Arn, AwsError, AwsErrorFamily, RequestContext,
     ServiceName,
 };
+use edge_runtime::SqsRequestRuntime;
 use serde_json::{Map, Value, json};
 use services::{
     BatchFailure, ChangeMessageVisibilityBatchEntryInput,
@@ -18,6 +19,7 @@ use services::{
     SqsScope, SqsService, StartMessageMoveTaskInput,
 };
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const REQUEST_ID: &str = "0000000000000000";
 const SQS_XMLNS: &str = "http://queue.amazonaws.com/doc/2012-11-05/";
@@ -54,9 +56,11 @@ pub(crate) fn is_sqs_action(action: &str) -> bool {
 
 pub(crate) fn handle_query(
     sqs: &SqsService,
+    sqs_requests: &SqsRequestRuntime,
     advertised_edge: &AdvertisedEdge,
     request: &HttpRequest<'_>,
     context: &RequestContext,
+    shutdown_signal: &AtomicBool,
 ) -> Result<String, AwsError> {
     let params = QueryParameters::parse(request.body())?;
     let Some(action) = params.action() else {
@@ -212,7 +216,7 @@ pub(crate) fn handle_query(
                 request,
                 context,
             )?;
-            let messages = sqs
+            let messages = sqs_requests
                 .receive_message(
                     &queue,
                     ReceiveMessageInput {
@@ -229,6 +233,7 @@ pub(crate) fn handle_query(
                             "WaitTimeSeconds",
                         )?,
                     },
+                    &|| shutdown_signal.load(Ordering::SeqCst),
                 )
                 .map_err(|error| error.to_aws_error())?;
 
@@ -403,9 +408,11 @@ pub(crate) fn handle_query(
 
 pub(crate) fn handle_json(
     sqs: &SqsService,
+    sqs_requests: &SqsRequestRuntime,
     advertised_edge: &AdvertisedEdge,
     request: &HttpRequest<'_>,
     context: &RequestContext,
+    shutdown_signal: &AtomicBool,
 ) -> Result<Vec<u8>, AwsError> {
     let target = request
         .header("x-amz-target")
@@ -555,7 +562,7 @@ pub(crate) fn handle_json(
                 request,
                 context,
             )?;
-            let messages = sqs
+            let messages = sqs_requests
                 .receive_message(
                     &queue,
                     ReceiveMessageInput {
@@ -572,6 +579,7 @@ pub(crate) fn handle_json(
                             "WaitTimeSeconds",
                         )?,
                     },
+                    &|| shutdown_signal.load(Ordering::SeqCst),
                 )
                 .map_err(|error| error.to_aws_error())?;
 
@@ -1377,14 +1385,21 @@ fn unsupported_operation_error(action: &str) -> AwsError {
 #[cfg(test)]
 mod tests {
     use super::queue_url;
+    use crate::request::EdgeRequest;
     use crate::runtime::EdgeRouter;
     use crate::test_runtime;
     use aws::{
-        AccountId, ProtocolFamily, RegionId, RequestContext, ServiceName,
+        AccountId, AdvertisedEdge, ProtocolFamily, RegionId, RequestContext,
+        ServiceName,
     };
+    use edge_runtime::SqsRequestRuntime;
     use serde_json::{Map, Value, json};
-    use services::{SqsQueueIdentity, SqsService};
+    use services::{
+        CreateQueueInput, SendMessageInput, SqsQueueIdentity, SqsScope,
+        SqsService,
+    };
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicBool;
 
     fn router() -> EdgeRouter {
         test_runtime::router_with_http_forwarder("http-sqs-tests", None)
@@ -1436,6 +1451,10 @@ mod tests {
             body.len()
         )
         .into_bytes()
+    }
+
+    fn parse_request(request: &[u8]) -> EdgeRequest {
+        EdgeRequest::parse(request).expect("request should parse")
     }
 
     fn header_value<'a>(
@@ -1622,9 +1641,122 @@ mod tests {
     }
 
     #[test]
+    fn sqs_query_receive_message_uses_queue_default_wait_time_when_request_omits_it()
+     {
+        let sqs = SqsService::new();
+        let advertised_edge = AdvertisedEdge::new("http", "localhost", 4566);
+        let scope = SqsScope::new(
+            "000000000000".parse().expect("account should parse"),
+            "eu-west-2".parse().expect("region should parse"),
+        );
+        let queue = sqs
+            .create_queue(
+                &scope,
+                CreateQueueInput {
+                    attributes: BTreeMap::from([(
+                        "ReceiveMessageWaitTimeSeconds".to_owned(),
+                        "1".to_owned(),
+                    )]),
+                    queue_name: "orders".to_owned(),
+                },
+            )
+            .expect("queue should create");
+        let request = parse_request(&query_request(
+            "/000000000000/orders",
+            "Action=ReceiveMessage",
+        ));
+        let sender = sqs.clone();
+        let delayed_queue = queue.clone();
+        let delayed_send = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            sender
+                .send_message(
+                    &delayed_queue,
+                    SendMessageInput {
+                        body: "payload".to_owned(),
+                        delay_seconds: None,
+                        message_deduplication_id: None,
+                        message_group_id: None,
+                    },
+                )
+                .expect("message should send");
+        });
+        let shutdown_signal = AtomicBool::new(false);
+        let sqs_requests = SqsRequestRuntime::new(sqs.clone());
+
+        let response = super::handle_query(
+            &sqs,
+            &sqs_requests,
+            &advertised_edge,
+            &request,
+            &context(ProtocolFamily::Query, "ReceiveMessage"),
+            &shutdown_signal,
+        )
+        .expect("query receive should succeed");
+        delayed_send.join().expect("delayed sender should finish cleanly");
+
+        assert!(response.contains("<Body>payload</Body>"));
+    }
+
+    #[test]
+    fn sqs_json_receive_message_uses_request_wait_time_over_queue_default() {
+        let sqs = SqsService::new();
+        let advertised_edge = AdvertisedEdge::new("http", "localhost", 4566);
+        let scope = SqsScope::new(
+            "000000000000".parse().expect("account should parse"),
+            "eu-west-2".parse().expect("region should parse"),
+        );
+        let queue = sqs
+            .create_queue(
+                &scope,
+                CreateQueueInput {
+                    attributes: BTreeMap::new(),
+                    queue_name: "orders".to_owned(),
+                },
+            )
+            .expect("queue should create");
+        let request = parse_request(&json_request(
+            "AmazonSQS.ReceiveMessage",
+            r#"{"QueueUrl":"http://localhost:4566/000000000000/orders","WaitTimeSeconds":1}"#,
+        ));
+        let sender = sqs.clone();
+        let delayed_queue = queue.clone();
+        let delayed_send = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            sender
+                .send_message(
+                    &delayed_queue,
+                    SendMessageInput {
+                        body: "payload".to_owned(),
+                        delay_seconds: None,
+                        message_deduplication_id: None,
+                        message_group_id: None,
+                    },
+                )
+                .expect("message should send");
+        });
+        let shutdown_signal = AtomicBool::new(false);
+        let sqs_requests = SqsRequestRuntime::new(sqs.clone());
+
+        let response = super::handle_json(
+            &sqs,
+            &sqs_requests,
+            &advertised_edge,
+            &request,
+            &context(ProtocolFamily::AwsJson10, "ReceiveMessage"),
+            &shutdown_signal,
+        )
+        .expect("json receive should succeed");
+        delayed_send.join().expect("delayed sender should finish cleanly");
+        let response: Value = serde_json::from_slice(&response)
+            .expect("response should be json");
+
+        assert_eq!(response["Messages"][0]["Body"], "payload");
+    }
+
+    #[test]
     fn sqs_standard_queue_url_helper_uses_advertised_edge() {
-        let advertised_edge =
-            aws::AdvertisedEdge::new("http", "localhost", 9999);
+        let advertised_edge = AdvertisedEdge::new("http", "localhost", 9999);
         let queue = SqsQueueIdentity::new(
             "000000000000".parse().expect("account should parse"),
             "eu-west-2".parse().expect("region should parse"),
@@ -1862,19 +1994,24 @@ mod tests {
 
     #[test]
     fn sqs_standard_internal_helpers_report_explicit_errors() {
-        let advertised_edge = aws::AdvertisedEdge::default();
+        let advertised_edge = AdvertisedEdge::default();
         let query_context = context(ProtocolFamily::Query, "MissingAction");
         let json_context = context(ProtocolFamily::AwsJson10, "ListQueues");
+        let shutdown_signal = AtomicBool::new(false);
+        let sqs = SqsService::default();
+        let sqs_requests = SqsRequestRuntime::new(sqs.clone());
 
         let missing_action_bytes = query_request("/", "QueueName=orders");
         let missing_action_request =
             crate::request::HttpRequest::parse(&missing_action_bytes)
                 .expect("request should parse");
         let missing_action = super::handle_query(
-            &SqsService::default(),
+            &sqs,
+            &sqs_requests,
             &advertised_edge,
             &missing_action_request,
             &query_context,
+            &shutdown_signal,
         )
         .expect_err("missing actions should fail");
         assert_eq!(missing_action.code(), "MissingAction");
@@ -1884,10 +2021,12 @@ mod tests {
             crate::request::HttpRequest::parse(&unsupported_query_bytes)
                 .expect("request should parse");
         let unsupported_query = super::handle_query(
-            &SqsService::default(),
+            &sqs,
+            &sqs_requests,
             &advertised_edge,
             &unsupported_query_request,
             &query_context,
+            &shutdown_signal,
         )
         .expect_err("unsupported query actions should fail");
         assert_eq!(unsupported_query.code(), "UnsupportedOperation");
@@ -1897,10 +2036,12 @@ mod tests {
         )
         .expect("request should parse");
         let missing_target = super::handle_json(
-            &SqsService::default(),
+            &sqs,
+            &sqs_requests,
             &advertised_edge,
             &missing_target_request,
             &json_context,
+            &shutdown_signal,
         )
         .expect_err("missing JSON targets should fail");
         assert_eq!(missing_target.code(), "UnsupportedOperation");
@@ -1910,10 +2051,12 @@ mod tests {
         )
         .expect("request should parse");
         let invalid_json = super::handle_json(
-            &SqsService::default(),
+            &sqs,
+            &sqs_requests,
             &advertised_edge,
             &invalid_json_request,
             &json_context,
+            &shutdown_signal,
         )
         .expect_err("invalid JSON bodies should fail");
         assert_eq!(invalid_json.code(), "InvalidParameterValue");

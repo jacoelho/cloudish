@@ -141,8 +141,9 @@ impl<K: StorageKey, V: StorageValue> StorageBackend<K, V>
 
     fn load(&self) -> Result<(), StorageError> {
         let _flush_guard = recover(self.inner.flush_lock.lock());
+        let mut state = recover(self.inner.state.write());
         let snapshot = load_snapshot(&self.inner.snapshot_path)?;
-        *recover(self.inner.state.write()) = snapshot;
+        *state = snapshot;
         self.inner.current_version.store(0, Ordering::SeqCst);
         self.inner.persisted_version.store(0, Ordering::SeqCst);
         Ok(())
@@ -150,11 +151,12 @@ impl<K: StorageKey, V: StorageValue> StorageBackend<K, V>
 
     fn clear(&self) -> Result<(), StorageError> {
         let _flush_guard = recover(self.inner.flush_lock.lock());
+        let mut state = recover(self.inner.state.write());
         write_snapshot_atomic(
             &self.inner.snapshot_path,
             &BTreeMap::<K, V>::new(),
         )?;
-        recover(self.inner.state.write()).clear();
+        state.clear();
         self.inner.current_version.store(0, Ordering::SeqCst);
         self.inner.persisted_version.store(0, Ordering::SeqCst);
         Ok(())

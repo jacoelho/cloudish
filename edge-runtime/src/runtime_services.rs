@@ -1,10 +1,17 @@
+#[cfg(feature = "eventbridge")]
+use crate::adapters::ThreadWorkQueueShutdownOutcome;
 use aws::{RuntimeDefaults, ServiceName};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+#[cfg(feature = "eventbridge")]
+use std::time::Duration;
 use storage::StorageError;
 
 type StorageShutdownHook =
     Arc<dyn Fn() -> Result<(), StorageError> + Send + Sync>;
+#[cfg(feature = "lambda")]
+type LambdaBackgroundShutdownHook =
+    Arc<dyn Fn() -> Result<(), InfrastructureError> + Send + Sync>;
 
 #[cfg(feature = "apigateway")]
 pub use apigateway::{
@@ -280,6 +287,8 @@ pub use kms::{
     ScheduleKmsKeyDeletionOutput,
 };
 #[cfg(feature = "lambda")]
+pub use lambda::request_runtime::LambdaRequestRuntime;
+#[cfg(feature = "lambda")]
 pub use lambda::{
     AddPermissionInput as AddLambdaPermissionInput,
     AddPermissionOutput as AddLambdaPermissionOutput,
@@ -386,6 +395,8 @@ pub use sns::{
     SnsDeliveryTransport, SnsError, SnsIdentifierSource, SnsScope, SnsService,
     SubscribeInput, SubscribeOutput, SubscriptionProtocol, SubscriptionState,
 };
+#[cfg(feature = "sqs")]
+pub use sqs::request_runtime::SqsRequestRuntime;
 #[cfg(feature = "sqs")]
 pub use sqs::{
     BatchFailure, ChangeMessageVisibilityBatchEntryInput,
@@ -527,6 +538,62 @@ pub fn supported_services() -> &'static [ServiceName] {
     SUPPORTED_SERVICES
 }
 
+#[cfg(feature = "eventbridge")]
+const EVENTBRIDGE_DELIVERY_DRAIN_TIMEOUT: Duration =
+    Duration::from_millis(250);
+#[cfg(feature = "eventbridge")]
+const EVENTBRIDGE_DELIVERY_ABORT_TIMEOUT: Duration =
+    Duration::from_millis(250);
+
+#[cfg(feature = "eventbridge")]
+#[derive(Clone)]
+pub struct EventBridgeDeliveryShutdown {
+    begin: Arc<dyn Fn() + Send + Sync>,
+    request_hard_stop: Arc<dyn Fn() + Send + Sync>,
+    finish: Arc<
+        dyn Fn(
+                Duration,
+            )
+                -> Result<ThreadWorkQueueShutdownOutcome, InfrastructureError>
+            + Send
+            + Sync,
+    >,
+}
+
+#[cfg(feature = "eventbridge")]
+impl EventBridgeDeliveryShutdown {
+    pub(crate) fn new(
+        begin: Arc<dyn Fn() + Send + Sync>,
+        request_hard_stop: Arc<dyn Fn() + Send + Sync>,
+        finish: Arc<
+            dyn Fn(
+                    Duration,
+                ) -> Result<
+                    ThreadWorkQueueShutdownOutcome,
+                    InfrastructureError,
+                > + Send
+                + Sync,
+        >,
+    ) -> Self {
+        Self { begin, request_hard_stop, finish }
+    }
+
+    fn begin(&self) {
+        (self.begin)();
+    }
+
+    fn request_hard_stop(&self) {
+        (self.request_hard_stop)();
+    }
+
+    fn finish(
+        &self,
+        timeout: Duration,
+    ) -> Result<ThreadWorkQueueShutdownOutcome, InfrastructureError> {
+        (self.finish)(timeout)
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeServices {
     #[cfg(feature = "apigateway")]
@@ -545,6 +612,8 @@ pub struct RuntimeServices {
     elasticache: ElastiCacheService,
     #[cfg(feature = "eventbridge")]
     eventbridge: EventBridgeService,
+    #[cfg(feature = "eventbridge")]
+    eventbridge_delivery_shutdown: Option<EventBridgeDeliveryShutdown>,
     iam: IamService,
     #[cfg(feature = "kinesis")]
     kinesis: KinesisService,
@@ -552,6 +621,8 @@ pub struct RuntimeServices {
     kms: KmsService,
     #[cfg(feature = "lambda")]
     lambda: LambdaService,
+    #[cfg(feature = "lambda")]
+    lambda_background_shutdown: Option<LambdaBackgroundShutdownHook>,
     #[cfg(feature = "rds")]
     rds: RdsService,
     #[cfg(feature = "s3")]
@@ -587,6 +658,8 @@ pub struct RuntimeServicesBuilder {
     pub elasticache: ElastiCacheService,
     #[cfg(feature = "eventbridge")]
     pub eventbridge: EventBridgeService,
+    #[cfg(feature = "eventbridge")]
+    pub eventbridge_delivery_shutdown: Option<EventBridgeDeliveryShutdown>,
     pub iam: IamService,
     #[cfg(feature = "kinesis")]
     pub kinesis: KinesisService,
@@ -594,6 +667,8 @@ pub struct RuntimeServicesBuilder {
     pub kms: KmsService,
     #[cfg(feature = "lambda")]
     pub lambda: LambdaService,
+    #[cfg(feature = "lambda")]
+    pub lambda_background_shutdown: Option<LambdaBackgroundShutdownHook>,
     #[cfg(feature = "rds")]
     pub rds: RdsService,
     #[cfg(feature = "s3")]
@@ -637,6 +712,9 @@ impl RuntimeServices {
             elasticache: dependencies.elasticache,
             #[cfg(feature = "eventbridge")]
             eventbridge: dependencies.eventbridge,
+            #[cfg(feature = "eventbridge")]
+            eventbridge_delivery_shutdown: dependencies
+                .eventbridge_delivery_shutdown,
             iam: dependencies.iam,
             #[cfg(feature = "kinesis")]
             kinesis: dependencies.kinesis,
@@ -644,6 +722,9 @@ impl RuntimeServices {
             kms: dependencies.kms,
             #[cfg(feature = "lambda")]
             lambda: dependencies.lambda,
+            #[cfg(feature = "lambda")]
+            lambda_background_shutdown: dependencies
+                .lambda_background_shutdown,
             #[cfg(feature = "rds")]
             rds: dependencies.rds,
             #[cfg(feature = "s3")]
@@ -663,9 +744,40 @@ impl RuntimeServices {
         }
     }
 
+    pub fn begin_shutdown(&self) {
+        #[cfg(feature = "eventbridge")]
+        if let Some(eventbridge_delivery_shutdown) =
+            &self.eventbridge_delivery_shutdown
+        {
+            eventbridge_delivery_shutdown.begin();
+        }
+    }
+
     pub fn shutdown(&self) {
+        self.begin_shutdown();
         #[cfg(feature = "eventbridge")]
         let _ = self.eventbridge.shutdown();
+        #[cfg(feature = "eventbridge")]
+        if let Some(eventbridge_delivery_shutdown) =
+            &self.eventbridge_delivery_shutdown
+        {
+            let drained = matches!(
+                eventbridge_delivery_shutdown
+                    .finish(EVENTBRIDGE_DELIVERY_DRAIN_TIMEOUT),
+                Ok(ThreadWorkQueueShutdownOutcome::Drained)
+            );
+            if !drained {
+                eventbridge_delivery_shutdown.request_hard_stop();
+                let _ = eventbridge_delivery_shutdown
+                    .finish(EVENTBRIDGE_DELIVERY_ABORT_TIMEOUT);
+            }
+        }
+        #[cfg(feature = "lambda")]
+        if let Some(lambda_background_shutdown) =
+            &self.lambda_background_shutdown
+        {
+            let _ = lambda_background_shutdown();
+        }
         #[cfg(feature = "rds")]
         let _ = self.rds.shutdown();
         #[cfg(feature = "elasticache")]
@@ -717,6 +829,11 @@ impl RuntimeServices {
         &self.eventbridge
     }
 
+    #[cfg(all(test, feature = "eventbridge"))]
+    pub(crate) fn has_eventbridge_delivery_shutdown(&self) -> bool {
+        self.eventbridge_delivery_shutdown.is_some()
+    }
+
     pub fn iam(&self) -> &IamService {
         &self.iam
     }
@@ -734,6 +851,16 @@ impl RuntimeServices {
     #[cfg(feature = "lambda")]
     pub fn lambda(&self) -> &LambdaService {
         &self.lambda
+    }
+
+    #[cfg(all(test, feature = "lambda"))]
+    pub(crate) fn has_lambda_background_shutdown(&self) -> bool {
+        self.lambda_background_shutdown.is_some()
+    }
+
+    #[cfg(feature = "lambda")]
+    pub fn lambda_requests(&self) -> LambdaRequestRuntime {
+        LambdaRequestRuntime::new(self.lambda.clone())
     }
 
     #[cfg(feature = "rds")]
@@ -761,6 +888,11 @@ impl RuntimeServices {
         &self.sqs
     }
 
+    #[cfg(feature = "sqs")]
+    pub fn sqs_requests(&self) -> SqsRequestRuntime {
+        SqsRequestRuntime::new(self.sqs.clone())
+    }
+
     #[cfg(feature = "ssm")]
     pub fn ssm(&self) -> &SsmService {
         &self.ssm
@@ -778,16 +910,20 @@ impl RuntimeServices {
 
 #[cfg(all(test, feature = "all-services"))]
 mod tests {
-    use super::{EnabledServices, RuntimeServicesBuilder, supported_services};
+    use super::{
+        EnabledServices, EventBridgeDeliveryShutdown, RuntimeServicesBuilder,
+        ThreadWorkQueueShutdownOutcome, supported_services,
+    };
     use crate::{
         ApiGatewayIntegrationExecutor, CreateQueueInput, EventBridgeScope,
         IamScope, PutEventsInput, PutEventsRequestEntry, S3Scope, SqsScope,
         TestRuntimeBuilder,
     };
-    use aws::ServiceName;
+    use aws::{InfrastructureError, ServiceName};
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn enabled_services_all_matches_supported_services() {
@@ -817,16 +953,15 @@ mod tests {
 
     #[test]
     fn runtime_services_builder_exposes_typed_service_accessors() {
-        let (_, runtime, _) =
-            TestRuntimeBuilder::new("runtime-services-builder")
-                .build()
-                .expect("test runtime should build")
-                .into_parts();
+        let (_, runtime) = TestRuntimeBuilder::new("runtime-services-builder")
+            .build()
+            .expect("test runtime should build")
+            .into_parts();
         let rebuilt = RuntimeServicesBuilder {
             apigateway: runtime.apigateway().clone(),
             execute_api_executor: Arc::new(
                 ApiGatewayIntegrationExecutor::new(
-                    runtime.lambda().clone(),
+                    Some(runtime.lambda_requests()),
                     None,
                 ),
             ),
@@ -836,10 +971,12 @@ mod tests {
             dynamodb: runtime.dynamodb().clone(),
             elasticache: runtime.elasticache().clone(),
             eventbridge: runtime.eventbridge().clone(),
+            eventbridge_delivery_shutdown: None,
             iam: runtime.iam().clone(),
             kinesis: runtime.kinesis().clone(),
             kms: runtime.kms().clone(),
             lambda: runtime.lambda().clone(),
+            lambda_background_shutdown: None,
             rds: runtime.rds().clone(),
             s3: runtime.s3().clone(),
             secrets_manager: runtime.secrets_manager().clone(),
@@ -907,7 +1044,7 @@ mod tests {
 
     #[test]
     fn runtime_services_shutdown_runs_storage_hook_once() {
-        let (_, runtime, _) =
+        let (_, runtime) =
             TestRuntimeBuilder::new("runtime-services-storage-shutdown")
                 .build()
                 .expect("test runtime should build")
@@ -918,7 +1055,7 @@ mod tests {
             apigateway: runtime.apigateway().clone(),
             execute_api_executor: Arc::new(
                 ApiGatewayIntegrationExecutor::new(
-                    runtime.lambda().clone(),
+                    Some(runtime.lambda_requests()),
                     None,
                 ),
             ),
@@ -928,10 +1065,12 @@ mod tests {
             dynamodb: runtime.dynamodb().clone(),
             elasticache: runtime.elasticache().clone(),
             eventbridge: runtime.eventbridge().clone(),
+            eventbridge_delivery_shutdown: None,
             iam: runtime.iam().clone(),
             kinesis: runtime.kinesis().clone(),
             kms: runtime.kms().clone(),
             lambda: runtime.lambda().clone(),
+            lambda_background_shutdown: None,
             rds: runtime.rds().clone(),
             s3: runtime.s3().clone(),
             secrets_manager: runtime.secrets_manager().clone(),
@@ -950,5 +1089,156 @@ mod tests {
         rebuilt.shutdown();
 
         assert_eq!(shutdown_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn runtime_services_shutdown_runs_eventbridge_delivery_hook_once() {
+        let (_, runtime) =
+            TestRuntimeBuilder::new("runtime-services-eventbridge-shutdown")
+                .build()
+                .expect("test runtime should build")
+                .into_parts();
+        let begin_calls = Arc::new(AtomicUsize::new(0));
+        let begin_calls_for_hook = Arc::clone(&begin_calls);
+        let hard_stop_calls = Arc::new(AtomicUsize::new(0));
+        let hard_stop_calls_for_hook = Arc::clone(&hard_stop_calls);
+        let finish_calls = Arc::new(AtomicUsize::new(0));
+        let finish_calls_for_hook = Arc::clone(&finish_calls);
+        let rebuilt =
+            RuntimeServicesBuilder {
+                apigateway: runtime.apigateway().clone(),
+                execute_api_executor: Arc::new(
+                    ApiGatewayIntegrationExecutor::new(
+                        Some(runtime.lambda_requests()),
+                        None,
+                    ),
+                ),
+                cloudformation: runtime.cloudformation().clone(),
+                cloudwatch: runtime.cloudwatch().clone(),
+                cognito: runtime.cognito().clone(),
+                dynamodb: runtime.dynamodb().clone(),
+                elasticache: runtime.elasticache().clone(),
+                eventbridge: runtime.eventbridge().clone(),
+                eventbridge_delivery_shutdown: Some(
+                    EventBridgeDeliveryShutdown::new(
+                        Arc::new(move || {
+                            begin_calls_for_hook
+                                .fetch_add(1, Ordering::SeqCst);
+                        }),
+                        Arc::new(move || {
+                            hard_stop_calls_for_hook
+                                .fetch_add(1, Ordering::SeqCst);
+                        }),
+                        Arc::new(move |timeout| {
+                            assert_eq!(timeout, Duration::from_millis(250));
+                            finish_calls_for_hook
+                                .fetch_add(1, Ordering::SeqCst);
+                            Ok::<
+                                ThreadWorkQueueShutdownOutcome,
+                                InfrastructureError,
+                            >(
+                                ThreadWorkQueueShutdownOutcome::Drained
+                            )
+                        }),
+                    ),
+                ),
+                iam: runtime.iam().clone(),
+                kinesis: runtime.kinesis().clone(),
+                kms: runtime.kms().clone(),
+                lambda: runtime.lambda().clone(),
+                lambda_background_shutdown: None,
+                rds: runtime.rds().clone(),
+                s3: runtime.s3().clone(),
+                secrets_manager: runtime.secrets_manager().clone(),
+                sns: runtime.sns().clone(),
+                sqs: runtime.sqs().clone(),
+                ssm: runtime.ssm().clone(),
+                storage_shutdown: None,
+                sts: runtime.sts().clone(),
+                step_functions: runtime.step_functions().clone(),
+            }
+            .build();
+
+        rebuilt.shutdown();
+
+        assert_eq!(begin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hard_stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(finish_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn runtime_services_shutdown_requests_hard_stop_after_timeout() {
+        let (_, runtime) =
+            TestRuntimeBuilder::new("runtime-services-eventbridge-hard-stop")
+                .build()
+                .expect("test runtime should build")
+                .into_parts();
+        let begin_calls = Arc::new(AtomicUsize::new(0));
+        let begin_calls_for_hook = Arc::clone(&begin_calls);
+        let hard_stop_calls = Arc::new(AtomicUsize::new(0));
+        let hard_stop_calls_for_hook = Arc::clone(&hard_stop_calls);
+        let finish_calls = Arc::new(AtomicUsize::new(0));
+        let finish_calls_for_hook = Arc::clone(&finish_calls);
+        let rebuilt =
+            RuntimeServicesBuilder {
+                apigateway: runtime.apigateway().clone(),
+                execute_api_executor: Arc::new(
+                    ApiGatewayIntegrationExecutor::new(
+                        Some(runtime.lambda_requests()),
+                        None,
+                    ),
+                ),
+                cloudformation: runtime.cloudformation().clone(),
+                cloudwatch: runtime.cloudwatch().clone(),
+                cognito: runtime.cognito().clone(),
+                dynamodb: runtime.dynamodb().clone(),
+                elasticache: runtime.elasticache().clone(),
+                eventbridge: runtime.eventbridge().clone(),
+                eventbridge_delivery_shutdown: Some(
+                    EventBridgeDeliveryShutdown::new(
+                        Arc::new(move || {
+                            begin_calls_for_hook
+                                .fetch_add(1, Ordering::SeqCst);
+                        }),
+                        Arc::new(move || {
+                            hard_stop_calls_for_hook
+                                .fetch_add(1, Ordering::SeqCst);
+                        }),
+                        Arc::new(move |_timeout| {
+                            let call = finish_calls_for_hook
+                                .fetch_add(1, Ordering::SeqCst);
+                            Ok::<
+                                ThreadWorkQueueShutdownOutcome,
+                                InfrastructureError,
+                            >(if call == 0 {
+                                ThreadWorkQueueShutdownOutcome::TimedOut
+                            } else {
+                                ThreadWorkQueueShutdownOutcome::Drained
+                            })
+                        }),
+                    ),
+                ),
+                iam: runtime.iam().clone(),
+                kinesis: runtime.kinesis().clone(),
+                kms: runtime.kms().clone(),
+                lambda: runtime.lambda().clone(),
+                lambda_background_shutdown: None,
+                rds: runtime.rds().clone(),
+                s3: runtime.s3().clone(),
+                secrets_manager: runtime.secrets_manager().clone(),
+                sns: runtime.sns().clone(),
+                sqs: runtime.sqs().clone(),
+                ssm: runtime.ssm().clone(),
+                storage_shutdown: None,
+                sts: runtime.sts().clone(),
+                step_functions: runtime.step_functions().clone(),
+            }
+            .build();
+
+        rebuilt.shutdown();
+
+        assert_eq!(begin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hard_stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(finish_calls.load(Ordering::SeqCst), 2);
     }
 }

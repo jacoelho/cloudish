@@ -13,6 +13,7 @@ pub const EDGE_PUBLIC_HOST_ENV: &str = "CLOUDISH_EDGE_PUBLIC_HOST";
 pub const EDGE_PUBLIC_PORT_ENV: &str = "CLOUDISH_EDGE_PUBLIC_PORT";
 pub const EDGE_PUBLIC_SCHEME_ENV: &str = "CLOUDISH_EDGE_PUBLIC_SCHEME";
 pub const EDGE_READY_FILE_ENV: &str = "CLOUDISH_EDGE_READY_FILE";
+pub const EDGE_WIRE_LOG_ENV: &str = "CLOUDISH_EDGE_WIRE_LOG";
 const DEFAULT_EDGE_PORT: u16 = 4566;
 const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
@@ -22,6 +23,7 @@ pub(crate) struct HostingPlan {
     edge_address: SocketAddr,
     max_request_bytes: usize,
     ready_file: Option<PathBuf>,
+    wire_log_enabled: bool,
 }
 
 impl HostingPlan {
@@ -57,6 +59,10 @@ impl HostingPlan {
             .unwrap_or_else(|| "http".to_owned());
         let ready_file =
             read_env(EDGE_READY_FILE_ENV).map(parse_ready_file).transpose()?;
+        let wire_log_enabled = read_env(EDGE_WIRE_LOG_ENV)
+            .map(parse_wire_log)
+            .transpose()?
+            .unwrap_or(false);
 
         Ok(Self {
             advertised_edge: AdvertisedEdgeTemplate::new(
@@ -67,6 +73,7 @@ impl HostingPlan {
             edge_address: SocketAddr::new(host, port),
             max_request_bytes,
             ready_file,
+            wire_log_enabled,
         })
     }
 
@@ -79,6 +86,7 @@ impl HostingPlan {
             )),
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             ready_file: None,
+            wire_log_enabled: false,
         }
     }
 
@@ -97,6 +105,10 @@ impl HostingPlan {
     pub(crate) fn ready_file(&self) -> Option<&PathBuf> {
         self.ready_file.as_ref()
     }
+
+    pub(crate) fn wire_log_enabled(&self) -> bool {
+        self.wire_log_enabled
+    }
 }
 
 #[derive(Debug)]
@@ -106,12 +118,14 @@ pub enum HostingPlanError {
     BlankPublicHost,
     BlankPublicScheme,
     BlankReadyFile,
+    BlankWireLog,
     InvalidHost { source: AddrParseError },
     InvalidMaxRequestBytes { source: ParseIntError },
     BlankPort,
     BlankPublicPort,
     InvalidPort { source: ParseIntError },
     InvalidPublicPort { source: ParseIntError },
+    InvalidWireLog { value: String },
     ZeroMaxRequestBytes,
 }
 
@@ -138,6 +152,10 @@ impl fmt::Display for HostingPlanError {
                 formatter,
                 "invalid edge ready file in {EDGE_READY_FILE_ENV}: value must not be blank"
             ),
+            Self::BlankWireLog => write!(
+                formatter,
+                "invalid edge wire log mode in {EDGE_WIRE_LOG_ENV}: value must not be blank"
+            ),
             Self::InvalidHost { source, .. } => write!(
                 formatter,
                 "invalid edge host in {EDGE_HOST_ENV}: {source}"
@@ -162,6 +180,10 @@ impl fmt::Display for HostingPlanError {
                 formatter,
                 "invalid public edge port in {EDGE_PUBLIC_PORT_ENV}: {source}"
             ),
+            Self::InvalidWireLog { value } => write!(
+                formatter,
+                "invalid edge wire log mode in {EDGE_WIRE_LOG_ENV}: unsupported value `{value}`"
+            ),
             Self::ZeroMaxRequestBytes => write!(
                 formatter,
                 "invalid edge request size in {EDGE_MAX_REQUEST_BYTES_ENV}: value must be greater than zero"
@@ -183,7 +205,9 @@ impl Error for HostingPlanError {
             | Self::BlankPublicPort
             | Self::BlankPublicScheme
             | Self::BlankReadyFile
+            | Self::BlankWireLog
             | Self::BlankPort
+            | Self::InvalidWireLog { .. }
             | Self::ZeroMaxRequestBytes => None,
         }
     }
@@ -261,6 +285,19 @@ fn parse_ready_file(value: String) -> Result<PathBuf, HostingPlanError> {
     Ok(PathBuf::from(value))
 }
 
+fn parse_wire_log(value: String) -> Result<bool, HostingPlanError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(HostingPlanError::BlankWireLog);
+    }
+
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(HostingPlanError::InvalidWireLog { value }),
+    }
+}
+
 fn default_public_host(host: IpAddr) -> String {
     if host.is_loopback() || host.is_unspecified() {
         return "localhost".to_owned();
@@ -274,7 +311,7 @@ mod tests {
     use super::{
         EDGE_HOST_ENV, EDGE_MAX_REQUEST_BYTES_ENV, EDGE_PORT_ENV,
         EDGE_PUBLIC_HOST_ENV, EDGE_PUBLIC_PORT_ENV, EDGE_PUBLIC_SCHEME_ENV,
-        EDGE_READY_FILE_ENV, HostingPlan, HostingPlanError,
+        EDGE_READY_FILE_ENV, EDGE_WIRE_LOG_ENV, HostingPlan, HostingPlanError,
     };
     use std::error::Error;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -292,6 +329,7 @@ mod tests {
             "http://localhost:4566"
         );
         assert_eq!(plan.max_request_bytes(), 64 * 1024 * 1024);
+        assert!(!plan.wire_log_enabled());
     }
 
     #[test]
@@ -308,6 +346,7 @@ mod tests {
             "http://localhost:4566"
         );
         assert_eq!(plan.max_request_bytes(), 64 * 1024 * 1024);
+        assert!(!plan.wire_log_enabled());
     }
 
     #[test]
@@ -320,6 +359,7 @@ mod tests {
             EDGE_PUBLIC_PORT_ENV => Some("8080".to_owned()),
             EDGE_PUBLIC_SCHEME_ENV => Some("https".to_owned()),
             EDGE_READY_FILE_ENV => Some("/tmp/cloudish-ready".to_owned()),
+            EDGE_WIRE_LOG_ENV => Some("true".to_owned()),
             _ => None,
         })
         .expect("valid overrides should build a listener plan");
@@ -334,6 +374,7 @@ mod tests {
             plan.ready_file().expect("ready file should be set"),
             &std::path::PathBuf::from("/tmp/cloudish-ready")
         );
+        assert!(plan.wire_log_enabled());
     }
 
     #[test]
@@ -368,6 +409,47 @@ mod tests {
         assert_eq!(
             Error::source(&error).map(ToString::to_string).as_deref(),
             Some("invalid IP address syntax")
+        );
+    }
+
+    #[test]
+    fn env_plan_accepts_false_wire_log_value() {
+        let plan = HostingPlan::from_env(|name| match name {
+            EDGE_WIRE_LOG_ENV => Some("off".to_owned()),
+            _ => None,
+        })
+        .expect("wire log override should parse");
+
+        assert!(!plan.wire_log_enabled());
+    }
+
+    #[test]
+    fn env_plan_rejects_blank_wire_log_value() {
+        let error = HostingPlan::from_env(|name| match name {
+            EDGE_WIRE_LOG_ENV => Some("   ".to_owned()),
+            _ => None,
+        })
+        .expect_err("blank wire log mode must fail");
+
+        assert!(matches!(error, HostingPlanError::BlankWireLog));
+        assert_eq!(
+            error.to_string(),
+            "invalid edge wire log mode in CLOUDISH_EDGE_WIRE_LOG: value must not be blank"
+        );
+    }
+
+    #[test]
+    fn env_plan_rejects_unknown_wire_log_value() {
+        let error = HostingPlan::from_env(|name| match name {
+            EDGE_WIRE_LOG_ENV => Some("verbose".to_owned()),
+            _ => None,
+        })
+        .expect_err("unknown wire log mode must fail");
+
+        assert!(matches!(error, HostingPlanError::InvalidWireLog { .. }));
+        assert_eq!(
+            error.to_string(),
+            "invalid edge wire log mode in CLOUDISH_EDGE_WIRE_LOG: unsupported value `verbose`"
         );
     }
 

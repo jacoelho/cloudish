@@ -229,3 +229,58 @@ async fn eventbridge_reports_explicit_batch_failures() {
     );
     assert!(output.entries()[1].event_id().is_some());
 }
+
+#[tokio::test]
+async fn eventbridge_rejects_cross_scope_target_arns() {
+    let runtime = shared_runtime().await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let eventbridge = EventBridgeClient::new(&config);
+
+    let bus_name = unique_name("cross-scope-bus");
+    eventbridge
+        .create_event_bus()
+        .name(&bus_name)
+        .send()
+        .await
+        .expect("event bus should create");
+    eventbridge
+        .put_rule()
+        .event_bus_name(&bus_name)
+        .name("orders-created")
+        .event_pattern(r#"{"source":["orders"]}"#)
+        .send()
+        .await
+        .expect("rule should create");
+
+    let output = eventbridge
+        .put_targets()
+        .event_bus_name(&bus_name)
+        .rule("orders-created")
+        .targets(
+            Target::builder()
+                .id("cross-region")
+                .arn("arn:aws:sqs:us-east-1:000000000000:orders")
+                .build()
+                .expect("target should build"),
+        )
+        .send()
+        .await
+        .expect("put targets should return failure entries");
+
+    assert_eq!(output.failed_entry_count(), 1);
+    assert_eq!(output.failed_entries().len(), 1);
+    assert_eq!(
+        output.failed_entries()[0].error_code(),
+        Some("ValidationException")
+    );
+    assert!(
+        output.failed_entries()[0]
+            .error_message()
+            .expect("failure message should exist")
+            .contains("must match the rule account and region")
+    );
+}

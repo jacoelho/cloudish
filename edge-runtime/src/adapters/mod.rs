@@ -33,3 +33,6 @@ pub use runtime::{
 pub use runtime::{
     ThreadStepFunctionsExecutionSpawner, ThreadStepFunctionsSleeper,
 };
+pub(crate) use runtime::{
+    ThreadWorkQueue, ThreadWorkQueueShutdownOutcome, ThreadWorkQueueStopToken,
+};

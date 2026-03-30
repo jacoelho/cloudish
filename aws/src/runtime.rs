@@ -428,6 +428,22 @@ pub trait HttpForwarder: Send + Sync {
         &self,
         request: &HttpForwardRequest,
     ) -> Result<HttpForwardResponse, InfrastructureError>;
+
+    /// Forwards an HTTP request and allows request-scoped callers to stop the
+    /// operation when their own shutdown boundary is reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InfrastructureError` when the request cannot be forwarded,
+    /// the response cannot be read, or the caller cancels the request.
+    fn forward_with_cancellation(
+        &self,
+        request: &HttpForwardRequest,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<HttpForwardResponse, InfrastructureError> {
+        let _ = is_cancelled;
+        self.forward(request)
+    }
 }
 
 pub trait Clock: Send + Sync {
@@ -614,6 +630,22 @@ pub trait LambdaExecutor: Send + Sync {
         &self,
         request: &LambdaInvocationRequest,
     ) -> Result<LambdaInvocationResult, InfrastructureError>;
+
+    /// Executes a Lambda invocation synchronously with an optional
+    /// request-scoped cancellation boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InfrastructureError` when the Lambda runtime cannot execute
+    /// the request.
+    fn invoke_with_cancellation(
+        &self,
+        request: &LambdaInvocationRequest,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<LambdaInvocationResult, InfrastructureError> {
+        let _ = is_cancelled;
+        self.invoke(request)
+    }
 
     /// Executes a Lambda invocation asynchronously.
     ///

@@ -4,6 +4,7 @@ use crate::runtime::EdgeResponse;
 use aws::{AdvertisedEdge, AwsError, RequestContext};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use edge_runtime::LambdaRequestRuntime;
 use serde::Deserialize;
 use serde::Serialize;
 use services::{
@@ -18,14 +19,17 @@ use services::{
     UpdateFunctionEventInvokeConfigInput, UpdateFunctionUrlConfigInput,
 };
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub(crate) fn handle_rest_json(
     lambda: &LambdaService,
+    lambda_requests: &LambdaRequestRuntime,
     advertised_edge: &AdvertisedEdge,
     request: &HttpRequest<'_>,
     context: &RequestContext,
+    request_cancellation: &AtomicBool,
 ) -> Result<EdgeResponse, AwsError> {
     let route = parse_route(request).map_err(|error| error.to_aws_error())?;
     let scope = LambdaScope::new(
@@ -484,7 +488,7 @@ pub(crate) fn handle_rest_json(
             let invocation_type =
                 parse_invocation_type(request.header("x-amz-invocation-type"))
                     .map_err(|error| error.to_aws_error())?;
-            let output = lambda
+            let output = lambda_requests
                 .invoke(
                     &scope,
                     &function_name,
@@ -493,6 +497,7 @@ pub(crate) fn handle_rest_json(
                         invocation_type,
                         payload: request.body().to_vec(),
                     },
+                    &|| request_cancellation.load(Ordering::SeqCst),
                 )
                 .map_err(|error| error.to_aws_error())?;
 

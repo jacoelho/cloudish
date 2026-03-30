@@ -12,6 +12,7 @@
     )
 )]
 
+mod edge_wire_log;
 mod hosting;
 mod transport;
 
@@ -26,15 +27,16 @@ use edge_runtime::DynamoDbInitError;
 use edge_runtime::ElastiCacheError;
 #[cfg(feature = "eventbridge")]
 use edge_runtime::EventBridgeError;
+#[cfg(any(feature = "eventbridge", feature = "lambda"))]
+use edge_runtime::InfrastructureError;
+#[cfg(feature = "lambda")]
+use edge_runtime::LambdaInitError;
 #[cfg(feature = "rds")]
 use edge_runtime::RdsError;
 #[cfg(feature = "s3")]
 use edge_runtime::S3InitError;
-#[cfg(feature = "lambda")]
-use edge_runtime::{InfrastructureError, LambdaInitError};
 use edge_runtime::{
-    LocalRuntimeBuilder, ManagedBackgroundTasks, RuntimeBuildError,
-    supported_services,
+    LocalRuntimeBuilder, RuntimeBuildError, supported_services,
 };
 use hosting::HostingPlan;
 use http::EdgeRouter;
@@ -44,14 +46,15 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use storage::{StorageError, StorageRuntime};
 use tokio::net::TcpListener;
 
+pub use edge_wire_log::WireLogInitError;
 pub use hosting::{
     EDGE_HOST_ENV, EDGE_MAX_REQUEST_BYTES_ENV, EDGE_PORT_ENV,
     EDGE_PUBLIC_HOST_ENV, EDGE_PUBLIC_PORT_ENV, EDGE_PUBLIC_SCHEME_ENV,
-    EDGE_READY_FILE_ENV, HostingPlanError,
+    EDGE_READY_FILE_ENV, EDGE_WIRE_LOG_ENV, HostingPlanError,
 };
 
 #[derive(Clone)]
@@ -60,10 +63,61 @@ pub struct CloudishApp {
     advertised_edge: SharedAdvertisedEdge,
     advertised_edge_template: aws::AdvertisedEdgeTemplate,
     max_request_bytes: usize,
-    #[cfg(feature = "lambda")]
-    _lambda_background_tasks: Arc<ManagedBackgroundTasks>,
     ready_file: Option<PathBuf>,
     router: EdgeRouter,
+    serve_state: Arc<Mutex<ServeState>>,
+    wire_log_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeState {
+    Ready,
+    Serving,
+    Closed,
+}
+
+struct ServeGuard {
+    state: Arc<Mutex<ServeState>>,
+    released: bool,
+}
+
+impl ServeGuard {
+    fn begin(state: &Arc<Mutex<ServeState>>) -> Result<Self, StartupError> {
+        let mut current = recover(state.lock());
+        match *current {
+            ServeState::Ready => {
+                *current = ServeState::Serving;
+                Ok(Self { state: Arc::clone(state), released: false })
+            }
+            ServeState::Serving => Err(StartupError::AlreadyServing),
+            ServeState::Closed => Err(StartupError::AlreadyServed),
+        }
+    }
+
+    fn release_to_ready(&mut self) {
+        if self.released {
+            return;
+        }
+        *recover(self.state.lock()) = ServeState::Ready;
+        self.released = true;
+    }
+
+    fn release_to_closed(&mut self) {
+        if self.released {
+            return;
+        }
+        *recover(self.state.lock()) = ServeState::Closed;
+        self.released = true;
+    }
+}
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        *recover(self.state.lock()) = ServeState::Closed;
+    }
 }
 
 impl fmt::Debug for CloudishApp {
@@ -120,14 +174,12 @@ impl CloudishApp {
         let advertised_edge = SharedAdvertisedEdge::new(
             hosting.advertised_edge().resolve(hosting.edge_address().port()),
         );
-        let (services, runtime, background_tasks) =
+        let (services, runtime) =
             LocalRuntimeBuilder::new(defaults.clone(), authenticator.clone())
                 .with_advertised_edge(advertised_edge.clone())
                 .build()
                 .map_err(StartupError::from)
                 .map(|assembly| assembly.into_parts())?;
-        #[cfg(not(feature = "lambda"))]
-        let _ = background_tasks;
         let router = EdgeRouter::new(
             defaults,
             advertised_edge.clone(),
@@ -141,10 +193,10 @@ impl CloudishApp {
             advertised_edge,
             advertised_edge_template: hosting.advertised_edge().clone(),
             max_request_bytes: hosting.max_request_bytes(),
-            #[cfg(feature = "lambda")]
-            _lambda_background_tasks: Arc::new(background_tasks),
             ready_file: hosting.ready_file().cloned(),
             router,
+            serve_state: Arc::new(Mutex::new(ServeState::Ready)),
+            wire_log_enabled: hosting.wire_log_enabled(),
         })
     }
 
@@ -153,35 +205,103 @@ impl CloudishApp {
     }
 
     /// Bind the configured edge address and serve until shutdown resolves.
+    /// The caller retains ownership of the app while serving.
     ///
     /// # Errors
     ///
     /// Returns [`StartupError`] when the edge listener cannot bind or a
     /// connection cannot be accepted.
     pub async fn serve_with_shutdown<F>(
-        self,
+        &self,
         shutdown: F,
     ) -> Result<(), StartupError>
     where
         F: Future<Output = ()>,
     {
-        let listener = TcpListener::bind(self.edge_address()).await.map_err(
-            |source| StartupError::Bind {
-                address: self.edge_address(),
-                source,
-            },
-        )?;
+        self.serve_with_shutdown_with_wire_log_init(
+            shutdown,
+            edge_wire_log::try_init_tracing,
+        )
+        .await
+    }
 
-        self.serve_listener_with_shutdown(listener, shutdown).await
+    async fn serve_with_shutdown_with_wire_log_init<F, G>(
+        &self,
+        shutdown: F,
+        init_wire_log: G,
+    ) -> Result<(), StartupError>
+    where
+        F: Future<Output = ()>,
+        G: FnOnce() -> Result<(), WireLogInitError>,
+    {
+        let mut serve_guard = self.begin_serve()?;
+        if let Err(error) = self.prepare_for_serve_with(init_wire_log) {
+            serve_guard.release_to_ready();
+            return Err(error);
+        }
+        let listener =
+            TcpListener::bind(self.edge_address()).await.map_err(|source| {
+                StartupError::Bind { address: self.edge_address(), source }
+            });
+        let listener = match listener {
+            Ok(listener) => listener,
+            Err(error) => {
+                serve_guard.release_to_ready();
+                return Err(error);
+            }
+        };
+
+        let result =
+            self.serve_listener_after_prepare(listener, shutdown).await;
+        serve_guard.release_to_closed();
+        result
     }
 
     /// Serve on an existing listener until shutdown resolves.
+    /// The caller retains ownership of the app while serving.
     ///
     /// # Errors
     ///
     /// Returns [`StartupError`] when the listener cannot accept a connection.
     pub async fn serve_listener_with_shutdown<F>(
-        self,
+        &self,
+        listener: TcpListener,
+        shutdown: F,
+    ) -> Result<(), StartupError>
+    where
+        F: Future<Output = ()>,
+    {
+        self.serve_listener_with_shutdown_with_wire_log_init(
+            listener,
+            shutdown,
+            edge_wire_log::try_init_tracing,
+        )
+        .await
+    }
+
+    async fn serve_listener_with_shutdown_with_wire_log_init<F, G>(
+        &self,
+        listener: TcpListener,
+        shutdown: F,
+        init_wire_log: G,
+    ) -> Result<(), StartupError>
+    where
+        F: Future<Output = ()>,
+        G: FnOnce() -> Result<(), WireLogInitError>,
+    {
+        let mut serve_guard = self.begin_serve()?;
+        if let Err(error) = self.prepare_for_serve_with(init_wire_log) {
+            serve_guard.release_to_ready();
+            return Err(error);
+        }
+        let result =
+            self.serve_listener_after_prepare(listener, shutdown).await;
+        serve_guard.release_to_closed();
+        result
+    }
+
+    async fn serve_listener_after_prepare<F>(
+        &self,
         listener: TcpListener,
         shutdown: F,
     ) -> Result<(), StartupError>
@@ -199,11 +319,30 @@ impl CloudishApp {
         }
         transport::serve_listener_with_shutdown(
             listener,
-            self.router,
+            self.router.clone(),
             self.max_request_bytes,
+            self.wire_log_enabled,
             shutdown,
         )
         .await
+    }
+
+    fn prepare_for_serve_with<F>(
+        &self,
+        init_wire_log: F,
+    ) -> Result<(), StartupError>
+    where
+        F: FnOnce() -> Result<(), WireLogInitError>,
+    {
+        if !self.wire_log_enabled {
+            return Ok(());
+        }
+
+        init_wire_log().map_err(StartupError::WireLogInit)
+    }
+
+    fn begin_serve(&self) -> Result<ServeGuard, StartupError> {
+        ServeGuard::begin(&self.serve_state)
     }
 }
 
@@ -254,6 +393,13 @@ where
     HostingPlan::from_env(read_env).map_err(StartupError::HostingConfig)
 }
 
+fn recover<T>(result: LockResult<MutexGuard<'_, T>>) -> MutexGuard<'_, T> {
+    match result {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn write_ready_file(
     path: &PathBuf,
     address: SocketAddr,
@@ -273,6 +419,8 @@ pub enum StartupError {
     Accept {
         source: io::Error,
     },
+    AlreadyServed,
+    AlreadyServing,
     Bind {
         address: SocketAddr,
         source: io::Error,
@@ -283,10 +431,16 @@ pub enum StartupError {
     ListenerAddress {
         source: io::Error,
     },
+    ShutdownTimeout {
+        active_requests: usize,
+    },
+    WireLogInit(WireLogInitError),
     #[cfg(feature = "dynamodb")]
     DynamoDbState(DynamoDbInitError),
     #[cfg(feature = "elasticache")]
     ElastiCacheRestore(ElastiCacheError),
+    #[cfg(feature = "eventbridge")]
+    EventBridgeRuntime(InfrastructureError),
     #[cfg(feature = "eventbridge")]
     EventBridgeRestore(EventBridgeError),
     #[cfg(feature = "lambda")]
@@ -310,6 +464,18 @@ impl fmt::Display for StartupError {
             Self::Accept { source } => {
                 write!(formatter, "failed to accept edge connection: {source}")
             }
+            Self::AlreadyServed => {
+                write!(
+                    formatter,
+                    "CloudishApp cannot be served again after it has stopped"
+                )
+            }
+            Self::AlreadyServing => {
+                write!(
+                    formatter,
+                    "CloudishApp is already serving on another listener"
+                )
+            }
             Self::Bind { address, source } => write!(
                 formatter,
                 "failed to bind edge listener on {address}: {source}"
@@ -329,6 +495,16 @@ impl fmt::Display for StartupError {
             Self::ListenerAddress { source } => {
                 write!(formatter, "failed to inspect edge listener: {source}")
             }
+            Self::ShutdownTimeout { active_requests } => write!(
+                formatter,
+                "edge shutdown timed out with {active_requests} blocking requests still active"
+            ),
+            Self::WireLogInit(source) => {
+                write!(
+                    formatter,
+                    "failed to initialize edge wire logging: {source}"
+                )
+            }
             #[cfg(feature = "dynamodb")]
             Self::DynamoDbState(source) => {
                 write!(formatter, "failed to load DynamoDB state: {source}")
@@ -337,6 +513,11 @@ impl fmt::Display for StartupError {
             Self::ElastiCacheRestore(source) => write!(
                 formatter,
                 "failed to restore ElastiCache runtimes: {source}"
+            ),
+            #[cfg(feature = "eventbridge")]
+            Self::EventBridgeRuntime(source) => write!(
+                formatter,
+                "failed to start EventBridge delivery runtime: {source}"
             ),
             #[cfg(feature = "eventbridge")]
             Self::EventBridgeRestore(source) => write!(
@@ -380,8 +561,11 @@ impl Error for StartupError {
             | Self::Bind { source, .. }
             | Self::ListenerAddress { source }
             | Self::StateDirectory { source, .. } => Some(source),
+            Self::WireLogInit(source) => Some(source),
             #[cfg(feature = "dynamodb")]
             Self::DynamoDbState(source) => Some(source),
+            #[cfg(feature = "eventbridge")]
+            Self::EventBridgeRuntime(source) => Some(source),
             #[cfg(feature = "eventbridge")]
             Self::EventBridgeRestore(source) => Some(source),
             #[cfg(feature = "elasticache")]
@@ -395,9 +579,11 @@ impl Error for StartupError {
             #[cfg(feature = "s3")]
             Self::S3State(source) => Some(source),
             Self::StorageLoad(source) => Some(source),
+            Self::AlreadyServed | Self::AlreadyServing => None,
             Self::BuildConfiguration(_) => None,
             Self::Config(source) => Some(source),
             Self::HostingConfig(source) => Some(source),
+            Self::ShutdownTimeout { .. } => None,
         }
     }
 }
@@ -415,6 +601,10 @@ impl From<RuntimeBuildError> for StartupError {
             #[cfg(feature = "elasticache")]
             RuntimeBuildError::ElastiCacheRestore(source) => {
                 Self::ElastiCacheRestore(source)
+            }
+            #[cfg(feature = "eventbridge")]
+            RuntimeBuildError::EventBridgeRuntime(source) => {
+                Self::EventBridgeRuntime(source)
             }
             #[cfg(feature = "eventbridge")]
             RuntimeBuildError::EventBridgeRestore(source) => {
@@ -443,12 +633,17 @@ impl From<RuntimeBuildError> for StartupError {
 mod tests {
     use super::{
         CloudishApp, EDGE_HOST_ENV, EDGE_MAX_REQUEST_BYTES_ENV, EDGE_PORT_ENV,
+        EDGE_READY_FILE_ENV, EDGE_WIRE_LOG_ENV, WireLogInitError,
         load_hosting_plan, load_runtime_defaults,
     };
     use aws::{
         DEFAULT_ACCOUNT_ENV, DEFAULT_REGION_ENV, RuntimeDefaults,
         STATE_DIRECTORY_ENV,
     };
+    #[cfg(unix)]
+    use base64::Engine as _;
+    #[cfg(unix)]
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use httpdate::parse_http_date;
     use serde_json::Value;
     use std::error::Error;
@@ -456,6 +651,7 @@ mod tests {
     use std::io::Write;
     use std::net::Shutdown;
     use std::net::TcpListener as StdTcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
     use test_support::{
@@ -463,6 +659,8 @@ mod tests {
     };
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+    #[cfg(unix)]
+    use zip::write::FileOptions;
 
     fn runtime_defaults(label: &str) -> RuntimeDefaults {
         let state_directory = temporary_directory(label).join("state");
@@ -484,6 +682,81 @@ mod tests {
 
         format!(
             "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn query_form_request(path: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[cfg(feature = "lambda")]
+    fn create_iam_role_request(role_name: &str) -> String {
+        let trust_policy = urlencoding::encode(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#,
+        );
+
+        query_form_request(
+            "/",
+            &format!(
+                "Action=CreateRole&Version=2010-05-08&RoleName={role_name}&AssumeRolePolicyDocument={trust_policy}",
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn lambda_archive_base64(entries: &[(&str, &str)]) -> String {
+        let mut cursor = io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            for (path, body) in entries {
+                let options = if *path == "bootstrap" {
+                    FileOptions::default().unix_permissions(0o755)
+                } else {
+                    FileOptions::default().unix_permissions(0o644)
+                };
+                writer
+                    .start_file(*path, options)
+                    .expect("zip entry should start");
+                writer
+                    .write_all(body.as_bytes())
+                    .expect("zip entry should write");
+            }
+            writer.finish().expect("zip should finish");
+        }
+
+        BASE64_STANDARD.encode(cursor.into_inner())
+    }
+
+    #[cfg(unix)]
+    fn create_lambda_request(
+        function_name: &str,
+        archive_base64: &str,
+    ) -> String {
+        let body = serde_json::json!({
+            "Code": {
+                "ZipFile": archive_base64,
+            },
+            "FunctionName": function_name,
+            "Handler": "bootstrap.handler",
+            "Role": "arn:aws:iam::000000000000:role/service-role/lambda-role",
+            "Runtime": "provided.al2",
+        })
+        .to_string();
+
+        format!(
+            "POST /2015-03-31/functions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[cfg(unix)]
+    fn invoke_lambda_request(function_name: &str, body: &str) -> String {
+        format!(
+            "POST /2015-03-31/functions/{function_name}/invocations HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nX-Amz-Invocation-Type: RequestResponse\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
     }
@@ -542,12 +815,32 @@ mod tests {
             EDGE_HOST_ENV => Some("0.0.0.0".to_owned()),
             EDGE_PORT_ENV => Some("4570".to_owned()),
             EDGE_MAX_REQUEST_BYTES_ENV => Some("1048576".to_owned()),
+            EDGE_WIRE_LOG_ENV => Some("on".to_owned()),
             _ => None,
         })
         .expect("valid hosting overrides should build");
 
         assert_eq!(plan.edge_address().to_string(), "0.0.0.0:4570");
         assert_eq!(plan.max_request_bytes(), 1_048_576);
+        assert!(plan.wire_log_enabled());
+    }
+
+    #[test]
+    fn prepare_for_serve_skips_wire_log_initialization_when_disabled() {
+        let server = CloudishApp::from_runtime_defaults(runtime_defaults(
+            "wire-log-disabled",
+        ))
+        .expect("server bootstrap should succeed");
+        let init_calls = AtomicUsize::new(0);
+
+        server
+            .prepare_for_serve_with(|| {
+                init_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect("disabled wire log should skip initialization");
+
+        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -597,6 +890,13 @@ mod tests {
             path: "/tmp/cloudish-state".into(),
             source: io::Error::other("mkdir failure"),
         };
+        let shutdown_timeout_error =
+            super::StartupError::ShutdownTimeout { active_requests: 2 };
+        let already_serving_error = super::StartupError::AlreadyServing;
+        let already_served_error = super::StartupError::AlreadyServed;
+        let wire_log_error = super::StartupError::WireLogInit(
+            WireLogInitError::GlobalSubscriberAlreadySet,
+        );
 
         assert_eq!(
             bind_error.to_string(),
@@ -619,10 +919,32 @@ mod tests {
             "failed to create state directory `/tmp/cloudish-state`: mkdir failure"
         );
         assert_eq!(
+            shutdown_timeout_error.to_string(),
+            "edge shutdown timed out with 2 blocking requests still active"
+        );
+        assert_eq!(
+            already_serving_error.to_string(),
+            "CloudishApp is already serving on another listener"
+        );
+        assert_eq!(
+            already_served_error.to_string(),
+            "CloudishApp cannot be served again after it has stopped"
+        );
+        assert_eq!(
+            wire_log_error.to_string(),
+            "failed to initialize edge wire logging: wire logging requested by CLOUDISH_EDGE_WIRE_LOG, but Cloudish could not install its JSON tracing subscriber because a global tracing subscriber is already installed"
+        );
+        assert_eq!(
             Error::source(&state_directory_error)
                 .map(ToString::to_string)
                 .as_deref(),
             Some("mkdir failure")
+        );
+        assert_eq!(
+            Error::source(&wire_log_error).map(ToString::to_string).as_deref(),
+            Some(
+                "wire logging requested by CLOUDISH_EDGE_WIRE_LOG, but Cloudish could not install its JSON tracing subscriber because a global tracing subscriber is already installed"
+            )
         );
     }
 
@@ -682,6 +1004,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_listener_with_shutdown_rejects_second_serve_after_clean_stop()
+     {
+        let server = CloudishApp::from_runtime_defaults(runtime_defaults(
+            "server-borrowed-serve",
+        ))
+        .expect("server bootstrap should succeed");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+
+        server
+            .serve_listener_with_shutdown(listener, async {})
+            .await
+            .expect("server should stop cleanly");
+
+        let second_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("second listener should bind");
+        let error = server
+            .serve_listener_with_shutdown(second_listener, async {})
+            .await
+            .expect_err("server should reject repeated serve");
+
+        assert!(matches!(error, super::StartupError::AlreadyServed));
+    }
+
+    #[tokio::test]
+    async fn serve_listener_with_shutdown_rejects_concurrent_serve_attempts() {
+        let server = CloudishApp::from_runtime_defaults(runtime_defaults(
+            "server-concurrent-serve",
+        ))
+        .expect("server bootstrap should succeed");
+        let first_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("first listener should bind");
+        let second_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("second listener should bind");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let serving_server = server.clone();
+
+        let first_handle = tokio::spawn(async move {
+            serving_server
+                .serve_listener_with_shutdown(first_listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let error = server
+            .serve_listener_with_shutdown(second_listener, async {})
+            .await
+            .expect_err("server should reject concurrent serve");
+
+        assert!(matches!(error, super::StartupError::AlreadyServing));
+        shutdown_tx.send(()).expect("first server should still be running");
+        first_handle
+            .await
+            .expect("first server task should complete")
+            .expect("first server should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn serve_with_shutdown_allows_retry_after_bind_failure() {
+        let port = available_port();
+        let occupied = StdTcpListener::bind(("127.0.0.1", port))
+            .expect("port should bind");
+        let hosting = load_hosting_plan(|name| match name {
+            EDGE_PORT_ENV => Some(port.to_string()),
+            _ => None,
+        })
+        .expect("ephemeral hosting plan should build");
+        let server = CloudishApp::from_runtime_defaults_with_hosting(
+            runtime_defaults("server-bind-retry"),
+            hosting,
+        )
+        .expect("server bootstrap should succeed");
+
+        let error = server
+            .serve_with_shutdown(async {})
+            .await
+            .expect_err("bind failure should surface");
+        assert!(matches!(error, super::StartupError::Bind { .. }));
+        drop(occupied);
+
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("retry listener should bind");
+        server
+            .serve_listener_with_shutdown(listener, async {})
+            .await
+            .expect("server should remain reusable after bind failure");
+    }
+
+    #[tokio::test]
     async fn serve_with_shutdown_reports_bind_errors() {
         let port = available_port();
         let occupied = StdTcpListener::bind(("127.0.0.1", port))
@@ -704,6 +1122,40 @@ mod tests {
 
         assert!(matches!(error, super::StartupError::Bind { .. }));
         drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn serve_with_shutdown_reports_wire_log_init_errors_before_binding()
+    {
+        let port = available_port();
+        let hosting = load_hosting_plan(|name| match name {
+            EDGE_PORT_ENV => Some(port.to_string()),
+            EDGE_WIRE_LOG_ENV => Some("on".to_owned()),
+            _ => None,
+        })
+        .expect("wire log hosting plan should build");
+        let server = CloudishApp::from_runtime_defaults_with_hosting(
+            runtime_defaults("wire-log-bind-error"),
+            hosting,
+        )
+        .expect("server bootstrap should succeed");
+
+        let error = server
+            .serve_with_shutdown_with_wire_log_init(async {}, || {
+                Err(WireLogInitError::GlobalSubscriberAlreadySet)
+            })
+            .await
+            .expect_err("wire log init failure should surface");
+
+        assert!(matches!(
+            error,
+            super::StartupError::WireLogInit(
+                WireLogInitError::GlobalSubscriberAlreadySet
+            )
+        ));
+        let listener = StdTcpListener::bind(("127.0.0.1", port))
+            .expect("wire log init failure should happen before bind");
+        drop(listener);
     }
 
     #[tokio::test]
@@ -951,6 +1403,204 @@ mod tests {
         assert_eq!(response_body(&get_response), b"data123");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn serve_listener_handles_health_checks_while_sqs_long_poll_is_waiting()
+     {
+        let server = CloudishApp::from_runtime_defaults(runtime_defaults(
+            "server-long-poll-health",
+        ))
+        .expect("server bootstrap should succeed");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should expose its address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            server
+                .serve_listener_with_shutdown(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let create_queue_request = query_form_request(
+            "/",
+            "Action=CreateQueue&Version=2012-11-05&QueueName=orders",
+        );
+        let create_queue_response = tokio::task::spawn_blocking(move || {
+            send_http_request(address, &create_queue_request)
+        })
+        .await
+        .expect("queue creation task should complete")
+        .expect("queue creation should succeed");
+        assert!(create_queue_response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let long_poll_request = query_form_request(
+            "/000000000000/orders",
+            "Action=ReceiveMessage&Version=2012-11-05&WaitTimeSeconds=1",
+        );
+        let long_poll = thread::spawn(move || {
+            send_http_request(address, &long_poll_request)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let health_response = tokio::time::timeout(
+            Duration::from_millis(300),
+            tokio::task::spawn_blocking(move || {
+                send_http_request(
+                    address,
+                    "GET /__cloudish/health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+            }),
+        )
+        .await
+        .expect("health request should not wait behind long polling")
+        .expect("health request task should complete")
+        .expect("health request should succeed");
+        let long_poll_response = long_poll
+            .join()
+            .expect("long poll thread should finish cleanly")
+            .expect("long poll should succeed");
+
+        shutdown_tx.send(()).expect("server should still be running");
+        let result = handle.await.expect("server task should complete");
+        result.expect("server should stop cleanly");
+
+        assert!(health_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(long_poll_response.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[tokio::test]
+    async fn serve_listener_shutdown_cancels_in_flight_sqs_long_polls() {
+        let server = CloudishApp::from_runtime_defaults(runtime_defaults(
+            "server-long-poll-shutdown",
+        ))
+        .expect("server bootstrap should succeed");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should expose its address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            server
+                .serve_listener_with_shutdown(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let create_queue_request = query_form_request(
+            "/",
+            "Action=CreateQueue&Version=2012-11-05&QueueName=orders",
+        );
+        let create_queue_response = tokio::task::spawn_blocking(move || {
+            send_http_request(address, &create_queue_request)
+        })
+        .await
+        .expect("queue creation task should complete")
+        .expect("queue creation should succeed");
+        assert!(create_queue_response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let long_poll_request = query_form_request(
+            "/000000000000/orders",
+            "Action=ReceiveMessage&Version=2012-11-05&WaitTimeSeconds=20",
+        );
+        let long_poll = tokio::task::spawn_blocking(move || {
+            send_http_request(address, &long_poll_request)
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send(()).expect("server should still be running");
+        let server_result =
+            tokio::time::timeout(Duration::from_millis(500), handle)
+                .await
+                .expect(
+                    "shutdown should not wait for the full long-poll window",
+                )
+                .expect("server task should complete");
+        server_result.expect("server should stop cleanly");
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), long_poll)
+            .await
+            .expect("client should unblock after shutdown")
+            .expect("client task should complete");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_listener_shutdown_cancels_in_flight_lambda_invokes() {
+        let server = CloudishApp::from_runtime_defaults(runtime_defaults(
+            "server-lambda-shutdown",
+        ))
+        .expect("server bootstrap should succeed");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should expose its address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            server
+                .serve_listener_with_shutdown(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let create_role_request = create_iam_role_request("lambda-role");
+        let create_role_response = tokio::task::spawn_blocking(move || {
+            send_http_request(address, &create_role_request)
+        })
+        .await
+        .expect("role creation task should complete")
+        .expect("role creation should succeed");
+        assert!(create_role_response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let archive = lambda_archive_base64(&[(
+            "bootstrap",
+            "#!/bin/sh\nsleep 20\ncat\n",
+        )]);
+        let create_request = create_lambda_request("slow", &archive);
+        let create_response = tokio::task::spawn_blocking(move || {
+            send_http_request(address, &create_request)
+        })
+        .await
+        .expect("function creation task should complete")
+        .expect("function creation should succeed");
+        if !create_response.starts_with("HTTP/1.1 201 Created\r\n") {
+            panic!("unexpected function create response:\n{create_response}");
+        }
+
+        let invoke_request = invoke_lambda_request("slow", r#"{"ok":true}"#);
+        let invoke = tokio::task::spawn_blocking(move || {
+            send_http_request(address, &invoke_request)
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send(()).expect("server should still be running");
+        let server_result = tokio::time::timeout(
+            Duration::from_millis(500),
+            handle,
+        )
+        .await
+        .expect("shutdown should not wait for the full Lambda invoke window")
+        .expect("server task should complete");
+        server_result.expect("server should stop cleanly");
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), invoke)
+            .await
+            .expect("invoke client should unblock after shutdown")
+            .expect("invoke client task should complete");
+    }
+
     #[tokio::test]
     async fn serve_listener_rejects_oversized_request_bodies() {
         let state_directory =
@@ -1016,6 +1666,46 @@ mod tests {
             "\"message\":\"request body exceeds configured limit of 8 bytes\""
         ));
         assert!(health_response.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[tokio::test]
+    async fn serve_listener_reports_wire_log_init_errors_before_writing_ready_file()
+     {
+        let ready_root = temporary_directory("wire-log-ready-file");
+        let ready_file = ready_root.join("nested").join("cloudish-ready");
+        let hosting = load_hosting_plan(|name| match name {
+            EDGE_READY_FILE_ENV => {
+                Some(ready_file.to_string_lossy().into_owned())
+            }
+            EDGE_WIRE_LOG_ENV => Some("on".to_owned()),
+            _ => None,
+        })
+        .expect("wire log hosting plan should build");
+        let server = CloudishApp::from_runtime_defaults_with_hosting(
+            runtime_defaults("wire-log-ready-file"),
+            hosting,
+        )
+        .expect("server bootstrap should succeed");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+
+        let error = server
+            .serve_listener_with_shutdown_with_wire_log_init(
+                listener,
+                async {},
+                || Err(WireLogInitError::GlobalSubscriberAlreadySet),
+            )
+            .await
+            .expect_err("wire log init failure should surface");
+
+        assert!(matches!(
+            error,
+            super::StartupError::WireLogInit(
+                WireLogInitError::GlobalSubscriberAlreadySet
+            )
+        ));
+        assert!(!ready_file.exists());
     }
 
     #[tokio::test]

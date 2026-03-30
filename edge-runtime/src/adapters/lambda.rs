@@ -6,10 +6,11 @@ use serde_json::json;
 use std::fs::{self, File};
 use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
 use zip::ZipArchive;
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,8 @@ impl Default for ProcessLambdaExecutor {
 }
 
 impl ProcessLambdaExecutor {
+    const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Arc::new(root.into()),
@@ -92,6 +95,55 @@ impl LambdaExecutor for ProcessLambdaExecutor {
         request: &LambdaInvocationRequest,
     ) -> Result<LambdaInvocationResult, InfrastructureError> {
         self.invoke_inner(request)
+    }
+
+    fn invoke_with_cancellation(
+        &self,
+        request: &LambdaInvocationRequest,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<LambdaInvocationResult, InfrastructureError> {
+        let archive = match request.package() {
+            LambdaExecutionPackage::ZipArchive(archive) => archive,
+            LambdaExecutionPackage::ImageUri(_) => {
+                return Err(io_error(
+                    "invoke",
+                    request.function_name(),
+                    "image package invocations are not supported",
+                ));
+            }
+        };
+
+        validate_zip_archive(request.runtime(), request.handler(), archive)
+            .map_err(|source| {
+                InfrastructureError::container(
+                    "validate",
+                    request.function_name(),
+                    source,
+                )
+            })?;
+
+        let workdir = self.allocate_workdir(request.function_name());
+        fs::create_dir_all(&workdir).map_err(|source| {
+            InfrastructureError::container(
+                "extract",
+                request.function_name(),
+                source,
+            )
+        })?;
+        let result =
+            (|| -> Result<LambdaInvocationResult, InfrastructureError> {
+                extract_archive(archive, &workdir).map_err(|source| {
+                    InfrastructureError::container(
+                        "extract",
+                        request.function_name(),
+                        source,
+                    )
+                })?;
+                run_request_with_cancellation(request, &workdir, is_cancelled)
+            })();
+        let _ = fs::remove_dir_all(&workdir);
+
+        result
     }
 
     fn invoke_async(
@@ -276,6 +328,14 @@ fn run_request(
     request: &LambdaInvocationRequest,
     workdir: &Path,
 ) -> Result<LambdaInvocationResult, InfrastructureError> {
+    run_request_with_cancellation(request, workdir, &|| false)
+}
+
+fn run_request_with_cancellation(
+    request: &LambdaInvocationRequest,
+    workdir: &Path,
+    is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<LambdaInvocationResult, InfrastructureError> {
     let mut command = build_command(request, workdir).map_err(|source| {
         InfrastructureError::container(
             "start",
@@ -309,9 +369,8 @@ fn run_request(
             )
         })?;
     }
-    let output = child.wait_with_output().map_err(|source| {
-        InfrastructureError::container("wait", request.function_name(), source)
-    })?;
+    let output =
+        wait_for_child_output(child, request.function_name(), is_cancelled)?;
 
     if output.status.success() {
         Ok(LambdaInvocationResult::new(output.stdout, Option::<String>::None))
@@ -328,6 +387,44 @@ fn run_request(
             error_payload(message),
             Some("Unhandled"),
         ))
+    }
+}
+
+fn wait_for_child_output(
+    mut child: Child,
+    function_name: &str,
+    is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<std::process::Output, InfrastructureError> {
+    loop {
+        if is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(InfrastructureError::container(
+                "wait",
+                function_name,
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "lambda invocation cancelled",
+                ),
+            ));
+        }
+
+        match child.try_wait().map_err(|source| {
+            InfrastructureError::container("wait", function_name, source)
+        })? {
+            Some(_) => {
+                return child.wait_with_output().map_err(|source| {
+                    InfrastructureError::container(
+                        "wait",
+                        function_name,
+                        source,
+                    )
+                });
+            }
+            None => thread::sleep(
+                ProcessLambdaExecutor::CANCELLATION_POLL_INTERVAL,
+            ),
+        }
     }
 }
 
@@ -431,6 +528,9 @@ mod tests {
         LambdaExecutionPackage, LambdaExecutor, LambdaInvocationRequest,
     };
     use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
     use test_support::temporary_directory;
     use zip::write::FileOptions;
 
@@ -509,5 +609,45 @@ mod tests {
 
         assert_eq!(result.function_error(), None);
         assert_eq!(result.payload(), br#"{"ok":true}"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_lambda_executor_cancels_blocked_invocations_promptly() {
+        let executor = ProcessLambdaExecutor::new(temporary_directory(
+            "hosting-lambda-executor-cancel",
+        ));
+        let archive =
+            zip_with_entries(&[("bootstrap", "#!/bin/sh\nsleep 20\ncat\n")]);
+        let request = LambdaInvocationRequest::new(
+            "slow",
+            "$LATEST",
+            "provided.al2",
+            "ignored.handler",
+            LambdaExecutionPackage::ZipArchive(archive),
+            br#"{"ok":true}"#.to_vec(),
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&cancelled);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            trigger.store(true, Ordering::SeqCst);
+        });
+
+        let started_at = Instant::now();
+        let error = executor
+            .invoke_with_cancellation(&request, &|| {
+                cancelled.load(Ordering::SeqCst)
+            })
+            .expect_err("cancelled invoke should fail");
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(1),
+            "cancellation should stop the child promptly",
+        );
+        assert!(
+            error.to_string().contains("lambda invocation cancelled"),
+            "unexpected cancellation error: {error}",
+        );
     }
 }

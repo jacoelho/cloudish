@@ -74,7 +74,7 @@ fn build_router_with_runtime(
     let defaults = runtime_defaults(label);
     let authenticator = Authenticator::new(defaults.clone());
     let assembly = builder.build().expect("test runtime should build");
-    let (services, runtime, _) = assembly.into_parts();
+    let (services, runtime) = assembly.into_parts();
     let router = EdgeRouter::new(
         defaults,
         SharedAdvertisedEdge::default(),
