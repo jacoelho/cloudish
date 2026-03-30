@@ -9,14 +9,13 @@ type StorageShutdownHook =
 #[cfg(feature = "apigateway")]
 pub use apigateway::{
     ApiGatewayError, ApiGatewayScope, ApiGatewayService, ApiKey, ApiMethod,
-    ApiResource, Authorizer, BasePathMapping, CreateApiKeyInput,
-    CreateAuthorizerInput, CreateBasePathMappingInput, CreateDeploymentInput,
-    CreateDomainNameInput, CreateHttpApiAuthorizerInput,
+    ApiResource, Authorizer, CreateApiKeyInput, CreateAuthorizerInput,
+    CreateDeploymentInput, CreateHttpApiAuthorizerInput,
     CreateHttpApiDeploymentInput, CreateHttpApiInput,
     CreateHttpApiIntegrationInput, CreateHttpApiRouteInput,
     CreateHttpApiStageInput, CreateRequestValidatorInput, CreateResourceInput,
     CreateRestApiInput, CreateStageInput, CreateUsagePlanInput,
-    CreateUsagePlanKeyInput, Deployment, DomainName, EndpointConfiguration,
+    CreateUsagePlanKeyInput, Deployment, EndpointConfiguration,
     ExecuteApiError, ExecuteApiIntegrationExecutor, ExecuteApiIntegrationPlan,
     ExecuteApiInvocation, ExecuteApiLambdaProxyPlan,
     ExecuteApiPreparedResponse, ExecuteApiRequest, GetTagsOutput, HttpApi,

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use super::{
     ApiGatewayError, ApiGatewayScope, ApiGatewayService, Integration,
     ROOT_PATH, StoredApiGatewayState, StoredApiMethod, StoredApiResource,
-    StoredDeployment, deployment, domain, execute_api_request_validator,
+    StoredDeployment, deployment, execute_api_request_validator,
     is_valid_execute_api_key, rest_api, stage, validate_status_code,
 };
 
@@ -322,22 +322,6 @@ impl ExecuteApiError {
 }
 
 impl ApiGatewayService {
-    pub fn has_custom_domain_execute_api_host(&self, host: &str) -> bool {
-        let host = normalize_authority(host);
-        self.all_states()
-            .into_iter()
-            .any(|(_, state)| find_domain_name(&state, &host).is_some())
-    }
-
-    pub fn resolve_execute_api(
-        &self,
-        request: &ExecuteApiRequest,
-        caller_identity: Option<&CallerIdentity>,
-    ) -> Option<Result<ResolvedExecuteApiTarget, ExecuteApiError>> {
-        let host = normalize_authority(request.host());
-        self.resolve_custom_domain_execute_api(&host, request, caller_identity)
-    }
-
     /// # Errors
     ///
     /// Returns [`ExecuteApiError`] when the API id is missing, ambiguous, or
@@ -370,25 +354,6 @@ impl ApiGatewayService {
             caller_identity,
         )
         .map(|invocation| ResolvedExecuteApiTarget::new(scope, invocation))
-    }
-
-    pub fn prepare_execute_api(
-        &self,
-        scope: &ApiGatewayScope,
-        request: &ExecuteApiRequest,
-        caller_identity: Option<&CallerIdentity>,
-    ) -> Option<Result<ExecuteApiInvocation, ExecuteApiError>> {
-        let state = self.load_state(scope);
-        let host = normalize_authority(request.host());
-        let domain_name = find_domain_name(&state, &host)?;
-
-        Some(self.prepare_custom_domain_execute_api(
-            scope,
-            &state,
-            domain_name,
-            request,
-            caller_identity,
-        ))
     }
 
     fn prepare_api_id_execute_api(
@@ -435,40 +400,6 @@ impl ApiGatewayService {
         };
 
         build_execute_api_invocation(&context, api, deployment, &resource_path)
-    }
-
-    fn resolve_custom_domain_execute_api(
-        &self,
-        host: &str,
-        request: &ExecuteApiRequest,
-        caller_identity: Option<&CallerIdentity>,
-    ) -> Option<Result<ResolvedExecuteApiTarget, ExecuteApiError>> {
-        let mut matches =
-            self.all_states().into_iter().filter_map(|(scope, state)| {
-                let domain_name =
-                    find_domain_name(&state, host).map(str::to_owned);
-                domain_name.map(|domain_name| (scope, state, domain_name))
-            });
-        let (scope, state, domain_name) = matches.next()?;
-        if matches.next().is_some() {
-            return Some(Err(ambiguous_execute_api_target_error(format!(
-                "multiple execute-api custom domains matched host {}",
-                request.host(),
-            ))));
-        }
-
-        Some(
-            self.prepare_custom_domain_execute_api(
-                &scope,
-                &state,
-                &domain_name,
-                request,
-                caller_identity,
-            )
-            .map(|invocation| {
-                ResolvedExecuteApiTarget::new(scope, invocation)
-            }),
-        )
     }
 }
 
@@ -538,41 +469,6 @@ pub fn map_lambda_proxy_response(
     };
 
     Ok(ExecuteApiPreparedResponse::new(status_code, headers, body))
-}
-
-impl ApiGatewayService {
-    fn prepare_custom_domain_execute_api(
-        &self,
-        scope: &ApiGatewayScope,
-        state: &StoredApiGatewayState,
-        domain_name: &str,
-        request: &ExecuteApiRequest,
-        caller_identity: Option<&CallerIdentity>,
-    ) -> Result<ExecuteApiInvocation, ExecuteApiError> {
-        let domain = domain(state, domain_name).map_err(not_found_error)?;
-        let path = normalize_path(request.path())?;
-        let mapping = resolve_base_path_mapping(domain, &path)
-            .ok_or(ExecuteApiError::NotFound)?;
-        let api =
-            rest_api(state, &mapping.rest_api_id).map_err(not_found_error)?;
-        let stage = stage(api, &mapping.stage).map_err(not_found_error)?;
-        let deployment_id =
-            stage.deployment_id.as_deref().ok_or(ExecuteApiError::NotFound)?;
-        let deployment =
-            deployment(api, deployment_id).map_err(not_found_error)?;
-        let resource_path = strip_base_path(&path, &mapping.base_path)?;
-        let context = ExecuteApiRequestContext {
-            scope,
-            state,
-            api_id: &mapping.rest_api_id,
-            stage,
-            request,
-            caller_identity,
-            host: &normalize_authority(request.host()),
-        };
-
-        build_execute_api_invocation(&context, api, deployment, &resource_path)
-    }
 }
 
 struct ExecuteApiRequestContext<'a> {
@@ -1305,17 +1201,6 @@ struct MatchedResource<'a> {
     resource: &'a StoredApiResource,
 }
 
-fn find_domain_name<'a>(
-    state: &'a StoredApiGatewayState,
-    host: &str,
-) -> Option<&'a str> {
-    state
-        .domains
-        .keys()
-        .find(|domain_name| domain_name.eq_ignore_ascii_case(host))
-        .map(String::as_str)
-}
-
 fn api_id_request_target(path: &str) -> Option<(String, String)> {
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
@@ -1359,48 +1244,6 @@ fn normalize_path(path: &str) -> Result<String, ExecuteApiError> {
     } else {
         Ok(format!("/{}", segments.join("/")))
     }
-}
-
-fn resolve_base_path_mapping<'a>(
-    domain: &'a super::StoredDomainName,
-    path: &str,
-) -> Option<&'a super::BasePathMapping> {
-    let mut candidates = domain
-        .base_path_mappings
-        .values()
-        .filter(|mapping| {
-            if mapping.base_path == "(none)" {
-                return true;
-            }
-            path == format!("/{}", mapping.base_path)
-                || path.starts_with(&format!("/{}/", mapping.base_path))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|mapping| {
-        (
-            mapping.base_path == "(none)",
-            std::cmp::Reverse(mapping.base_path.len()),
-        )
-    });
-    candidates.into_iter().next()
-}
-
-fn strip_base_path(
-    path: &str,
-    base_path: &str,
-) -> Result<String, ExecuteApiError> {
-    if base_path == "(none)" {
-        return Ok(path.to_owned());
-    }
-
-    if path == format!("/{base_path}") {
-        return Ok(ROOT_PATH.to_owned());
-    }
-
-    path.strip_prefix(&format!("/{base_path}"))
-        .filter(|path| path.starts_with('/'))
-        .map(str::to_owned)
-        .ok_or(ExecuteApiError::NotFound)
 }
 
 fn match_resource<'a>(
@@ -1764,8 +1607,7 @@ fn multi_value_headers_from_json_map(
 mod tests {
     use super::*;
     use crate::{
-        CreateBasePathMappingInput, CreateDeploymentInput,
-        CreateDomainNameInput, CreateResourceInput, CreateRestApiInput,
+        CreateDeploymentInput, CreateResourceInput, CreateRestApiInput,
         CreateStageInput, PutIntegrationInput, PutMethodInput,
     };
     use std::sync::Arc;
@@ -2018,147 +1860,6 @@ mod tests {
 
         assert_eq!(resolved.scope(), &alternate_scope);
         assert_eq!(resolved.invocation().api_id(), api_id);
-    }
-
-    #[test]
-    fn apigw_v1_runtime_custom_domain_longest_base_path_wins() {
-        let service = service("custom-domain");
-        let scope = scope();
-        let (api_id, _, _) = deploy_http_api(
-            &service,
-            "HTTP",
-            "http://127.0.0.1:8080/api",
-            false,
-        );
-        service
-            .create_domain_name(
-                &scope,
-                CreateDomainNameInput {
-                    certificate_arn: None,
-                    certificate_name: None,
-                    domain_name: "api.example.test".to_owned(),
-                    endpoint_configuration: None,
-                    security_policy: None,
-                    tags: BTreeMap::new(),
-                },
-            )
-            .expect("domain should create");
-        service
-            .create_base_path_mapping(
-                &scope,
-                "api.example.test",
-                CreateBasePathMappingInput {
-                    base_path: Some("v1".to_owned()),
-                    rest_api_id: api_id.clone(),
-                    stage: "dev".to_owned(),
-                },
-            )
-            .expect("base path mapping should create");
-        service
-            .create_base_path_mapping(
-                &scope,
-                "api.example.test",
-                CreateBasePathMappingInput {
-                    base_path: Some("(none)".to_owned()),
-                    rest_api_id: api_id.clone(),
-                    stage: "dev".to_owned(),
-                },
-            )
-            .expect("default mapping should create");
-        let request =
-            ExecuteApiRequest::new("api.example.test", "GET", "/v1/pets");
-
-        let invocation = service
-            .prepare_execute_api(&scope, &request, None)
-            .expect("domain host should be recognized")
-            .expect("invocation should resolve");
-        assert_eq!(invocation.api_id(), api_id);
-        assert_eq!(invocation.request_path(), "/pets");
-    }
-
-    #[test]
-    fn apigw_runtime_custom_domains_with_execute_api_in_the_name_remain_exact_matches()
-     {
-        let service = service("custom-domain-execute-api-substring");
-        let scope = scope();
-        let (api_id, _, _) = deploy_http_api(
-            &service,
-            "HTTP",
-            "http://127.0.0.1:8080/api",
-            false,
-        );
-        let domain_name = "api.execute-api.dev.example.com";
-        service
-            .create_domain_name(
-                &scope,
-                CreateDomainNameInput {
-                    certificate_arn: None,
-                    certificate_name: None,
-                    domain_name: domain_name.to_owned(),
-                    endpoint_configuration: None,
-                    security_policy: None,
-                    tags: BTreeMap::new(),
-                },
-            )
-            .expect("domain should create");
-        service
-            .create_base_path_mapping(
-                &scope,
-                domain_name,
-                CreateBasePathMappingInput {
-                    base_path: Some("(none)".to_owned()),
-                    rest_api_id: api_id.clone(),
-                    stage: "dev".to_owned(),
-                },
-            )
-            .expect("base path mapping should create");
-
-        assert!(service.has_custom_domain_execute_api_host(domain_name));
-        let invocation = service
-            .resolve_execute_api(
-                &ExecuteApiRequest::new(domain_name, "GET", "/pets"),
-                None,
-            )
-            .expect("custom domain should be recognized")
-            .expect("invocation should resolve");
-
-        assert_eq!(invocation.scope(), &scope);
-        assert_eq!(invocation.invocation().api_id(), api_id);
-        assert_eq!(invocation.invocation().request_path(), "/pets");
-    }
-
-    #[test]
-    fn apigw_runtime_rejects_duplicate_custom_domains_across_accounts() {
-        let service = service("duplicate-custom-domain");
-
-        service
-            .create_domain_name(
-                &scope(),
-                CreateDomainNameInput {
-                    certificate_arn: None,
-                    certificate_name: None,
-                    domain_name: "api.example.test".to_owned(),
-                    endpoint_configuration: None,
-                    security_policy: None,
-                    tags: BTreeMap::new(),
-                },
-            )
-            .expect("default-scope custom domain should create");
-        let error = service
-            .create_domain_name(
-                &alternate_scope(),
-                CreateDomainNameInput {
-                    certificate_arn: None,
-                    certificate_name: None,
-                    domain_name: "API.example.test".to_owned(),
-                    endpoint_configuration: None,
-                    security_policy: None,
-                    tags: BTreeMap::new(),
-                },
-            )
-            .expect_err("custom domain should be globally unique");
-
-        assert!(matches!(error, ApiGatewayError::Conflict { .. }));
     }
 
     #[test]

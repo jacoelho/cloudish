@@ -1,4 +1,4 @@
-use aws::{AccountId, AdvertisedEdge, Clock, RegionId, SharedAdvertisedEdge};
+use aws::{AccountId, Clock, RegionId, SharedAdvertisedEdge};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -9,8 +9,6 @@ use crate::{
     errors::ApiGatewayError, execute_api, scope::ApiGatewayScope, v2,
 };
 const DEFAULT_API_KEY_SOURCE: &str = "HEADER";
-const DEFAULT_DOMAIN_STATUS: &str = "AVAILABLE";
-const DEFAULT_SECURITY_POLICY: &str = "TLS_1_2";
 const EXECUTE_API_ID_WIDTH: usize = 10;
 const GLOBAL_ROUTING_STATE_KEY: &str = "global";
 const RESOURCE_ID_WIDTH: usize = 8;
@@ -21,7 +19,6 @@ const API_KEY_ID_WIDTH: usize = 10;
 const USAGE_PLAN_ID_WIDTH: usize = 10;
 pub(crate) const ROOT_PATH: &str = "/";
 const TAGS_LIMIT: usize = 50;
-const REGIONAL_HOSTED_ZONE_ID: &str = "Z2OJLYMUO9EFXC";
 pub(crate) const HTTP_ROUTE_ID_WIDTH: usize = 10;
 pub(crate) const HTTP_INTEGRATION_ID_WIDTH: usize = 10;
 pub(crate) const HTTP_DEPLOYMENT_ID_WIDTH: usize = 10;
@@ -259,33 +256,6 @@ pub struct UsagePlanKey {
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DomainName {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub certificate_arn: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub certificate_name: Option<String>,
-    pub domain_name: String,
-    pub domain_name_arn: String,
-    pub domain_name_status: String,
-    pub endpoint_configuration: EndpointConfiguration,
-    pub regional_domain_name: String,
-    pub regional_hosted_zone_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub security_policy: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub tags: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BasePathMapping {
-    pub base_path: String,
-    pub rest_api_id: String,
-    pub stage: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GetTagsOutput {
     pub tags: BTreeMap<String, String>,
@@ -500,31 +470,6 @@ pub struct CreateUsagePlanKeyInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateDomainNameInput {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub certificate_arn: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub certificate_name: Option<String>,
-    pub domain_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint_configuration: Option<EndpointConfiguration>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub security_policy: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub tags: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateBasePathMappingInput {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_path: Option<String>,
-    pub rest_api_id: String,
-    pub stage: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TagResourceInput {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
@@ -707,11 +652,6 @@ impl ApiGatewayService {
 
         for usage_plan in state.usage_plans.values_mut() {
             usage_plan.api_stages.retain(|stage| stage.api_id != api_id);
-        }
-        for domain in state.domains.values_mut() {
-            domain
-                .base_path_mappings
-                .retain(|_, mapping| mapping.rest_api_id != api_id);
         }
 
         self.save_state(scope, state)
@@ -2111,289 +2051,6 @@ impl ApiGatewayService {
     }
 
     #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
-    pub fn create_domain_name(
-        &self,
-        scope: &ApiGatewayScope,
-        input: CreateDomainNameInput,
-    ) -> Result<DomainName, ApiGatewayError> {
-        validate_domain_name(&input.domain_name)?;
-        validate_tags(&input.tags)?;
-
-        let _guard = self.lock_state();
-        if self.domain_exists_globally(&input.domain_name) {
-            return Err(ApiGatewayError::Conflict {
-                resource: format!("Domain name {}", input.domain_name),
-            });
-        }
-        let mut state = self.load_state(scope);
-        if state.domains.contains_key(&input.domain_name) {
-            return Err(ApiGatewayError::Conflict {
-                resource: format!("Domain name {}", input.domain_name),
-            });
-        }
-        let endpoint_configuration = normalize_domain_endpoint_configuration(
-            input.endpoint_configuration,
-        )?;
-        let domain = StoredDomainName {
-            base_path_mappings: BTreeMap::new(),
-            certificate_arn: input.certificate_arn,
-            certificate_name: input.certificate_name,
-            domain_name: input.domain_name.clone(),
-            endpoint_configuration,
-            security_policy: input
-                .security_policy
-                .or_else(|| Some(DEFAULT_SECURITY_POLICY.to_owned())),
-            tags: input.tags,
-        };
-        let response =
-            domain.to_domain_name(scope, &self.advertised_edge.current());
-        state.domains.insert(input.domain_name, domain);
-        self.save_state(scope, state)?;
-
-        Ok(response)
-    }
-
-    #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
-    pub fn get_domain_name(
-        &self,
-        scope: &ApiGatewayScope,
-        domain_name: &str,
-    ) -> Result<DomainName, ApiGatewayError> {
-        let state = self.load_state(scope);
-        let domain = domain(&state, domain_name)?;
-
-        Ok(domain.to_domain_name(scope, &self.advertised_edge.current()))
-    }
-
-    #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
-    pub fn get_domain_names(
-        &self,
-        scope: &ApiGatewayScope,
-        position: Option<&str>,
-        limit: Option<u32>,
-    ) -> Result<ItemCollection<DomainName>, ApiGatewayError> {
-        let state = self.load_state(scope);
-        let domains = state
-            .domains
-            .values()
-            .map(|domain| {
-                domain.to_domain_name(scope, &self.advertised_edge.current())
-            })
-            .collect::<Vec<_>>();
-
-        paginate(domains, position, limit)
-    }
-
-    #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
-    pub fn update_domain_name(
-        &self,
-        scope: &ApiGatewayScope,
-        domain_name: &str,
-        patch_operations: &[PatchOperation],
-    ) -> Result<DomainName, ApiGatewayError> {
-        let mut state = self.load_state(scope);
-        for operation in patch_operations {
-            match patch_path(operation, "domain name")? {
-                ("replace", "/certificateArn") => {
-                    domain_mut(&mut state, domain_name)?.certificate_arn =
-                        operation.value.clone().and_then(empty_to_none);
-                }
-                ("replace", "/certificateName") => {
-                    domain_mut(&mut state, domain_name)?.certificate_name =
-                        operation.value.clone().and_then(empty_to_none);
-                }
-                ("replace", "/securityPolicy") => {
-                    let value = required_patch_value(operation)?;
-                    domain_mut(&mut state, domain_name)?.security_policy =
-                        Some(value.to_owned());
-                }
-                _ => {
-                    return Err(ApiGatewayError::UnsupportedPatchPath {
-                        resource: "domain name",
-                        path: operation.path.clone(),
-                    });
-                }
-            }
-        }
-
-        let response = domain(&state, domain_name)?
-            .to_domain_name(scope, &self.advertised_edge.current());
-        self.save_state(scope, state)?;
-
-        Ok(response)
-    }
-
-    #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
-    pub fn delete_domain_name(
-        &self,
-        scope: &ApiGatewayScope,
-        domain_name: &str,
-    ) -> Result<(), ApiGatewayError> {
-        let mut state = self.load_state(scope);
-        if state.domains.remove(domain_name).is_none() {
-            return Err(ApiGatewayError::NotFound {
-                resource: format!("Domain name {domain_name}"),
-            });
-        }
-        self.save_state(scope, state)
-    }
-
-    #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
-    pub fn create_base_path_mapping(
-        &self,
-        scope: &ApiGatewayScope,
-        domain_name: &str,
-        input: CreateBasePathMappingInput,
-    ) -> Result<BasePathMapping, ApiGatewayError> {
-        let base_path = normalize_base_path(
-            input.base_path.unwrap_or_else(|| "(none)".to_owned()),
-        );
-        let mut state = self.load_state(scope);
-        validate_stage_reference(&state, &input.rest_api_id, &input.stage)?;
-        let domain = domain_mut(&mut state, domain_name)?;
-        if domain.base_path_mappings.contains_key(&base_path) {
-            return Err(ApiGatewayError::Conflict {
-                resource: format!(
-                    "Base path mapping {base_path} for domain {domain_name}"
-                ),
-            });
-        }
-        let mapping = BasePathMapping {
-            base_path: base_path.clone(),
-            rest_api_id: input.rest_api_id,
-            stage: input.stage,
-        };
-        domain.base_path_mappings.insert(base_path, mapping.clone());
-        self.save_state(scope, state)?;
-
-        Ok(mapping)
-    }
-
-    #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
-    pub fn get_base_path_mapping(
-        &self,
-        scope: &ApiGatewayScope,
-        domain_name: &str,
-        base_path: &str,
-    ) -> Result<BasePathMapping, ApiGatewayError> {
-        let state = self.load_state(scope);
-        let domain = domain(&state, domain_name)?;
-        let base_path = normalize_base_path(base_path.to_owned());
-        domain.base_path_mappings.get(&base_path).cloned().ok_or_else(|| {
-            ApiGatewayError::NotFound {
-                resource: format!(
-                    "Base path mapping {base_path} for domain {domain_name}"
-                ),
-            }
-        })
-    }
-
-    #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
-    pub fn get_base_path_mappings(
-        &self,
-        scope: &ApiGatewayScope,
-        domain_name: &str,
-        position: Option<&str>,
-        limit: Option<u32>,
-    ) -> Result<ItemCollection<BasePathMapping>, ApiGatewayError> {
-        let state = self.load_state(scope);
-        let domain = domain(&state, domain_name)?;
-        let items =
-            domain.base_path_mappings.values().cloned().collect::<Vec<_>>();
-
-        paginate(items, position, limit)
-    }
-
-    #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
-    pub fn update_base_path_mapping(
-        &self,
-        scope: &ApiGatewayScope,
-        domain_name: &str,
-        base_path: &str,
-        patch_operations: &[PatchOperation],
-    ) -> Result<BasePathMapping, ApiGatewayError> {
-        let normalized_base_path = normalize_base_path(base_path.to_owned());
-        let mut state = self.load_state(scope);
-        let (mut next_base_path, mut next_rest_api_id, mut next_stage) = {
-            let current = self.get_base_path_mapping(
-                scope,
-                domain_name,
-                &normalized_base_path,
-            )?;
-            (current.base_path, current.rest_api_id, current.stage)
-        };
-
-        for operation in patch_operations {
-            match patch_path(operation, "base path mapping")? {
-                ("replace", "/basePath") => {
-                    next_base_path = normalize_base_path(
-                        required_patch_value(operation)?.to_owned(),
-                    );
-                }
-                ("replace", "/restapiId") | ("replace", "/restApiId") => {
-                    next_rest_api_id =
-                        required_patch_value(operation)?.to_owned();
-                }
-                ("replace", "/stage") => {
-                    next_stage = required_patch_value(operation)?.to_owned();
-                }
-                _ => {
-                    return Err(ApiGatewayError::UnsupportedPatchPath {
-                        resource: "base path mapping",
-                        path: operation.path.clone(),
-                    });
-                }
-            }
-        }
-
-        validate_stage_reference(&state, &next_rest_api_id, &next_stage)?;
-        let domain = domain_mut(&mut state, domain_name)?;
-        let Some(mut mapping) =
-            domain.base_path_mappings.remove(&normalized_base_path)
-        else {
-            return Err(ApiGatewayError::NotFound {
-                resource: format!(
-                    "Base path mapping {normalized_base_path} for domain {domain_name}"
-                ),
-            });
-        };
-        mapping.base_path = next_base_path.clone();
-        mapping.rest_api_id = next_rest_api_id;
-        mapping.stage = next_stage;
-        if domain.base_path_mappings.contains_key(&next_base_path) {
-            return Err(ApiGatewayError::Conflict {
-                resource: format!(
-                    "Base path mapping {next_base_path} for domain {domain_name}"
-                ),
-            });
-        }
-        domain.base_path_mappings.insert(next_base_path, mapping.clone());
-        self.save_state(scope, state)?;
-
-        Ok(mapping)
-    }
-
-    #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
-    pub fn delete_base_path_mapping(
-        &self,
-        scope: &ApiGatewayScope,
-        domain_name: &str,
-        base_path: &str,
-    ) -> Result<(), ApiGatewayError> {
-        let normalized = normalize_base_path(base_path.to_owned());
-        let mut state = self.load_state(scope);
-        let domain = domain_mut(&mut state, domain_name)?;
-        if domain.base_path_mappings.remove(&normalized).is_none() {
-            return Err(ApiGatewayError::NotFound {
-                resource: format!(
-                    "Base path mapping {normalized} for domain {domain_name}"
-                ),
-            });
-        }
-        self.save_state(scope, state)
-    }
-
-    #[doc = "# Errors\n\nReturns `ApiGatewayError` when the request fails validation, referenced resources are missing, or the API Gateway control-plane state cannot be loaded or persisted."]
     pub fn get_tags(
         &self,
         scope: &ApiGatewayScope,
@@ -2412,9 +2069,6 @@ impl ApiGatewayService {
             }
             TagTarget::UsagePlan(usage_plan_id) => {
                 usage_plan(&state, usage_plan_id)?.tags.clone()
-            }
-            TagTarget::DomainName(domain_name) => {
-                domain(&state, domain_name)?.tags.clone()
             }
         };
 
@@ -2445,9 +2099,6 @@ impl ApiGatewayService {
             }
             TagTarget::UsagePlan(usage_plan_id) => {
                 usage_plan_mut(&mut state, usage_plan_id)?.tags.extend(tags);
-            }
-            TagTarget::DomainName(domain_name) => {
-                domain_mut(&mut state, domain_name)?.tags.extend(tags);
             }
         }
         self.save_state(scope, state)
@@ -2487,12 +2138,6 @@ impl ApiGatewayService {
             TagTarget::UsagePlan(usage_plan_id) => {
                 remove_tag_keys(
                     &mut usage_plan_mut(&mut state, usage_plan_id)?.tags,
-                    tag_keys,
-                );
-            }
-            TagTarget::DomainName(domain_name) => {
-                remove_tag_keys(
-                    &mut domain_mut(&mut state, domain_name)?.tags,
                     tag_keys,
                 );
             }
@@ -2564,15 +2209,6 @@ impl ApiGatewayService {
         }
     }
 
-    pub(crate) fn domain_exists_globally(&self, domain_name: &str) -> bool {
-        self.all_states().into_iter().any(|(_, state)| {
-            state
-                .domains
-                .keys()
-                .any(|candidate| candidate.eq_ignore_ascii_case(domain_name))
-        })
-    }
-
     fn execute_api_id_exists_globally(&self, api_id: &str) -> bool {
         self.all_states().into_iter().any(|(_, state)| {
             state.rest_apis.contains_key(api_id)
@@ -2604,7 +2240,6 @@ pub(crate) struct StoredApiGatewayState {
     pub(crate) http_apis: BTreeMap<String, v2::StoredHttpApi>,
     pub(crate) api_keys: BTreeMap<String, StoredApiKey>,
     pub(crate) usage_plans: BTreeMap<String, StoredUsagePlan>,
-    pub(crate) domains: BTreeMap<String, StoredDomainName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2866,41 +2501,6 @@ impl StoredUsagePlanKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct StoredDomainName {
-    pub(crate) base_path_mappings: BTreeMap<String, BasePathMapping>,
-    pub(crate) certificate_arn: Option<String>,
-    pub(crate) certificate_name: Option<String>,
-    pub(crate) domain_name: String,
-    pub(crate) endpoint_configuration: EndpointConfiguration,
-    pub(crate) security_policy: Option<String>,
-    pub(crate) tags: BTreeMap<String, String>,
-}
-
-impl StoredDomainName {
-    fn to_domain_name(
-        &self,
-        scope: &ApiGatewayScope,
-        advertised_edge: &AdvertisedEdge,
-    ) -> DomainName {
-        DomainName {
-            certificate_arn: self.certificate_arn.clone(),
-            certificate_name: self.certificate_name.clone(),
-            domain_name: self.domain_name.clone(),
-            domain_name_arn: domain_name_arn(
-                scope.region(),
-                &self.domain_name,
-            ),
-            domain_name_status: DEFAULT_DOMAIN_STATUS.to_owned(),
-            endpoint_configuration: self.endpoint_configuration.clone(),
-            regional_domain_name: advertised_edge.authority(),
-            regional_hosted_zone_id: REGIONAL_HOSTED_ZONE_ID.to_owned(),
-            security_policy: self.security_policy.clone(),
-            tags: self.tags.clone(),
-        }
-    }
-}
-
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
 )]
@@ -2915,7 +2515,6 @@ enum TagTarget<'a> {
     Stage { api_id: &'a str, stage_name: &'a str },
     ApiKey(&'a str),
     UsagePlan(&'a str),
-    DomainName(&'a str),
 }
 
 fn scope_key(scope: &ApiGatewayScope) -> ApiGatewayStateKey {
@@ -3150,15 +2749,6 @@ fn usage_plan_key<'a>(
     })
 }
 
-pub(crate) fn domain<'a>(
-    state: &'a StoredApiGatewayState,
-    domain_name: &str,
-) -> Result<&'a StoredDomainName, ApiGatewayError> {
-    state.domains.get(domain_name).ok_or_else(|| ApiGatewayError::NotFound {
-        resource: format!("Domain name {domain_name}"),
-    })
-}
-
 fn execute_api_method<'a>(
     api: &'a StoredRestApi,
     resource_id: &str,
@@ -3168,17 +2758,6 @@ fn execute_api_method<'a>(
     let resource = api.resources.get(resource_id)?;
 
     resource.methods.get(&normalized).or_else(|| resource.methods.get("ANY"))
-}
-
-fn domain_mut<'a>(
-    state: &'a mut StoredApiGatewayState,
-    domain_name: &str,
-) -> Result<&'a mut StoredDomainName, ApiGatewayError> {
-    state.domains.get_mut(domain_name).ok_or_else(|| {
-        ApiGatewayError::NotFound {
-            resource: format!("Domain name {domain_name}"),
-        }
-    })
 }
 
 pub(crate) fn paginate<T: Clone>(
@@ -3734,16 +3313,6 @@ fn validate_stage_reference(
     Ok(())
 }
 
-fn validate_domain_name(domain_name: &str) -> Result<(), ApiGatewayError> {
-    if domain_name.trim().is_empty() || domain_name.contains('/') {
-        return Err(ApiGatewayError::Validation {
-            message: format!("invalid domain name {domain_name:?}"),
-        });
-    }
-
-    Ok(())
-}
-
 fn normalize_rest_api_endpoint_configuration(
     endpoint_configuration: Option<EndpointConfiguration>,
 ) -> Result<EndpointConfiguration, ApiGatewayError> {
@@ -3780,42 +3349,6 @@ fn normalize_rest_api_endpoint_configuration(
     Ok(endpoint_configuration)
 }
 
-fn normalize_domain_endpoint_configuration(
-    endpoint_configuration: Option<EndpointConfiguration>,
-) -> Result<EndpointConfiguration, ApiGatewayError> {
-    let mut endpoint_configuration =
-        endpoint_configuration.unwrap_or_else(|| EndpointConfiguration {
-            ip_address_type: Some("ipv4".to_owned()),
-            types: vec!["REGIONAL".to_owned()],
-            vpc_endpoint_ids: Vec::new(),
-        });
-    if endpoint_configuration.types.is_empty() {
-        endpoint_configuration.types.push("REGIONAL".to_owned());
-    }
-    let Some(type_) = endpoint_configuration.types.first().map(String::as_str)
-    else {
-        return Err(ApiGatewayError::Validation {
-            message: "endpointConfiguration.types must not be empty"
-                .to_owned(),
-        });
-    };
-    if !matches!(type_, "EDGE" | "REGIONAL") {
-        return Err(ApiGatewayError::Validation {
-            message: format!("unsupported domain endpoint type {type_:?}"),
-        });
-    }
-    if endpoint_configuration.ip_address_type.is_none() {
-        endpoint_configuration.ip_address_type = Some("ipv4".to_owned());
-    }
-
-    Ok(endpoint_configuration)
-}
-
-fn normalize_base_path(base_path: String) -> String {
-    let trimmed = base_path.trim();
-    if trimmed.is_empty() { "(none)".to_owned() } else { trimmed.to_owned() }
-}
-
 fn empty_to_none(value: impl Into<String>) -> Option<String> {
     let value = value.into();
     (!value.trim().is_empty()).then_some(value)
@@ -3850,26 +3383,24 @@ fn parse_tag_target<'a>(
         ["usageplans", usage_plan_id] => {
             Ok(TagTarget::UsagePlan(usage_plan_id))
         }
-        ["domainnames", domain_name] => Ok(TagTarget::DomainName(domain_name)),
+        ["domainnames", _domain_name] => {
+            Err(ApiGatewayError::UnsupportedOperation {
+                message:
+                    "API Gateway custom domains and base path mappings are not supported."
+                        .to_owned(),
+            })
+        }
         _ => Err(ApiGatewayError::Validation {
             message: format!("unsupported API Gateway ARN {resource_arn:?}"),
         }),
     }
 }
 
-fn domain_name_arn(region: &RegionId, domain_name: &str) -> String {
-    format!(
-        "arn:aws:apigateway:{}::/domainnames/{domain_name}",
-        region.as_str()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         ApiGatewayScope, ApiGatewayService, CreateApiKeyInput,
-        CreateAuthorizerInput, CreateBasePathMappingInput,
-        CreateDeploymentInput, CreateDomainNameInput,
+        CreateAuthorizerInput, CreateDeploymentInput,
         CreateRequestValidatorInput, CreateResourceInput, CreateRestApiInput,
         CreateStageInput, CreateUsagePlanInput, CreateUsagePlanKeyInput,
         PatchOperation, PutIntegrationInput, PutMethodInput,
@@ -4314,7 +3845,7 @@ mod tests {
     }
 
     #[test]
-    fn apigw_v1_control_tags_api_keys_usage_plans_and_domains_round_trip() {
+    fn apigw_v1_control_tags_api_keys_and_usage_plans_round_trip() {
         let service = service("apigw-v1-control-tags");
         let scope = scope();
         let api = service
@@ -4397,7 +3928,7 @@ mod tests {
                 &scope,
                 CreateUsagePlanInput {
                     api_stages: vec![UsagePlanApiStage {
-                        api_id: api.id.clone(),
+                        api_id: api.id,
                         stage: "dev".to_owned(),
                     }],
                     description: Some("plan".to_owned()),
@@ -4426,35 +3957,25 @@ mod tests {
             .get_usage_plan_keys(&scope, &usage_plan.id, None, None)
             .expect("usage plan keys should list");
         assert_eq!(usage_plan_keys.item.len(), 1);
+    }
 
-        let domain = service
-            .create_domain_name(
-                &scope,
-                CreateDomainNameInput {
-                    certificate_arn: None,
-                    certificate_name: Some("cert".to_owned()),
-                    domain_name: "api.example.test".to_owned(),
-                    endpoint_configuration: None,
-                    security_policy: None,
-                    tags: BTreeMap::from([(
-                        "owner".to_owned(),
-                        "qa".to_owned(),
-                    )]),
-                },
+    #[test]
+    fn apigw_v1_control_domain_tag_arns_fail_explicitly() {
+        let service = service("apigw-v1-control-domain-tag-error");
+        let error = service
+            .get_tags(
+                &scope(),
+                "arn:aws:apigateway:eu-west-2::/domainnames/api.example.test",
             )
-            .expect("domain name should create");
-        let mapping = service
-            .create_base_path_mapping(
-                &scope,
-                &domain.domain_name,
-                CreateBasePathMappingInput {
-                    base_path: Some("v1".to_owned()),
-                    rest_api_id: api.id,
-                    stage: "dev".to_owned(),
-                },
-            )
-            .expect("base path mapping should create");
-        assert_eq!(mapping.base_path, "v1");
+            .expect_err("domain tag arns should fail explicitly");
+
+        assert!(matches!(
+            error,
+            super::ApiGatewayError::UnsupportedOperation { .. }
+        ));
+        assert!(error.to_string().contains(
+            "custom domains and base path mappings are not supported"
+        ));
     }
 
     #[test]

@@ -682,107 +682,35 @@ pub(crate) fn handle_rest_json(
                 .map_err(|error| error.to_aws_error())?;
             Ok(empty_response(202))
         }
-        ("POST", ["domainnames"]) => {
-            let input = parse_json_body(request.body())
-                .map_err(|error| error.to_aws_error())?;
-            json_response(
-                201,
-                &apigateway
-                    .create_domain_name(&scope, input)
-                    .map_err(|error| error.to_aws_error())?,
-            )
+        ("POST", ["domainnames"]) => Err(custom_domain_unsupported_error()),
+        ("GET", ["domainnames"]) => Err(custom_domain_unsupported_error()),
+        ("GET", ["domainnames", _domain_name]) => {
+            Err(custom_domain_unsupported_error())
         }
-        ("GET", ["domainnames"]) => json_response(
-            200,
-            &apigateway
-                .get_domain_names(
-                    &scope,
-                    query.first("position"),
-                    query.first_u32("limit")?,
-                )
-                .map_err(|error| error.to_aws_error())?,
-        ),
-        ("GET", ["domainnames", domain_name]) => json_response(
-            200,
-            &apigateway
-                .get_domain_name(&scope, domain_name)
-                .map_err(|error| error.to_aws_error())?,
-        ),
-        ("PATCH", ["domainnames", domain_name]) => {
-            let operations = parse_patch_operations(request.body())
-                .map_err(|error| error.to_aws_error())?;
-            json_response(
-                200,
-                &apigateway
-                    .update_domain_name(&scope, domain_name, &operations)
-                    .map_err(|error| error.to_aws_error())?,
-            )
+        ("PATCH", ["domainnames", _domain_name]) => {
+            Err(custom_domain_unsupported_error())
         }
-        ("DELETE", ["domainnames", domain_name]) => {
-            apigateway
-                .delete_domain_name(&scope, domain_name)
-                .map_err(|error| error.to_aws_error())?;
-            Ok(empty_response(202))
+        ("DELETE", ["domainnames", _domain_name]) => {
+            Err(custom_domain_unsupported_error())
         }
-        ("POST", ["domainnames", domain_name, "basepathmappings"]) => {
-            let input = parse_json_body(request.body())
-                .map_err(|error| error.to_aws_error())?;
-            json_response(
-                201,
-                &apigateway
-                    .create_base_path_mapping(&scope, domain_name, input)
-                    .map_err(|error| error.to_aws_error())?,
-            )
+        ("POST", ["domainnames", _domain_name, "basepathmappings"]) => {
+            Err(custom_domain_unsupported_error())
         }
-        ("GET", ["domainnames", domain_name, "basepathmappings"]) => {
-            json_response(
-                200,
-                &apigateway
-                    .get_base_path_mappings(
-                        &scope,
-                        domain_name,
-                        query.first("position"),
-                        query.first_u32("limit")?,
-                    )
-                    .map_err(|error| error.to_aws_error())?,
-            )
+        ("GET", ["domainnames", _domain_name, "basepathmappings"]) => {
+            Err(custom_domain_unsupported_error())
         }
         (
             "GET",
-            ["domainnames", domain_name, "basepathmappings", base_path],
-        ) => json_response(
-            200,
-            &apigateway
-                .get_base_path_mapping(&scope, domain_name, base_path)
-                .map_err(|error| error.to_aws_error())?,
-        ),
+            ["domainnames", _domain_name, "basepathmappings", _base_path],
+        ) => Err(custom_domain_unsupported_error()),
         (
             "PATCH",
-            ["domainnames", domain_name, "basepathmappings", base_path],
-        ) => {
-            let operations = parse_patch_operations(request.body())
-                .map_err(|error| error.to_aws_error())?;
-            json_response(
-                200,
-                &apigateway
-                    .update_base_path_mapping(
-                        &scope,
-                        domain_name,
-                        base_path,
-                        &operations,
-                    )
-                    .map_err(|error| error.to_aws_error())?,
-            )
-        }
+            ["domainnames", _domain_name, "basepathmappings", _base_path],
+        ) => Err(custom_domain_unsupported_error()),
         (
             "DELETE",
-            ["domainnames", domain_name, "basepathmappings", base_path],
-        ) => {
-            apigateway
-                .delete_base_path_mapping(&scope, domain_name, base_path)
-                .map_err(|error| error.to_aws_error())?;
-            Ok(empty_response(202))
-        }
+            ["domainnames", _domain_name, "basepathmappings", _base_path],
+        ) => Err(custom_domain_unsupported_error()),
         _ => Err(not_found_error(request.path_without_query())),
     }
 }
@@ -895,6 +823,15 @@ fn not_found_error(path: &str) -> AwsError {
         404,
         true,
     )
+}
+
+fn custom_domain_unsupported_error() -> AwsError {
+    ApiGatewayError::UnsupportedOperation {
+        message:
+            "API Gateway custom domains and base path mappings are not supported."
+                .to_owned(),
+    }
+    .to_aws_error()
 }
 
 struct QueryParameters {
@@ -1193,6 +1130,50 @@ mod tests {
             Some("ConflictException")
         );
         assert!(body.contains("Method GET for resource"));
+    }
+
+    #[test]
+    fn apigw_v1_control_integration_response_routes_remain_not_found() {
+        let router = router();
+        let create_api = router.handle_bytes(&json_request(
+            "POST",
+            "/restapis",
+            r#"{"name":"demo"}"#,
+        ));
+        let create_api_bytes = create_api.to_http_bytes();
+        let (_, _, body) = split_response(&create_api_bytes);
+        let api: serde_json::Value =
+            serde_json::from_str(body).expect("api response should parse");
+        let api_id = api["id"].as_str().expect("api id should exist");
+        let root_id = api["rootResourceId"]
+            .as_str()
+            .expect("root resource id should exist");
+
+        let put_method = router.handle_bytes(&json_request(
+            "PUT",
+            &format!("/restapis/{api_id}/resources/{root_id}/methods/GET"),
+            r#"{"authorizationType":"NONE"}"#,
+        ));
+        let put_method_bytes = put_method.to_http_bytes();
+        let (put_status, _, _) = split_response(&put_method_bytes);
+        assert_eq!(put_status, "HTTP/1.1 201 Created");
+
+        let response = router.handle_bytes(&json_request(
+            "GET",
+            &format!(
+                "/restapis/{api_id}/resources/{root_id}/methods/GET/integration/responses/200"
+            ),
+            "",
+        ));
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+
+        assert_eq!(status, "HTTP/1.1 404 Not Found");
+        assert_eq!(
+            header_value(&headers, "x-amzn-errortype"),
+            Some("NotFoundException")
+        );
+        assert!(body.contains("integration/responses/200"));
     }
 
     #[test]

@@ -16,11 +16,10 @@ pub(crate) use state::{
     HTTP_API_AUTHORIZER_ID_WIDTH, HTTP_DEPLOYMENT_ID_WIDTH,
     HTTP_INTEGRATION_ID_WIDTH, HTTP_ROUTE_ID_WIDTH, ROOT_PATH,
     StoredApiGatewayState, StoredApiMethod, StoredApiResource,
-    StoredDeployment, StoredDomainName, StoredRestApi, StoredStage,
-    deployment, domain, execute_api_request_validator,
-    is_valid_execute_api_key, next_identifier, normalize_http_method,
-    optional_empty_to_none, paginate, rest_api, stage, validate_name,
-    validate_stage_name, validate_status_code, validate_tags,
+    StoredDeployment, StoredRestApi, StoredStage, deployment,
+    execute_api_request_validator, is_valid_execute_api_key, next_identifier,
+    normalize_http_method, optional_empty_to_none, paginate, rest_api, stage,
+    validate_name, validate_stage_name, validate_status_code, validate_tags,
 };
 
 pub use errors::ApiGatewayError;
@@ -42,11 +41,10 @@ pub use http_api::{
 };
 pub use rest_api::{
     ApiGatewayService, ApiKey, ApiMethod, ApiResource, Authorizer,
-    BasePathMapping, CreateApiKeyInput, CreateAuthorizerInput,
-    CreateBasePathMappingInput, CreateDeploymentInput, CreateDomainNameInput,
+    CreateApiKeyInput, CreateAuthorizerInput, CreateDeploymentInput,
     CreateRequestValidatorInput, CreateResourceInput, CreateRestApiInput,
     CreateStageInput, CreateUsagePlanInput, CreateUsagePlanKeyInput,
-    Deployment, DomainName, EndpointConfiguration, GetTagsOutput, Integration,
+    Deployment, EndpointConfiguration, GetTagsOutput, Integration,
     ItemCollection, MethodResponse, PatchOperation, PutIntegrationInput,
     PutMethodInput, PutMethodResponseInput, QuotaSettings, RequestValidator,
     RestApi, Stage, TagResourceInput, ThrottleSettings, UsagePlan,

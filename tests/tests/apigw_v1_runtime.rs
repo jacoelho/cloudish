@@ -8,7 +8,6 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
-use tests::common::http_fixture;
 use tests::common::lambda as lambda_fixture;
 use tests::common::runtime;
 use tests::common::sdk;
@@ -183,7 +182,7 @@ async fn apigw_v1_runtime_lambda_proxy_round_trip() {
 }
 
 #[tokio::test]
-async fn apigw_v1_runtime_http_proxy_custom_domain_and_missing_mapping() {
+async fn apigw_v1_runtime_http_proxy_custom_hosts_fall_through() {
     let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
@@ -192,9 +191,6 @@ async fn apigw_v1_runtime_http_proxy_custom_domain_and_missing_mapping() {
     let config = target.load().await;
     let apigw = ApiGatewayClient::new(&config);
     let root = unique_root("apigw-v1-runtime-domain");
-    let backend = http_fixture::OneShotHttpServer::spawn(
-        b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nX-Upstream: ok\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
-    );
 
     let api = apigw
         .create_rest_api()
@@ -233,7 +229,7 @@ async fn apigw_v1_runtime_http_proxy_custom_domain_and_missing_mapping() {
         .http_method("GET")
         .r#type(IntegrationType::HttpProxy)
         .integration_http_method("GET")
-        .uri(format!("http://127.0.0.1:{}/backend", backend.address().port()))
+        .uri("http://127.0.0.1:65535/backend")
         .send()
         .await
         .expect("HTTP proxy integration should create");
@@ -253,58 +249,20 @@ async fn apigw_v1_runtime_http_proxy_custom_domain_and_missing_mapping() {
         .send()
         .await
         .expect("stage should create");
-    apigw
-        .create_domain_name()
-        .domain_name("api.example.test")
-        .send()
-        .await
-        .expect("custom domain should create");
-    apigw
-        .create_base_path_mapping()
-        .domain_name("api.example.test")
-        .base_path("v1")
-        .rest_api_id(&api_id)
-        .stage("dev")
-        .send()
-        .await
-        .expect("base path mapping should create");
-    apigw
-        .create_domain_name()
-        .domain_name("orphan.example.test")
-        .send()
-        .await
-        .expect("orphan domain should create");
-
-    let response = reqwest::Client::new()
-        .get(format!("http://{}/v1/pets?mode=test", runtime.address()))
+    let custom_host = reqwest::Client::new()
+        .get(format!("http://{}/pets", runtime.address()))
         .header(HOST, "api.example.test")
         .send()
         .await
-        .expect("custom-domain execute-api request should succeed");
-    let missing_mapping = reqwest::Client::new()
-        .get(format!("http://{}/pets", runtime.address()))
-        .header(HOST, "orphan.example.test")
-        .send()
-        .await
-        .expect("orphan custom-domain request should return an API error");
+        .expect("custom-host request should return a generic router error");
 
-    assert_eq!(response.status(), 201);
-    assert_eq!(
-        response
-            .headers()
-            .get("x-upstream")
-            .and_then(|value| value.to_str().ok()),
-        Some("ok")
-    );
-    assert_eq!(response.text().await.expect("body should decode"), "ok");
-    assert_eq!(missing_mapping.status(), 404);
-    let missing_mapping_body: serde_json::Value = serde_json::from_str(
-        &missing_mapping.text().await.expect("error body should decode"),
+    assert_eq!(custom_host.status(), 404);
+    let custom_host_body: serde_json::Value = serde_json::from_str(
+        &custom_host.text().await.expect("error body should decode"),
     )
     .expect("error body should decode");
-    assert_eq!(missing_mapping_body["message"], "Not Found");
+    assert_eq!(custom_host_body["message"], "not found");
 
-    backend.join();
     assert!(runtime.state_directory().exists());
 }
 

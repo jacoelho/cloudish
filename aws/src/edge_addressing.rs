@@ -31,6 +31,15 @@ impl S3EdgeRequestTarget {
 pub enum S3EdgeRequestTargetError {
     InvalidPercentEncoding,
     InvalidUtf8,
+    UnsupportedHost,
+    UnsupportedVirtualHostStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3EdgeHostRouting {
+    PathStyle,
+    UnsupportedHost,
+    UnsupportedVirtualHostStyle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,20 +288,50 @@ pub fn parse_reserved_lambda_function_url_path(
 
 /// # Errors
 ///
-/// Returns [`S3EdgeRequestTargetError`] when the request uses an invalid
-/// virtual-host-style key path or when the bucket or key cannot be
-/// percent-decoded into a valid UTF-8 string.
+/// Returns [`S3EdgeRequestTargetError`] when the request targets an
+/// unsupported host or when the bucket or key cannot be percent-decoded into a
+/// valid UTF-8 string.
 pub fn parse_s3_edge_request_target(
     advertised_edge: &AdvertisedEdge,
     host: &str,
     path: &str,
 ) -> Result<S3EdgeRequestTarget, S3EdgeRequestTargetError> {
-    if let Some(bucket) = s3_virtual_host_bucket(advertised_edge, host) {
-        let key = virtual_host_key(path)?;
-        return Ok(S3EdgeRequestTarget { bucket: Some(bucket), key });
+    match classify_s3_edge_host(advertised_edge, host) {
+        S3EdgeHostRouting::PathStyle => path_style_target(path),
+        S3EdgeHostRouting::UnsupportedHost => {
+            Err(S3EdgeRequestTargetError::UnsupportedHost)
+        }
+        S3EdgeHostRouting::UnsupportedVirtualHostStyle => {
+            Err(S3EdgeRequestTargetError::UnsupportedVirtualHostStyle)
+        }
+    }
+}
+
+pub fn classify_s3_edge_host(
+    advertised_edge: &AdvertisedEdge,
+    host: &str,
+) -> S3EdgeHostRouting {
+    let normalized_host = normalize_host(host);
+    let public_host = normalize_host(advertised_edge.public_host());
+    let public_host_suffix = format!(".{public_host}");
+    if normalized_host == public_host {
+        return S3EdgeHostRouting::PathStyle;
+    }
+    let advertised_virtual_host = if public_host == "localhost" {
+        is_single_label_bucket_host_suffix(
+            &normalized_host,
+            &public_host_suffix,
+        )
+    } else {
+        is_bucket_host_suffix(&normalized_host, &public_host_suffix)
+    };
+    if advertised_virtual_host
+        || is_bucket_host_suffix(&normalized_host, ".s3.localhost")
+    {
+        return S3EdgeHostRouting::UnsupportedVirtualHostStyle;
     }
 
-    path_style_target(path)
+    S3EdgeHostRouting::UnsupportedHost
 }
 
 fn split_route_identity(remainder: &str) -> (&str, String) {
@@ -330,39 +369,13 @@ fn path_style_target(
     Ok(S3EdgeRequestTarget { bucket: Some(percent_decode_path(bucket)?), key })
 }
 
-fn virtual_host_key(
-    path: &str,
-) -> Result<Option<String>, S3EdgeRequestTargetError> {
-    let key = path
-        .strip_prefix('/')
-        .unwrap_or(path)
-        .strip_prefix('/')
-        .unwrap_or(path.strip_prefix('/').unwrap_or(path));
-    if key.is_empty() {
-        return Ok(None);
-    }
-
-    percent_decode_path(key).map(Some)
+fn is_bucket_host_suffix(host: &str, suffix: &str) -> bool {
+    host.strip_suffix(suffix).is_some_and(|bucket| !bucket.is_empty())
 }
 
-fn s3_virtual_host_bucket(
-    advertised_edge: &AdvertisedEdge,
-    host: &str,
-) -> Option<String> {
-    let normalized_host = normalize_host(host);
-    let public_host = normalize_host(advertised_edge.public_host());
-    let public_host_suffix = format!(".{public_host}");
-
-    normalized_host
-        .strip_suffix(&public_host_suffix)
-        .filter(|bucket| !bucket.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            normalized_host
-                .split_once(".s3.")
-                .map(|(bucket, _)| bucket.to_owned())
-                .filter(|bucket| !bucket.is_empty())
-        })
+fn is_single_label_bucket_host_suffix(host: &str, suffix: &str) -> bool {
+    host.strip_suffix(suffix)
+        .is_some_and(|bucket| !bucket.is_empty() && !bucket.contains('.'))
 }
 
 fn normalize_host(host: &str) -> String {
@@ -432,6 +445,7 @@ fn hex_value(byte: u8) -> Result<u8, S3EdgeRequestTargetError> {
 mod tests {
     use super::{
         AWS_PATH_PREFIX, AdvertisedEdge, AdvertisedEdgeTemplate,
+        S3EdgeHostRouting, S3EdgeRequestTargetError, classify_s3_edge_host,
         parse_reserved_execute_api_path,
         parse_reserved_lambda_function_url_path, parse_s3_edge_request_target,
     };
@@ -513,28 +527,76 @@ mod tests {
     }
 
     #[test]
-    fn parse_s3_edge_request_target_supports_public_host_virtual_hosts() {
-        let target = parse_s3_edge_request_target(
+    fn parse_s3_edge_request_target_rejects_public_host_virtual_hosts() {
+        let error = parse_s3_edge_request_target(
             &AdvertisedEdge::new("http", "cloudish.test", 4566),
             "demo.cloudish.test:4566",
             "/reports/data%20file.txt",
         )
-        .expect("virtual-host target should parse");
+        .expect_err("virtual-host target should fail");
 
-        assert_eq!(target.bucket(), Some("demo"));
-        assert_eq!(target.key(), Some("reports/data file.txt"));
+        assert_eq!(
+            error,
+            S3EdgeRequestTargetError::UnsupportedVirtualHostStyle
+        );
     }
 
     #[test]
-    fn parse_s3_edge_request_target_supports_legacy_s3_compatibility_hosts() {
-        let target = parse_s3_edge_request_target(
+    fn parse_s3_edge_request_target_rejects_localhost_compatibility_host() {
+        let error = parse_s3_edge_request_target(
             &AdvertisedEdge::new("http", "cloudish.test", 4566),
-            "demo.s3.localhost.localstack.cloud:4566",
+            "demo.s3.localhost:4566",
             "/reports/data.txt",
         )
-        .expect("compatibility target should parse");
+        .expect_err("localhost compatibility target should fail");
 
-        assert_eq!(target.bucket(), Some("demo"));
-        assert_eq!(target.key(), Some("reports/data.txt"));
+        assert_eq!(
+            error,
+            S3EdgeRequestTargetError::UnsupportedVirtualHostStyle
+        );
+    }
+
+    #[test]
+    fn parse_s3_edge_request_target_rejects_unrelated_s3_domains() {
+        let error = parse_s3_edge_request_target(
+            &AdvertisedEdge::new("http", "cloudish.test", 4566),
+            "demo.s3.evil.example.com:4566",
+            "/",
+        )
+        .expect_err("unrelated domains should fail");
+
+        assert_eq!(error, S3EdgeRequestTargetError::UnsupportedHost);
+    }
+
+    #[test]
+    fn classify_s3_edge_host_accepts_only_the_advertised_path_style_host() {
+        let edge = AdvertisedEdge::new("http", "cloudish.test", 4566);
+
+        assert_eq!(
+            classify_s3_edge_host(&edge, "cloudish.test:4566"),
+            S3EdgeHostRouting::PathStyle
+        );
+        assert_eq!(
+            classify_s3_edge_host(&edge, "demo.cloudish.test:4566"),
+            S3EdgeHostRouting::UnsupportedVirtualHostStyle
+        );
+        assert_eq!(
+            classify_s3_edge_host(&edge, "api.example.test:4566"),
+            S3EdgeHostRouting::UnsupportedHost
+        );
+    }
+
+    #[test]
+    fn classify_s3_edge_host_treats_multi_label_localhost_hosts_as_non_s3() {
+        let edge = AdvertisedEdge::localhost(4566);
+
+        assert_eq!(
+            classify_s3_edge_host(&edge, "demo.localhost:4566"),
+            S3EdgeHostRouting::UnsupportedVirtualHostStyle
+        );
+        assert_eq!(
+            classify_s3_edge_host(&edge, "apiid.execute-api.localhost:4566",),
+            S3EdgeHostRouting::UnsupportedHost
+        );
     }
 }

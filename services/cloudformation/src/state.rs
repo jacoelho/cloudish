@@ -6458,24 +6458,28 @@ Resources:
     }
 
     #[test]
-    fn cloudformation_parser_validate_template_source_reads_legacy_s3_compatibility_hosts()
-     {
+    fn cloudformation_parser_validate_template_source_rejects_host_style_urls()
+    {
         let service = s3_provider_service(aws::SharedAdvertisedEdge::new(
             aws::AdvertisedEdge::new("http", "cloudish.test", 4566),
         ));
 
-        let output = service
+        let error = service
             .validate_template_source(
                 &scope(),
                 None,
                 Some(
-                    "http://template-bucket.s3.localhost.localstack.cloud/templates/demo.yaml"
+                    "http://template-bucket.cloudish.test/templates/demo.yaml"
                         .to_owned(),
                 ),
             )
-            .expect("TemplateURL should resolve through compatibility hosts");
+            .expect_err("host-style TemplateURL should fail");
 
-        assert!(output.capabilities.is_empty());
+        assert!(
+            error
+                .to_string()
+                .contains("TemplateURL http://template-bucket.cloudish.test/templates/demo.yaml is not a valid S3 URL")
+        );
     }
 
     #[test]

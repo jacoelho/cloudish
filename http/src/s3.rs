@@ -11,7 +11,8 @@ use crate::s3_xml::{
 use crate::xml::XmlBuilder;
 use auth::{AwsChunkedMode, VerifiedPayload, VerifiedSignature};
 use aws::{
-    AdvertisedEdge, AwsError, AwsErrorFamily, S3EdgeRequestTargetError,
+    AdvertisedEdge, AwsError, AwsErrorFamily, S3EdgeHostRouting,
+    S3EdgeRequestTargetError, classify_s3_edge_host,
     parse_s3_edge_request_target,
 };
 use aws_smithy_eventstream::frame::write_message_to;
@@ -63,12 +64,23 @@ impl From<S3Error> for S3RouteError {
     }
 }
 
-pub(crate) fn is_rest_xml_request(request: &HttpRequest<'_>) -> bool {
+pub(crate) fn is_rest_xml_request(
+    request: &HttpRequest<'_>,
+    advertised_edge: &AdvertisedEdge,
+) -> bool {
     let path = request.path_without_query();
+    let Some(host) = request.header("host") else {
+        return false;
+    };
+    let host_routing = classify_s3_edge_host(advertised_edge, host);
 
     matches!(request.method(), "DELETE" | "GET" | "HEAD" | "POST" | "PUT")
-        && request.header("host").is_some()
         && !path.starts_with("/__")
+        && matches!(
+            host_routing,
+            S3EdgeHostRouting::PathStyle
+                | S3EdgeHostRouting::UnsupportedVirtualHostStyle
+        )
 }
 
 pub(crate) fn normalize_request(
@@ -431,7 +443,8 @@ fn handle_object_request(
     if request.method() == "PUT"
         && request.header("x-amz-copy-source").is_some()
     {
-        let (source_bucket, source_key) = parse_copy_source(request)?;
+        let (source_bucket, source_key, source_version_id) =
+            parse_copy_source(request)?;
         let copied = s3
             .copy_object(
                 scope,
@@ -440,6 +453,7 @@ fn handle_object_request(
                     destination_key: key.to_owned(),
                     source_bucket,
                     source_key,
+                    source_version_id,
                 },
             )
             .map_err(S3RouteError::from)?;
@@ -1527,6 +1541,12 @@ fn s3_edge_target_error(error: S3EdgeRequestTargetError) -> AwsError {
     match error {
         S3EdgeRequestTargetError::InvalidPercentEncoding
         | S3EdgeRequestTargetError::InvalidUtf8 => malformed_xml_error(),
+        S3EdgeRequestTargetError::UnsupportedHost
+        | S3EdgeRequestTargetError::UnsupportedVirtualHostStyle => {
+            invalid_request_error(
+                "S3 requests must use the advertised edge host with path-style URLs.",
+            )
+        }
     }
 }
 
@@ -1771,11 +1791,12 @@ fn required_u16(
 
 fn parse_copy_source(
     request: &HttpRequest<'_>,
-) -> Result<(String, String), AwsError> {
+) -> Result<(String, String, Option<String>), AwsError> {
     let source = request
         .header("x-amz-copy-source")
         .ok_or_else(not_implemented_error)?
         .trim();
+    let (source, query) = source.split_once('?').unwrap_or((source, ""));
     let source = source.strip_prefix('/').unwrap_or(source);
     let (bucket, key) = source.split_once('/').ok_or_else(|| {
         S3Error::InvalidArgument {
@@ -1787,7 +1808,47 @@ fn parse_copy_source(
         .to_aws_error()
     })?;
 
-    Ok((percent_decode_path(bucket)?, percent_decode_path(key)?))
+    let source_version_id = if query.is_empty() {
+        None
+    } else {
+        parse_copy_source_version_id(query)?
+    };
+
+    Ok((
+        percent_decode_path(bucket)?,
+        percent_decode_path(key)?,
+        source_version_id,
+    ))
+}
+
+fn parse_copy_source_version_id(
+    query: &str,
+) -> Result<Option<String>, AwsError> {
+    let mut version_id = None;
+
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').ok_or_else(|| {
+            S3Error::InvalidArgument {
+                code: "InvalidArgument",
+                message: "The copy source query string is not valid."
+                    .to_owned(),
+                status_code: 400,
+            }
+            .to_aws_error()
+        })?;
+        if name != "versionId" || version_id.is_some() {
+            return Err(S3Error::InvalidArgument {
+                code: "InvalidArgument",
+                message: "The copy source query string is not valid."
+                    .to_owned(),
+                status_code: 400,
+            }
+            .to_aws_error());
+        }
+        version_id = Some(percent_decode_path(value)?);
+    }
+
+    Ok(version_id)
 }
 
 fn parse_bucket_acl(
@@ -1878,7 +1939,7 @@ fn parse_create_bucket_region(
 ) -> Result<aws::RegionId, AwsError> {
     let body = request.body();
     if body.is_empty() {
-        return Ok(scope.region().clone());
+        return default_create_bucket_region(scope);
     }
 
     let body = std::str::from_utf8(body).map_err(|_| malformed_xml_error())?;
@@ -1887,7 +1948,7 @@ fn parse_create_bucket_region(
     let Some(start) =
         body.find(start_tag).map(|index| index + start_tag.len())
     else {
-        return Ok(scope.region().clone());
+        return default_create_bucket_region(scope);
     };
     let Some(end) = body[start..].find(end_tag).map(|index| start + index)
     else {
@@ -1896,7 +1957,7 @@ fn parse_create_bucket_region(
     let region = body[start..end].trim();
 
     if region.is_empty() {
-        return Ok(scope.region().clone());
+        return default_create_bucket_region(scope);
     }
 
     region.parse().map_err(|_| {
@@ -1908,6 +1969,21 @@ fn parse_create_bucket_region(
         }
         .to_aws_error()
     })
+}
+
+fn default_create_bucket_region(
+    scope: &S3Scope,
+) -> Result<aws::RegionId, AwsError> {
+    if scope.region().as_str() == "us-east-1" {
+        return Ok(scope.region().clone());
+    }
+
+    Err(S3Error::InvalidArgument {
+        code: "InvalidLocationConstraint",
+        message: "The specified location constraint is not valid.".to_owned(),
+        status_code: 400,
+    }
+    .to_aws_error())
 }
 
 fn request_body_utf8(request: &HttpRequest<'_>) -> Result<String, AwsError> {
@@ -2209,7 +2285,7 @@ fn percent_decode_tag_component(value: &str) -> Result<String, AwsError> {
 mod tests {
     use super::{
         AwsChunkedMode, EdgeRequest, RequestTarget, normalize_request,
-        wrong_region_response,
+        parse_copy_source, parse_create_bucket_region, wrong_region_response,
     };
     use auth::{
         AwsChunkedSigningContext, VerifiedPayload, VerifiedRequest,
@@ -2218,8 +2294,9 @@ mod tests {
     use aws::{
         AccountId, AdvertisedEdge, Arn, ArnResource, AwsPrincipalType,
         CallerCredentialKind, CallerIdentity, CredentialScope, Partition,
-        ServiceName, StableAwsPrincipal,
+        RegionId, ServiceName, StableAwsPrincipal,
     };
+    use services::S3Scope;
 
     #[test]
     fn normalize_request_decodes_streaming_payload_and_strips_aws_chunked() {
@@ -2323,7 +2400,7 @@ mod tests {
     }
 
     #[test]
-    fn request_target_parse_resolves_virtual_host_public_host_requests() {
+    fn request_target_parse_rejects_virtual_host_public_host_requests() {
         let request = EdgeRequest::new(
             "GET",
             "/reports/data%20file.txt",
@@ -2331,14 +2408,13 @@ mod tests {
             Vec::new(),
         );
 
-        let target = RequestTarget::parse(
+        let error = RequestTarget::parse(
             &request,
             &AdvertisedEdge::new("http", "cloudish.test", 4566),
         )
-        .expect("virtual-host request should parse");
+        .expect_err("virtual-host request should fail");
 
-        assert_eq!(target.bucket.as_deref(), Some("demo"));
-        assert_eq!(target.key.as_deref(), Some("reports/data file.txt"));
+        assert_eq!(error.code(), "InvalidRequest");
     }
 
     #[test]
@@ -2354,6 +2430,115 @@ mod tests {
         );
         assert!(response_text.contains("<Code>IncorrectEndpoint</Code>"));
         assert!(response_text.contains("another Region"));
+    }
+
+    #[test]
+    fn parse_copy_source_supports_version_id_and_percent_decoding() {
+        let request = EdgeRequest::new(
+            "PUT",
+            "/demo/dst.txt",
+            vec![(
+                "x-amz-copy-source".to_owned(),
+                "/source/reports%2Fdata%20file.txt?versionId=v1%2B2"
+                    .to_owned(),
+            )],
+            Vec::new(),
+        );
+
+        let (bucket, key, version_id) =
+            parse_copy_source(&request).expect("copy source should parse");
+
+        assert_eq!(bucket, "source");
+        assert_eq!(key, "reports/data file.txt");
+        assert_eq!(version_id.as_deref(), Some("v1+2"));
+    }
+
+    #[test]
+    fn parse_copy_source_rejects_invalid_query_strings() {
+        let unsupported = EdgeRequest::new(
+            "PUT",
+            "/demo/dst.txt",
+            vec![(
+                "x-amz-copy-source".to_owned(),
+                "/source/key?partNumber=1".to_owned(),
+            )],
+            Vec::new(),
+        );
+        let malformed = EdgeRequest::new(
+            "PUT",
+            "/demo/dst.txt",
+            vec![(
+                "x-amz-copy-source".to_owned(),
+                "/source/key?versionId".to_owned(),
+            )],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            parse_copy_source(&unsupported)
+                .expect_err("unsupported query should fail")
+                .code(),
+            "InvalidArgument"
+        );
+        assert_eq!(
+            parse_copy_source(&malformed)
+                .expect_err("malformed query should fail")
+                .code(),
+            "InvalidArgument"
+        );
+    }
+
+    #[test]
+    fn parse_create_bucket_region_enforces_nonempty_constraint_outside_us_east_1()
+     {
+        let east_scope = s3_scope("us-east-1");
+        let west_scope = s3_scope("eu-west-2");
+        let empty_request =
+            EdgeRequest::new("PUT", "/demo", Vec::new(), Vec::new());
+        let missing_tag = EdgeRequest::new(
+            "PUT",
+            "/demo",
+            Vec::new(),
+            br#"<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></CreateBucketConfiguration>"#.to_vec(),
+        );
+        let blank_tag = EdgeRequest::new(
+            "PUT",
+            "/demo",
+            Vec::new(),
+            br#"<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>   </LocationConstraint></CreateBucketConfiguration>"#.to_vec(),
+        );
+
+        assert_eq!(
+            parse_create_bucket_region(&empty_request, &east_scope)
+                .expect("us-east-1 empty body should default")
+                .as_str(),
+            "us-east-1"
+        );
+        assert_eq!(
+            parse_create_bucket_region(&empty_request, &west_scope)
+                .expect_err("non-us-east-1 empty body should fail")
+                .code(),
+            "InvalidLocationConstraint"
+        );
+        assert_eq!(
+            parse_create_bucket_region(&missing_tag, &west_scope)
+                .expect_err("missing tag should fail outside us-east-1")
+                .code(),
+            "InvalidLocationConstraint"
+        );
+        assert_eq!(
+            parse_create_bucket_region(&blank_tag, &west_scope)
+                .expect_err("blank tag should fail outside us-east-1")
+                .code(),
+            "InvalidLocationConstraint"
+        );
+    }
+
+    fn s3_scope(region: &str) -> S3Scope {
+        S3Scope::new(
+            "000000000000".parse::<AccountId>().expect("account should parse"),
+            region.parse::<RegionId>().expect("region should parse"),
+        )
     }
 
     fn streaming_verified_signature(

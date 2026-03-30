@@ -42,10 +42,10 @@ pub use caller_credentials::{
 pub use credential_scope::CredentialScope;
 pub use edge_addressing::{
     AWS_PATH_PREFIX, AdvertisedEdge, AdvertisedEdgeTemplate,
-    ReservedExecuteApiPath, ReservedLambdaFunctionUrlPath,
+    ReservedExecuteApiPath, ReservedLambdaFunctionUrlPath, S3EdgeHostRouting,
     S3EdgeRequestTarget, S3EdgeRequestTargetError, SharedAdvertisedEdge,
-    parse_reserved_execute_api_path, parse_reserved_lambda_function_url_path,
-    parse_s3_edge_request_target,
+    classify_s3_edge_host, parse_reserved_execute_api_path,
+    parse_reserved_lambda_function_url_path, parse_s3_edge_request_target,
 };
 pub use error::{AwsError, AwsErrorBuildError, AwsErrorFamily};
 pub use execute_api_source_arn::{

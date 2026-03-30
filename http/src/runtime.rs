@@ -46,9 +46,10 @@ use auth::{
     VerifiedSignature,
 };
 use aws::{
-    AwsError, AwsErrorFamily, CredentialScope, ProtocolFamily, RegionId,
-    RequestContext, RuntimeDefaults, ServiceName, SharedAdvertisedEdge,
-    parse_reserved_execute_api_path, parse_reserved_lambda_function_url_path,
+    AdvertisedEdge, AwsError, AwsErrorFamily, CredentialScope, ProtocolFamily,
+    RegionId, RequestContext, RuntimeDefaults, ServiceName,
+    SharedAdvertisedEdge, parse_reserved_execute_api_path,
+    parse_reserved_lambda_function_url_path,
 };
 use ciborium::into_writer;
 use edge_runtime::{EnabledServices, RuntimeServices};
@@ -147,18 +148,16 @@ impl EdgeRouter {
             return response;
         }
 
-        if let Some(response) = self.route_custom_domain_execute_api(&request)
-        {
-            return response;
-        }
-
         if let Some(response) = self.route_function_url(&request) {
             return response;
         }
 
-        let Some(protocol) = detect_generic_protocol(&request) else {
+        let advertised_edge = self.advertised_edge.current();
+        let Some(protocol) =
+            detect_generic_protocol(&request, &advertised_edge)
+        else {
             #[cfg(feature = "s3")]
-            if s3::is_rest_xml_request(&request) {
+            if s3::is_rest_xml_request(&request, &advertised_edge) {
                 let verified_signature =
                     match self.authenticate_details(&request) {
                         Ok(verified_signature) => verified_signature,
@@ -368,7 +367,7 @@ impl EdgeRouter {
             parse_reserved_execute_api_path(request.path_without_query())?;
         Some(self.route_execute_api_request(
             request,
-            Some(execute_api.api_id()),
+            execute_api.api_id(),
             execute_api.request_path(),
         ))
     }
@@ -382,28 +381,10 @@ impl EdgeRouter {
     }
 
     #[cfg(feature = "apigateway")]
-    fn route_custom_domain_execute_api(
-        &self,
-        request: &HttpRequest<'_>,
-    ) -> Option<EdgeResponse> {
-        let host = request.header("host")?;
-        if !self.runtime.apigateway().has_custom_domain_execute_api_host(host)
-        {
-            return None;
-        }
-
-        Some(self.route_execute_api_request(
-            request,
-            None,
-            request.path_without_query(),
-        ))
-    }
-
-    #[cfg(feature = "apigateway")]
     fn route_execute_api_request(
         &self,
         request: &HttpRequest<'_>,
-        api_id: Option<&str>,
+        api_id: &str,
         request_path: &str,
     ) -> EdgeResponse {
         let execute_request = build_execute_api_request(request, request_path);
@@ -428,27 +409,14 @@ impl EdgeRouter {
                 )),
             );
         }
-        let resolved = match api_id {
-            Some(api_id) => {
-                self.runtime.apigateway().resolve_execute_api_by_api_id(
-                    api_id,
-                    &execute_request,
-                    verified_request
-                        .as_ref()
-                        .map(VerifiedRequest::caller_identity),
-                )
-            }
-            None => self
-                .runtime
-                .apigateway()
-                .resolve_execute_api(
-                    &execute_request,
-                    verified_request
-                        .as_ref()
-                        .map(VerifiedRequest::caller_identity),
-                )
-                .unwrap_or(Err(services::ExecuteApiError::NotFound)),
-        };
+        let resolved =
+            self.runtime.apigateway().resolve_execute_api_by_api_id(
+                api_id,
+                &execute_request,
+                verified_request
+                    .as_ref()
+                    .map(VerifiedRequest::caller_identity),
+            );
         let (scope, invocation) = match resolved {
             Ok(target) => target.into_parts(),
             Err(error) => return execute_api_error_response(&error),
@@ -494,14 +462,6 @@ impl EdgeRouter {
             }
             Err(error) => execute_api_error_response(&error),
         }
-    }
-
-    #[cfg(not(feature = "apigateway"))]
-    fn route_custom_domain_execute_api(
-        &self,
-        _request: &HttpRequest<'_>,
-    ) -> Option<EdgeResponse> {
-        None
     }
 
     fn internal_route(
@@ -1462,6 +1422,7 @@ struct FunctionUrlHost {
 
 fn detect_generic_protocol(
     request: &HttpRequest<'_>,
+    advertised_edge: &AdvertisedEdge,
 ) -> Option<ProtocolFamily> {
     let content_type = request.header("content-type").unwrap_or_default();
     let smithy_protocol =
@@ -1469,14 +1430,20 @@ fn detect_generic_protocol(
     let target = request.header("x-amz-target");
     let path = request.path_without_query();
     #[cfg(feature = "s3")]
-    let s3_candidate = s3::is_rest_xml_request(request);
+    let s3_candidate = s3::is_rest_xml_request(request, advertised_edge);
     #[cfg(not(feature = "s3"))]
     let s3_candidate = false;
 
     if smithy_path(request.path_without_query()).is_some()
-        || content_type.eq_ignore_ascii_case("application/cbor")
         || smithy_protocol.eq_ignore_ascii_case("rpc-v2-cbor")
     {
+        return Some(ProtocolFamily::SmithyRpcV2Cbor);
+    }
+
+    if content_type.eq_ignore_ascii_case("application/cbor") {
+        if s3_candidate && path != "/" {
+            return None;
+        }
         return Some(ProtocolFamily::SmithyRpcV2Cbor);
     }
 
@@ -2167,15 +2134,15 @@ mod tests {
     use serde_json::{Value, json};
     use services::{
         AddLambdaPermissionInput, ApiGatewayScope, CreateDeploymentInput,
-        CreateDomainNameInput, CreateFunctionInput,
-        CreateFunctionUrlConfigInput, CreateHttpApiDeploymentInput,
-        CreateHttpApiInput, CreateHttpApiIntegrationInput,
-        CreateHttpApiRouteInput, CreateHttpApiStageInput, CreateQueueInput,
-        CreateResourceInput, CreateRestApiInput, CreateStageInput,
-        CreateTopicInput, LambdaCodeInput, LambdaExecutor,
-        LambdaFunctionUrlAuthType, LambdaFunctionUrlInvokeMode,
-        LambdaInvocationRequest, LambdaInvocationResult, LambdaPackageType,
-        LambdaScope, ReceiveMessageInput, SnsScope, SqsScope,
+        CreateFunctionInput, CreateFunctionUrlConfigInput,
+        CreateHttpApiDeploymentInput, CreateHttpApiInput,
+        CreateHttpApiIntegrationInput, CreateHttpApiRouteInput,
+        CreateHttpApiStageInput, CreateQueueInput, CreateResourceInput,
+        CreateRestApiInput, CreateStageInput, CreateTopicInput,
+        LambdaCodeInput, LambdaExecutor, LambdaFunctionUrlAuthType,
+        LambdaFunctionUrlInvokeMode, LambdaInvocationRequest,
+        LambdaInvocationResult, LambdaPackageType, LambdaScope,
+        ReceiveMessageInput, SnsScope, SqsScope,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -2566,6 +2533,22 @@ mod tests {
         )
     }
 
+    fn legacy_execute_api_host_request(
+        method: &str,
+        api_id: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        execute_api_request(
+            method,
+            &format!("{api_id}.execute-api.localhost"),
+            path,
+            headers,
+            body,
+        )
+    }
+
     fn create_access_key_for_scope(
         runtime: &RuntimeServices,
         scope: &ApiGatewayScope,
@@ -2722,6 +2705,23 @@ mod tests {
         format!(
             "arn:aws:apigateway:eu-west-2:lambda:path/2015-03-31/functions/arn:aws:lambda:eu-west-2:000000000000:function:{function_name}/invocations"
         )
+    }
+
+    fn s3_create_bucket_request(path: &str, host: &str) -> Vec<u8> {
+        s3_create_bucket_request_with_headers(path, host, "")
+    }
+
+    fn s3_create_bucket_request_with_headers(
+        path: &str,
+        host: &str,
+        extra_headers: &str,
+    ) -> Vec<u8> {
+        let body = r#"<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>eu-west-2</LocationConstraint></CreateBucketConfiguration>"#;
+        format!(
+            "PUT {path} HTTP/1.1\r\nHost: {host}\r\n{extra_headers}Content-Type: application/xml\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
     }
 
     #[derive(Debug, Default)]
@@ -3641,7 +3641,7 @@ mod tests {
     }
 
     #[test]
-    fn apigw_v1_runtime_mock_and_custom_domain_miss_use_gateway_errors() {
+    fn apigw_v1_runtime_mock_and_custom_hosts_do_not_resolve_execute_api() {
         let (router, runtime) = router_with_runtime("apigw-v1-runtime-mock");
         let api_id = deploy_execute_api(
             &runtime,
@@ -3654,20 +3654,6 @@ mod tests {
             )]),
             false,
         );
-        runtime
-            .apigateway()
-            .create_domain_name(
-                &apigateway_scope(),
-                CreateDomainNameInput {
-                    certificate_arn: None,
-                    certificate_name: None,
-                    domain_name: "api.example.test".to_owned(),
-                    endpoint_configuration: None,
-                    security_policy: None,
-                    tags: BTreeMap::new(),
-                },
-            )
-            .expect("domain should create");
 
         let mock = router.handle_bytes(&reserved_execute_api_request(
             "GET",
@@ -3684,7 +3670,7 @@ mod tests {
                 &[],
                 b"",
             ));
-        let missing_mapping = router.handle_bytes(&execute_api_request(
+        let custom_host = router.handle_bytes(&execute_api_request(
             "GET",
             "api.example.test",
             "/pets",
@@ -3694,27 +3680,60 @@ mod tests {
 
         let mock_bytes = mock.to_http_bytes();
         let missing_stage_bytes = missing_stage.to_http_bytes();
-        let missing_mapping_bytes = missing_mapping.to_http_bytes();
+        let custom_host_bytes = custom_host.to_http_bytes();
         let (mock_status, mock_headers, mock_body) =
             split_response(&mock_bytes);
         let (missing_stage_status, _, missing_stage_body) =
             split_response(&missing_stage_bytes);
-        let (missing_mapping_status, _, missing_mapping_body) =
-            split_response(&missing_mapping_bytes);
+        let (custom_host_status, _, custom_host_body) =
+            split_response(&custom_host_bytes);
         let missing_stage_body: Value =
             serde_json::from_slice(missing_stage_body)
                 .expect("missing-stage body should decode");
-        let missing_mapping_body: Value =
-            serde_json::from_slice(missing_mapping_body)
-                .expect("missing-mapping body should decode");
+        let custom_host_body: Value = serde_json::from_slice(custom_host_body)
+            .expect("custom-host body should decode");
 
         assert_eq!(mock_status, "HTTP/1.1 202 Accepted");
         assert_eq!(header_value(&mock_headers, "x-mock"), Some("ok"));
         assert_eq!(mock_body, b"ready");
         assert_eq!(missing_stage_status, "HTTP/1.1 404 Not Found");
         assert_eq!(missing_stage_body["message"], "Not Found");
-        assert_eq!(missing_mapping_status, "HTTP/1.1 404 Not Found");
-        assert_eq!(missing_mapping_body["message"], "Not Found");
+        assert_eq!(custom_host_status, "HTTP/1.1 404 Not Found");
+        assert_eq!(custom_host_body["message"], "not found");
+    }
+
+    #[test]
+    fn apigw_v1_runtime_legacy_execute_api_hosts_do_not_resolve() {
+        let (router, runtime) =
+            router_with_runtime("apigw-v1-runtime-legacy-host");
+        let api_id = deploy_execute_api(
+            &runtime,
+            "MOCK",
+            None,
+            BTreeMap::from([(
+                "application/json".to_owned(),
+                r#"{"statusCode":202,"headers":{"x-mock":"ok"},"body":"ready"}"#
+                    .to_owned(),
+            )]),
+            false,
+        );
+
+        let legacy_host =
+            router.handle_bytes(&legacy_execute_api_host_request(
+                "GET",
+                &api_id,
+                "/dev/pets",
+                &[("Content-Type", "application/json")],
+                b"",
+            ));
+        let legacy_host_bytes = legacy_host.to_http_bytes();
+        let (legacy_host_status, _, legacy_host_body) =
+            split_response(&legacy_host_bytes);
+        let legacy_host_body: Value = serde_json::from_slice(legacy_host_body)
+            .expect("legacy-host body should decode");
+
+        assert_eq!(legacy_host_status, "HTTP/1.1 404 Not Found");
+        assert_eq!(legacy_host_body["message"], "not found");
     }
 
     #[test]
@@ -4254,9 +4273,8 @@ mod tests {
     fn s3_core_rest_xml_path_style_object_flow_round_trips() {
         let router = router();
 
-        let create = router.handle_bytes(
-            b"PUT /demo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-        );
+        let create = router
+            .handle_bytes(&s3_create_bucket_request("/demo", "localhost"));
         let put = router.handle_bytes(
             b"PUT /demo/reports/data.txt HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\nx-amz-meta-trace: abc123\r\nContent-Length: 7\r\n\r\npayload",
         );
@@ -4329,9 +4347,10 @@ mod tests {
     fn s3_core_rest_xml_put_object_ignores_jsonish_object_content_types() {
         let router = router();
 
-        let create = router.handle_bytes(
-            b"PUT /jsonish-content HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-        );
+        let create = router.handle_bytes(&s3_create_bucket_request(
+            "/jsonish-content",
+            "localhost",
+        ));
         let put = router.handle_bytes(
             b"PUT /jsonish-content/object.bin HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-amz-json-1.0\r\nContent-Length: 7\r\n\r\npayload",
         );
@@ -4369,73 +4388,76 @@ mod tests {
     }
 
     #[test]
-    fn s3_core_rest_xml_virtual_host_routes_and_errors_are_s3_shaped() {
+    fn s3_core_rest_xml_put_object_ignores_generic_cbor_content_type() {
         let router = router();
 
-        let create = router.handle_bytes(
-            b"PUT / HTTP/1.1\r\nHost: virtual-bucket.s3.localhost\r\nContent-Length: 0\r\n\r\n",
-        );
-        let location = router.handle_bytes(
-            b"GET /?location HTTP/1.1\r\nHost: virtual-bucket.s3.localhost\r\n\r\n",
-        );
-        let duplicate = router.handle_bytes(
-            b"PUT / HTTP/1.1\r\nHost: virtual-bucket.s3.localhost\r\nContent-Length: 0\r\n\r\n",
-        );
+        let create = router.handle_bytes(&s3_create_bucket_request(
+            "/cborish-content",
+            "localhost",
+        ));
         let put = router.handle_bytes(
-            b"PUT /hello.txt HTTP/1.1\r\nHost: virtual-bucket.s3.localhost\r\nContent-Length: 4\r\n\r\nbody",
+            b"PUT /cborish-content/object.bin HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/cbor\r\nContent-Length: 7\r\n\r\npayload",
         );
-        let delete_bucket = router.handle_bytes(
-            b"DELETE / HTTP/1.1\r\nHost: virtual-bucket.s3.localhost\r\n\r\n",
+        let head = router.handle_bytes(
+            b"HEAD /cborish-content/object.bin HTTP/1.1\r\nHost: localhost\r\n\r\n",
         );
-        let missing = router.handle_bytes(
+        let get = router.handle_bytes(
+            b"GET /cborish-content/object.bin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+
+        let create_bytes = create.to_http_bytes();
+        let put_bytes = put.to_http_bytes();
+        let head_bytes = head.to_http_bytes();
+        let get_bytes = get.to_http_bytes();
+        let (create_status, _, _) = split_response(&create_bytes);
+        let (put_status, _, put_body) = split_response(&put_bytes);
+        let (head_status, head_headers, _) = split_response(&head_bytes);
+        let (get_status, get_headers, get_body) = split_response(&get_bytes);
+
+        assert_eq!(create_status, "HTTP/1.1 200 OK");
+        assert_eq!(put_status, "HTTP/1.1 200 OK");
+        assert!(put_body.is_empty());
+        assert_eq!(head_status, "HTTP/1.1 200 OK");
+        assert_eq!(
+            header_value(&head_headers, "content-type"),
+            Some("application/cbor")
+        );
+        assert_eq!(get_status, "HTTP/1.1 200 OK");
+        assert_eq!(
+            header_value(&get_headers, "content-type"),
+            Some("application/cbor")
+        );
+        assert_eq!(get_body, b"payload");
+    }
+
+    #[test]
+    fn s3_core_rest_xml_virtual_host_requests_fail_explicitly() {
+        let router = router();
+
+        let create = router.handle_bytes(&s3_create_bucket_request(
+            "/",
+            "virtual-bucket.s3.localhost",
+        ));
+        let get = router.handle_bytes(
             b"GET /missing.txt HTTP/1.1\r\nHost: virtual-bucket.s3.localhost\r\n\r\n",
         );
 
         let create_bytes = create.to_http_bytes();
-        let location_bytes = location.to_http_bytes();
-        let duplicate_bytes = duplicate.to_http_bytes();
-        let put_bytes = put.to_http_bytes();
-        let delete_bucket_bytes = delete_bucket.to_http_bytes();
-        let missing_bytes = missing.to_http_bytes();
-
+        let get_bytes = get.to_http_bytes();
         let (create_status, _, _) = split_response(&create_bytes);
-        let (location_status, _, location_body) =
-            split_response(&location_bytes);
-        let (duplicate_status, _, duplicate_body) =
-            split_response(&duplicate_bytes);
-        let (put_status, _, put_body) = split_response(&put_bytes);
-        let (delete_status, _, delete_body) =
-            split_response(&delete_bucket_bytes);
-        let (missing_status, _, missing_body) = split_response(&missing_bytes);
+        let (get_status, _, get_body) = split_response(&get_bytes);
 
-        assert_eq!(create_status, "HTTP/1.1 200 OK");
-        assert_eq!(location_status, "HTTP/1.1 200 OK");
+        assert_eq!(create_status, "HTTP/1.1 400 Bad Request");
+        assert_eq!(get_status, "HTTP/1.1 400 Bad Request");
         assert!(
-            std::str::from_utf8(location_body)
-                .expect("location body should be UTF-8")
-                .contains(
-                    "<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">eu-west-2</LocationConstraint>"
-                )
+            std::str::from_utf8(get_body)
+                .expect("body should be UTF-8")
+                .contains("<Code>InvalidRequest</Code>")
         );
-        assert_eq!(duplicate_status, "HTTP/1.1 409 Conflict");
         assert!(
-            std::str::from_utf8(duplicate_body)
-                .expect("duplicate body should be UTF-8")
-                .contains("<Code>BucketAlreadyOwnedByYou</Code>")
-        );
-        assert_eq!(put_status, "HTTP/1.1 200 OK");
-        assert!(put_body.is_empty());
-        assert_eq!(delete_status, "HTTP/1.1 409 Conflict");
-        assert!(
-            std::str::from_utf8(delete_body)
-                .expect("delete body should be UTF-8")
-                .contains("<Code>BucketNotEmpty</Code>")
-        );
-        assert_eq!(missing_status, "HTTP/1.1 404 Not Found");
-        assert!(
-            std::str::from_utf8(missing_body)
-                .expect("missing body should be UTF-8")
-                .contains("<Code>NoSuchKey</Code>")
+            std::str::from_utf8(get_body)
+                .expect("body should be UTF-8")
+                .contains("path-style URLs")
         );
     }
 
@@ -4443,9 +4465,10 @@ mod tests {
     fn s3_advanced_rest_xml_versioning_delete_markers_and_tagging_work() {
         let router = router();
 
-        let create = router.handle_bytes(
-            b"PUT /advanced-demo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-        );
+        let create = router.handle_bytes(&s3_create_bucket_request(
+            "/advanced-demo",
+            "localhost",
+        ));
         let enable_versioning = router.handle_bytes(
             b"PUT /advanced-demo?versioning HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/xml\r\nContent-Length: 132\r\n\r\n<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>",
         );
@@ -4566,9 +4589,10 @@ mod tests {
     fn s3_advanced_rest_xml_multipart_lifecycle_and_validation_errors_work() {
         let router = router();
 
-        let create = router.handle_bytes(
-            b"PUT /multipart-demo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-        );
+        let create = router.handle_bytes(&s3_create_bucket_request(
+            "/multipart-demo",
+            "localhost",
+        ));
         let initiate = router.handle_bytes(
             b"POST /multipart-demo/archive.bin?uploads HTTP/1.1\r\nHost: localhost\r\nx-amz-tagging: stage=parts\r\nContent-Length: 0\r\n\r\n",
         );
@@ -4778,9 +4802,12 @@ mod tests {
             )
             .expect("topic should be created");
 
-        let create = router.handle_bytes(
-            b"PUT /notify-demo HTTP/1.1\r\nHost: localhost\r\nx-amz-bucket-object-lock-enabled: true\r\nContent-Length: 0\r\n\r\n",
-        );
+        let create =
+            router.handle_bytes(&s3_create_bucket_request_with_headers(
+                "/notify-demo",
+                "localhost",
+                "x-amz-bucket-object-lock-enabled: true\r\n",
+            ));
         let notification_body = format!(
             "<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><QueueConfiguration><Id>queue-config</Id><Queue>{queue_arn}</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration><TopicConfiguration><Id>topic-config</Id><Topic>{topic_arn}</Topic><Event>s3:ObjectCreated:Put</Event></TopicConfiguration></NotificationConfiguration>"
         );
@@ -4933,9 +4960,10 @@ mod tests {
     #[test]
     fn s3_notifications_rest_xml_select_stream_and_invalid_input_work() {
         let (router, _) = router_with_runtime("http-runtime-select");
-        let create = router.handle_bytes(
-            b"PUT /select-demo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-        );
+        let create = router.handle_bytes(&s3_create_bucket_request(
+            "/select-demo",
+            "localhost",
+        ));
         let put = router.handle_bytes(
             b"PUT /select-demo/records.csv HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/csv\r\nContent-Length: 24\r\n\r\nName,Age\nJane,30\nBob,20\n",
         );

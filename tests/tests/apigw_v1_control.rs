@@ -14,8 +14,7 @@ use tests::common::sdk;
 use aws_sdk_apigateway::Client as ApiGatewayClient;
 use aws_sdk_apigateway::error::ProvideErrorMetadata;
 use aws_sdk_apigateway::types::{
-    ApiStage, AuthorizerType, ConnectionType, EndpointConfiguration,
-    EndpointType, IntegrationType, SecurityPolicy,
+    ApiStage, AuthorizerType, ConnectionType, IntegrationType,
 };
 use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
@@ -319,7 +318,7 @@ async fn apigw_v1_control_rest_api_crud_round_trip() {
 }
 
 #[tokio::test]
-async fn apigw_v1_control_api_keys_usage_plans_and_domains_round_trip() {
+async fn apigw_v1_control_api_keys_usage_plans_and_domains_are_unsupported() {
     let runtime = shared_runtime().await;
     let target = SdkSmokeTarget::new(
         format!("http://{}", runtime.address()),
@@ -420,27 +419,26 @@ async fn apigw_v1_control_api_keys_usage_plans_and_domains_round_trip() {
         .expect("usage plan keys should list");
     assert_eq!(listed_usage_plan_keys.items().len(), 1);
 
-    let created_domain = client
+    let create_domain_error = client
         .create_domain_name()
         .domain_name(&domain_name)
-        .certificate_name("cert")
-        .security_policy(SecurityPolicy::Tls12)
-        .endpoint_configuration(
-            EndpointConfiguration::builder()
-                .types(EndpointType::Regional)
-                .build(),
-        )
-        .tags("owner", "qa")
         .send()
         .await
-        .expect("domain should create");
-    assert_eq!(created_domain.domain_name(), Some(domain_name.as_str()));
+        .expect_err("custom domains should fail explicitly");
     assert_eq!(
-        created_domain.security_policy().map(SecurityPolicy::as_str),
-        Some("TLS_1_2")
+        create_domain_error.code().expect("error code should be present"),
+        "BadRequestException"
+    );
+    assert!(
+        create_domain_error
+            .message()
+            .expect("error message should be present")
+            .contains(
+                "custom domains and base path mappings are not supported"
+            )
     );
 
-    let created_mapping = client
+    let create_mapping_error = client
         .create_base_path_mapping()
         .domain_name(&domain_name)
         .base_path("v1")
@@ -448,30 +446,19 @@ async fn apigw_v1_control_api_keys_usage_plans_and_domains_round_trip() {
         .stage("dev")
         .send()
         .await
-        .expect("base path mapping should create");
-    assert_eq!(created_mapping.base_path(), Some("v1"));
-
-    let fetched_domain = client
-        .get_domain_name()
-        .domain_name(&domain_name)
-        .send()
-        .await
-        .expect("domain should load");
-    assert_eq!(fetched_domain.domain_name(), Some(domain_name.as_str()));
+        .expect_err("base path mappings should fail explicitly");
     assert_eq!(
-        fetched_domain.regional_hosted_zone_id(),
-        Some("Z2OJLYMUO9EFXC")
+        create_mapping_error.code().expect("error code should be present"),
+        "BadRequestException"
     );
-
-    let fetched_mapping = client
-        .get_base_path_mapping()
-        .domain_name(&domain_name)
-        .base_path("v1")
-        .send()
-        .await
-        .expect("base path mapping should load");
-    assert_eq!(fetched_mapping.rest_api_id(), Some(api_id.as_str()));
-    assert_eq!(fetched_mapping.stage(), Some("dev"));
+    assert!(
+        create_mapping_error
+            .message()
+            .expect("error message should be present")
+            .contains(
+                "custom domains and base path mappings are not supported"
+            )
+    );
 
     assert!(runtime.state_directory().exists());
 }
