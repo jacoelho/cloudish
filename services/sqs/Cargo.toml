@@ -1,0 +1,18 @@
+[package]
+name = "sqs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aws = { path = "../../aws" }
+base64 = "0.22.1"
+md5 = "0.7.0"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+thiserror.workspace = true

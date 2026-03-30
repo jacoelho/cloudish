@@ -1,0 +1,22 @@
+allow-print-in-tests = true
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+allow-indexing-slicing-in-tests = true
+disallowed-methods = [
+    { path = "std::println", reason = "use tracing macros (info!, warn!, debug!) instead for library code", allow-invalid = true },
+    { path = "std::eprintln", reason = "use tracing macros (error!, warn!) instead for library code", allow-invalid = true },
+    { path = "std::dbg", reason = "remove debug statements or use proper logging", allow-invalid = true },
+    { path = "std::mem::transmute", reason = "transmute is extremely unsafe - find a safer alternative" },
+    { path = "std::option::Option::map_or", reason = "prefer `map(..).unwrap_or(..)` for legibility" },
+    { path = "std::option::Option::map_or_else", reason = "prefer `map(..).unwrap_or_else(..)` for legibility" },
+    { path = "std::result::Result::map_or", reason = "prefer `map(..).unwrap_or(..)` for legibility" },
+    { path = "std::result::Result::map_or_else", reason = "prefer `map(..).unwrap_or_else(..)` for legibility" },
+    { path = "std::iter::Iterator::for_each", reason = "prefer `for` for side-effects" },
+    { path = "std::iter::Iterator::try_for_each", reason = "prefer `for` for side-effects" },
+]
+
+cognitive-complexity-threshold = 25
+type-complexity-threshold = 250
+max-fn-params-bools = 3

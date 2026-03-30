@@ -1,0 +1,20 @@
+[package]
+name = "secrets-manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aws = { path = "../../aws" }
+base64 = "0.22.1"
+md5 = "0.7.0"
+serde.workspace = true
+storage = { path = "../../storage" }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

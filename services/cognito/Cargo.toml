@@ -1,0 +1,19 @@
+[package]
+name = "cognito"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aws = { path = "../../aws" }
+base64 = "0.22.1"
+ring = "0.17.14"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+storage = { path = "../../storage" }
+thiserror.workspace = true

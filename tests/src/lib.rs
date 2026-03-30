@@ -1,0 +1,15 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::assertions_on_constants,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::unwrap_used
+    )
+)]
+
+pub mod common;
