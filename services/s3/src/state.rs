@@ -382,6 +382,7 @@ pub struct CopyObjectInput {
     pub destination_key: String,
     pub source_bucket: String,
     pub source_key: String,
+    pub source_version_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1048,7 +1049,7 @@ impl S3Service {
         let source = self.resolve_object_record(
             &input.source_bucket,
             &input.source_key,
-            None,
+            input.source_version_id.as_deref(),
         )?;
         if source.delete_marker {
             return Err(S3Error::NoSuchKey { key: input.source_key });
@@ -4228,6 +4229,7 @@ mod tests {
                     destination_key: "dst.txt".to_owned(),
                     source_bucket: "demo".to_owned(),
                     source_key: "src.txt".to_owned(),
+                    source_version_id: None,
                 },
             )
             .expect("copy should succeed");
@@ -4258,6 +4260,86 @@ mod tests {
         assert_eq!(head.metadata.get("env"), Some(&"dev".to_owned()));
         assert_eq!(tags.tags.get("team"), Some(&"platform".to_owned()));
         assert!(matches!(missing, S3Error::NoSuchKey { .. }));
+    }
+
+    #[test]
+    fn s3_advanced_copy_object_can_target_a_noncurrent_version() {
+        let service = service(1_710_000_000);
+        let scope = scope();
+
+        create_bucket(&service, &scope, "demo");
+        service
+            .put_bucket_versioning(
+                &scope,
+                "demo",
+                BucketVersioningStatus::Enabled,
+            )
+            .expect("versioning should enable");
+
+        let first = service
+            .put_object(
+                &scope,
+                PutObjectInput {
+                    body: b"first".to_vec(),
+                    bucket: "demo".to_owned(),
+                    content_type: Some("text/plain".to_owned()),
+                    key: "src.txt".to_owned(),
+                    metadata: BTreeMap::from([(
+                        "env".to_owned(),
+                        "dev".to_owned(),
+                    )]),
+                    object_lock: None,
+                    tags: BTreeMap::from([(
+                        "team".to_owned(),
+                        "platform".to_owned(),
+                    )]),
+                },
+            )
+            .expect("first version should write");
+        service
+            .put_object(
+                &scope,
+                PutObjectInput {
+                    body: b"second".to_vec(),
+                    bucket: "demo".to_owned(),
+                    content_type: Some("text/plain".to_owned()),
+                    key: "src.txt".to_owned(),
+                    metadata: BTreeMap::from([(
+                        "env".to_owned(),
+                        "prod".to_owned(),
+                    )]),
+                    object_lock: None,
+                    tags: BTreeMap::from([(
+                        "team".to_owned(),
+                        "data".to_owned(),
+                    )]),
+                },
+            )
+            .expect("second version should write");
+
+        service
+            .copy_object(
+                &scope,
+                CopyObjectInput {
+                    destination_bucket: "demo".to_owned(),
+                    destination_key: "dst.txt".to_owned(),
+                    source_bucket: "demo".to_owned(),
+                    source_key: "src.txt".to_owned(),
+                    source_version_id: first.version_id,
+                },
+            )
+            .expect("historical version copy should succeed");
+
+        let copied = service
+            .get_object(&scope, "demo", "dst.txt", None)
+            .expect("copied object should exist");
+        let copied_tags = service
+            .get_object_tagging(&scope, "demo", "dst.txt", None)
+            .expect("copied tags should exist");
+
+        assert_eq!(copied.body, b"first");
+        assert_eq!(copied.head.metadata.get("env"), Some(&"dev".to_owned()));
+        assert_eq!(copied_tags.tags.get("team"), Some(&"platform".to_owned()));
     }
 
     #[test]
