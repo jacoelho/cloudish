@@ -1592,6 +1592,37 @@ mod tests {
     }
 
     #[test]
+    fn lambda_core_resource_policy_get_and_delete_routes_remain_unsupported() {
+        let router = router();
+
+        for (method, path) in [
+            ("GET", "/2015-03-31/functions/demo/policy"),
+            ("DELETE", "/2015-03-31/functions/demo/policy"),
+            ("GET", "/2015-03-31/functions/demo/policy?Qualifier=live"),
+            ("DELETE", "/2015-03-31/functions/demo/policy?Qualifier=live"),
+        ] {
+            let response =
+                router.handle_bytes(&json_request(method, path, ""));
+            let (status, headers, body) =
+                split_response(&response.to_http_bytes());
+
+            assert_eq!(status, "HTTP/1.1 404 Not Found");
+            assert_eq!(
+                header_value(&headers, "x-amzn-errortype"),
+                Some("ResourceNotFoundException")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body)
+                    .expect("unsupported policy route should be JSON"),
+                json!({
+                    "Type": "User",
+                    "message": "Lambda route not found.",
+                })
+            );
+        }
+    }
+
+    #[test]
     fn lambda_url_rest_json_function_url_control_plane_round_trip() {
         let router = router();
 
