@@ -15,7 +15,8 @@ use super::messages::{
     validate_wait_time_seconds,
 };
 use super::queues::{
-    CreateQueueInput, QueueRecord, SqsIdentifierSource, SqsService,
+    CreateQueueInput, QueueRecord, SqsIdentifierSource, SqsReceiveWaiter,
+    SqsService,
 };
 use super::redrive::{
     StartMessageMoveTaskInput, encode_move_task_handle,
@@ -89,6 +90,37 @@ impl ManualClock {
         Arc::new(move || {
             *now.lock().unwrap_or_else(|poison| poison.into_inner())
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TestWaiter {
+    clock: ManualClock,
+    waits: Arc<Mutex<Vec<Duration>>>,
+}
+
+impl TestWaiter {
+    fn new(clock: ManualClock) -> Self {
+        Self { clock, waits: Arc::new(Mutex::new(Vec::new())) }
+    }
+
+    fn total_wait(&self) -> Duration {
+        self.waits
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .copied()
+            .fold(Duration::ZERO, |total, wait| total + wait)
+    }
+}
+
+impl SqsReceiveWaiter for TestWaiter {
+    fn wait(&self, duration: Duration) {
+        self.waits
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(duration);
+        self.clock.advance(duration);
     }
 }
 
@@ -408,7 +440,10 @@ fn sqs_standard_receipt_handles_are_renewed_and_invalid_handles_fail_explicitly(
         )
         .expect("second receive should succeed");
 
-    assert_ne!(first[0].receipt_handle, second[0].receipt_handle);
+    let first_handle = first[0].receipt_handle.clone();
+    let second_handle = second[0].receipt_handle.clone();
+
+    assert_ne!(first_handle, second_handle);
 
     let invalid_delete = service
         .delete_message(&queue, "garbage")
@@ -419,20 +454,36 @@ fn sqs_standard_receipt_handles_are_renewed_and_invalid_handles_fail_explicitly(
             receipt_handle: "garbage".to_owned(),
         }
     );
+    let stale_delete = service
+        .delete_message(&queue, &first_handle)
+        .expect_err("stale handles should fail deletes");
+    assert_eq!(
+        stale_delete,
+        SqsError::ReceiptHandleIsInvalid {
+            receipt_handle: first_handle.clone(),
+        }
+    );
+    let stale_visibility = service
+        .change_message_visibility(&queue, &first_handle, 10)
+        .expect_err("stale handles should fail visibility updates");
+    assert_eq!(
+        stale_visibility,
+        SqsError::ReceiptHandleIsInvalid { receipt_handle: first_handle }
+    );
 
     service
-        .delete_message(&queue, "handle-2")
+        .delete_message(&queue, &second_handle)
         .expect("latest handle should delete");
     service
-        .delete_message(&queue, "handle-2")
+        .delete_message(&queue, &second_handle)
         .expect("repeated delete should be a no-op");
     let invalid_visibility = service
-        .change_message_visibility(&queue, "handle-2", 10)
+        .change_message_visibility(&queue, &second_handle, 10)
         .expect_err("deleted message handle should fail visibility change");
     assert_eq!(
         invalid_visibility,
         SqsError::InvalidReceiptHandleForVisibility {
-            receipt_handle: "handle-2".to_owned(),
+            receipt_handle: second_handle,
         }
     );
 }
@@ -778,6 +829,182 @@ fn sqs_fifo_batch_apis_report_partial_failures() {
 }
 
 #[test]
+fn sqs_standard_failed_automatic_redrive_keeps_source_message() {
+    let clock = ManualClock::new(UNIX_EPOCH + Duration::from_secs(2_400));
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(
+            &["msg-1"],
+            &["handle-1", "handle-2"],
+        )),
+    );
+    let scope = scope();
+    let dlq = service
+        .create_queue(&scope, queue_input("orders-dlq"))
+        .expect("dlq should be created");
+    let dlq_arn =
+        format!("arn:aws:sqs:eu-west-2:000000000000:{}", dlq.queue_name());
+    let source = service
+        .create_queue(
+            &scope,
+            CreateQueueInput {
+                attributes: BTreeMap::from([(
+                    "RedrivePolicy".to_owned(),
+                    format!(
+                        r#"{{"deadLetterTargetArn":"{dlq_arn}","maxReceiveCount":1}}"#
+                    ),
+                )]),
+                queue_name: "orders".to_owned(),
+            },
+        )
+        .expect("source queue should be created");
+
+    service
+        .send_message(&source, send_input("payload", None))
+        .expect("message should send");
+    assert_eq!(
+        service
+            .receive_message(
+                &source,
+                ReceiveMessageInput {
+                    max_number_of_messages: Some(1),
+                    visibility_timeout: Some(0),
+                    wait_time_seconds: Some(0),
+                },
+            )
+            .expect("first receive should succeed")
+            .len(),
+        1
+    );
+    service.delete_queue(&dlq).expect("deleting the DLQ should succeed");
+
+    let error = service
+        .receive_message(
+            &source,
+            ReceiveMessageInput {
+                max_number_of_messages: Some(1),
+                visibility_timeout: Some(0),
+                wait_time_seconds: Some(0),
+            },
+        )
+        .expect_err("redrive should fail when the target queue is missing");
+    assert_eq!(error, SqsError::QueueDoesNotExist);
+
+    let state =
+        service.state.lock().unwrap_or_else(|poison| poison.into_inner());
+    let source_queue =
+        state.queues.get(&source).expect("source queue should still exist");
+    let message = source_queue
+        .messages
+        .iter()
+        .find(|message| !message.deleted)
+        .expect("source message should be retained");
+    assert_eq!(message.body, "payload");
+    assert_eq!(message.receive_count, 1);
+}
+
+#[test]
+fn sqs_move_task_default_destination_failure_keeps_dlq_message() {
+    let clock = ManualClock::new(UNIX_EPOCH + Duration::from_secs(2_450));
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(
+            &["msg-1"],
+            &["handle-1", "handle-2"],
+        )),
+    );
+    let scope = scope();
+    let dlq = service
+        .create_queue(&scope, queue_input("orders-dlq"))
+        .expect("dlq should be created");
+    let dlq_arn: Arn =
+        format!("arn:aws:sqs:eu-west-2:000000000000:{}", dlq.queue_name())
+            .parse()
+            .expect("dlq arn should parse");
+    let source = service
+        .create_queue(
+            &scope,
+            CreateQueueInput {
+                attributes: BTreeMap::from([(
+                    "RedrivePolicy".to_owned(),
+                    format!(
+                        r#"{{"deadLetterTargetArn":"{dlq_arn}","maxReceiveCount":1}}"#
+                    ),
+                )]),
+                queue_name: "orders".to_owned(),
+            },
+        )
+        .expect("source queue should be created");
+    let _other_source = service
+        .create_queue(
+            &scope,
+            CreateQueueInput {
+                attributes: BTreeMap::from([(
+                    "RedrivePolicy".to_owned(),
+                    format!(
+                        r#"{{"deadLetterTargetArn":"{dlq_arn}","maxReceiveCount":1}}"#
+                    ),
+                )]),
+                queue_name: "orders-secondary".to_owned(),
+            },
+        )
+        .expect("second source queue should be created");
+
+    service
+        .send_message(&source, send_input("payload", None))
+        .expect("message should send");
+    assert_eq!(
+        service
+            .receive_message(
+                &source,
+                ReceiveMessageInput {
+                    max_number_of_messages: Some(1),
+                    visibility_timeout: Some(0),
+                    wait_time_seconds: Some(0),
+                },
+            )
+            .expect("first receive should succeed")
+            .len(),
+        1
+    );
+    assert!(
+        service
+            .receive_message(
+                &source,
+                ReceiveMessageInput {
+                    max_number_of_messages: Some(1),
+                    visibility_timeout: Some(0),
+                    wait_time_seconds: Some(0),
+                },
+            )
+            .expect("second receive should move to the dlq")
+            .is_empty()
+    );
+    service
+        .delete_queue(&source)
+        .expect("deleting the original source should succeed");
+
+    let error = service
+        .start_message_move_task(StartMessageMoveTaskInput {
+            destination_arn: None,
+            max_number_of_messages_per_second: None,
+            source_arn: dlq_arn,
+        })
+        .expect_err("default destination resolution should fail");
+    assert_eq!(error, SqsError::QueueDoesNotExist);
+
+    let state =
+        service.state.lock().unwrap_or_else(|poison| poison.into_inner());
+    let dlq_queue = state.queues.get(&dlq).expect("dlq should still exist");
+    let message = dlq_queue
+        .messages
+        .iter()
+        .find(|message| !message.deleted)
+        .expect("dlq message should be retained");
+    assert_eq!(message.body, "payload");
+}
+
+#[test]
 fn sqs_fifo_redrive_helpers_move_messages_from_dlq() {
     let clock = ManualClock::new(UNIX_EPOCH + Duration::from_secs(2_500));
     let service = SqsService::with_sources(
@@ -911,6 +1138,82 @@ fn sqs_fifo_redrive_helpers_move_messages_from_dlq() {
             message: "StartMessageMoveTask does not support MaxNumberOfMessagesPerSecond in this Cloudish subset.".to_owned(),
         }
     );
+}
+
+#[test]
+fn sqs_receive_message_uses_queue_default_wait_time_when_request_omits_it() {
+    let clock = ManualClock::new(UNIX_EPOCH + Duration::from_secs(3_000));
+    let waiter = Arc::new(TestWaiter::new(clock.clone()));
+    let service = SqsService::with_waiter_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(&["msg-1"], &["handle-1"])),
+        waiter.clone(),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(
+            &scope,
+            CreateQueueInput {
+                attributes: BTreeMap::from([(
+                    "ReceiveMessageWaitTimeSeconds".to_owned(),
+                    "2".to_owned(),
+                )]),
+                queue_name: "orders".to_owned(),
+            },
+        )
+        .expect("queue should be created");
+
+    let received = service
+        .receive_message(
+            &queue,
+            ReceiveMessageInput {
+                max_number_of_messages: Some(1),
+                visibility_timeout: None,
+                wait_time_seconds: None,
+            },
+        )
+        .expect("long poll should succeed");
+
+    assert!(received.is_empty());
+    assert_eq!(waiter.total_wait(), Duration::from_secs(2));
+}
+
+#[test]
+fn sqs_receive_message_request_wait_time_overrides_queue_default() {
+    let clock = ManualClock::new(UNIX_EPOCH + Duration::from_secs(3_100));
+    let waiter = Arc::new(TestWaiter::new(clock.clone()));
+    let service = SqsService::with_waiter_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(&["msg-1"], &["handle-1"])),
+        waiter.clone(),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(
+            &scope,
+            CreateQueueInput {
+                attributes: BTreeMap::from([(
+                    "ReceiveMessageWaitTimeSeconds".to_owned(),
+                    "5".to_owned(),
+                )]),
+                queue_name: "orders".to_owned(),
+            },
+        )
+        .expect("queue should be created");
+
+    let received = service
+        .receive_message(
+            &queue,
+            ReceiveMessageInput {
+                max_number_of_messages: Some(1),
+                visibility_timeout: None,
+                wait_time_seconds: Some(1),
+            },
+        )
+        .expect("long poll should succeed");
+
+    assert!(received.is_empty());
+    assert_eq!(waiter.total_wait(), Duration::from_secs(1));
 }
 
 fn queue_identities() -> (SqsQueueIdentity, SqsQueueIdentity) {

@@ -1,5 +1,5 @@
 use crate::errors::SqsError;
-use crate::messages::MessageRecord;
+use crate::messages::PendingQueueMove;
 use crate::queues::{QueueRecord, SqsService, SqsWorld};
 use crate::scope::SqsQueueIdentity;
 use aws::Arn;
@@ -125,22 +125,23 @@ impl SqsWorld {
             None
         };
 
-        let moved_messages = {
+        let staged_moves = {
             let queue = self
                 .queues
-                .get_mut(&source_identity)
+                .get(&source_identity)
                 .ok_or_else(|| SqsError::ResourceNotFound {
                     message: "The resource that you specified for the SourceArn parameter doesn't exist.".to_owned(),
                 })?;
-            queue.drain_messages_for_move_task()
-        };
-
-        for message in moved_messages {
+            queue.staged_messages_for_move_task()
+        }
+        .into_iter()
+        .map(|message| {
             let target_arn = destination_arn
                 .as_ref()
                 .cloned()
                 .or_else(|| {
                     message
+                        .message
                         .dead_letter_source_arn
                         .as_deref()
                         .and_then(|value| value.parse().ok())
@@ -148,66 +149,37 @@ impl SqsWorld {
                 .ok_or_else(|| SqsError::InvalidParameterValue {
                     message: "Messages in the dead-letter queue are missing their original source metadata.".to_owned(),
                 })?;
-            self.enqueue_moved_message(&target_arn, message)?;
-        }
+            self.stage_message_move(
+                &source_identity,
+                message.source_message_index,
+                &target_arn,
+                message.message,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+        self.commit_staged_message_moves(staged_moves)?;
 
         Ok(StartMessageMoveTaskOutput {
             task_handle: encode_move_task_handle(&input.source_arn),
         })
     }
-
-    pub(crate) fn enqueue_moved_message(
-        &mut self,
-        target_arn: &Arn,
-        mut message: MessageRecord,
-    ) -> Result<(), SqsError> {
-        let target_identity =
-            parse_queue_identity_from_arn(target_arn, "QueueArn")?;
-        let target_queue = self
-            .queues
-            .get_mut(&target_identity)
-            .ok_or(SqsError::QueueDoesNotExist)?;
-        message.deleted = false;
-        message.issued_receipt_handles.clear();
-        message.latest_receipt_handle = None;
-        message.receive_count = 0;
-        message.visible_at_millis = message.sent_timestamp_millis;
-        if target_queue.is_fifo() && message.message_group_id.is_none() {
-            return Err(SqsError::InvalidParameterValue {
-                message:
-                    "The moved FIFO message is missing its MessageGroupId."
-                        .to_owned(),
-            });
-        }
-        if target_queue.queue_arn() != target_arn.to_string() {
-            return Err(SqsError::QueueDoesNotExist);
-        }
-        if target_queue.is_fifo() && message.sequence_number.is_none() {
-            message.sequence_number =
-                Some(target_queue.next_sequence_number());
-        }
-        target_queue.messages.push_back(message);
-
-        Ok(())
-    }
 }
 
 impl QueueRecord {
-    pub(crate) fn drain_messages_for_move_task(
-        &mut self,
-    ) -> Vec<MessageRecord> {
-        let mut moved = Vec::new();
-
-        while let Some(mut message) = self.messages.pop_front() {
-            if message.deleted {
-                continue;
-            }
-            message.deleted = false;
-            moved.push(message);
-        }
-        self.deduplication_records.clear();
-
-        moved
+    pub(crate) fn staged_messages_for_move_task(
+        &self,
+    ) -> Vec<PendingQueueMove> {
+        self.messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| !message.deleted)
+            .map(|(index, message)| PendingQueueMove {
+                message: message.staged_for_queue_move(
+                    message.dead_letter_source_arn.clone(),
+                ),
+                source_message_index: index,
+            })
+            .collect()
     }
 
     pub(crate) fn redrive_policy_document(

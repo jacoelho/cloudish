@@ -1,6 +1,7 @@
 use crate::errors::SqsError;
 use crate::messages::{
-    MessageRecord, ReceiveOutcome, SendMessageInput, SendMessageOutput,
+    MessageRecord, PendingQueueMove, ReceiveOutcome, SendMessageInput,
+    SendMessageOutput,
 };
 use crate::queues::QueueRecord;
 use std::collections::BTreeSet;
@@ -158,9 +159,11 @@ impl QueueRecord {
                 if max_receive_count
                     .is_some_and(|limit| message.receive_count + 1 > limit)
                 {
-                    outcome.dead_letter_messages.push(
-                        message.take_for_queue_move(Some(queue_arn.clone())),
-                    );
+                    outcome.dead_letter_messages.push(PendingQueueMove {
+                        message: message
+                            .staged_for_queue_move(Some(queue_arn.clone())),
+                        source_message_index: index,
+                    });
                     continue;
                 }
 

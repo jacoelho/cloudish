@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MAX_NUMBER_OF_MESSAGES: u32 = 10;
 const MAX_RECEIVE_WAIT_TIME_SECONDS: u32 = 20;
 const MAX_BATCH_ENTRY_ID_LENGTH: usize = 80;
+const LONG_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendMessageInput {
@@ -110,7 +111,19 @@ pub struct ChangeMessageVisibilityBatchOutput {
 
 #[derive(Debug, Default)]
 pub(crate) struct ReceiveOutcome {
-    pub(crate) dead_letter_messages: Vec<MessageRecord>,
+    pub(crate) dead_letter_messages: Vec<PendingQueueMove>,
+    pub(crate) received: Vec<ReceivedMessage>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingQueueMove {
+    pub(crate) message: MessageRecord,
+    pub(crate) source_message_index: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReceiveAttempt {
+    pub(crate) effective_wait_time_seconds: u32,
     pub(crate) received: Vec<ReceivedMessage>,
 }
 
@@ -146,17 +159,59 @@ impl SqsService {
         queue: &SqsQueueIdentity,
         input: ReceiveMessageInput,
     ) -> Result<Vec<ReceivedMessage>, SqsError> {
-        let mut state =
-            self.state.lock().unwrap_or_else(|poison| poison.into_inner());
         let mut next_receipt_handle =
             || self.identifier_source.next_receipt_handle();
+        let now_millis = timestamp_millis((self.time_source)());
+        let first_attempt = {
+            let mut state =
+                self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+            state.receive_message(
+                queue,
+                input.clone(),
+                now_millis,
+                &mut next_receipt_handle,
+            )?
+        };
 
-        state.receive_message(
-            queue,
-            input,
-            timestamp_millis((self.time_source)()),
-            &mut next_receipt_handle,
-        )
+        if !first_attempt.received.is_empty()
+            || first_attempt.effective_wait_time_seconds == 0
+        {
+            return Ok(first_attempt.received);
+        }
+
+        let deadline_millis = now_millis.saturating_add(
+            u64::from(first_attempt.effective_wait_time_seconds)
+                .saturating_mul(1_000),
+        );
+        let mut current_millis = now_millis;
+
+        while current_millis < deadline_millis {
+            self.receive_waiter.wait(long_poll_wait_duration(
+                deadline_millis - current_millis,
+            ));
+            current_millis = timestamp_millis((self.time_source)());
+            if current_millis >= deadline_millis {
+                break;
+            }
+
+            let attempt = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                state.receive_message(
+                    queue,
+                    input.clone(),
+                    current_millis,
+                    &mut next_receipt_handle,
+                )?
+            };
+            if !attempt.received.is_empty() {
+                return Ok(attempt.received);
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     /// Sends multiple messages and returns per-entry successes and failures.
@@ -328,8 +383,13 @@ impl SqsWorld {
         input: ReceiveMessageInput,
         now_millis: u64,
         next_receipt_handle: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<ReceivedMessage>, SqsError> {
-        let (received, dead_letter_messages, dead_letter_target_arn) = {
+    ) -> Result<ReceiveAttempt, SqsError> {
+        let (
+            received,
+            dead_letter_messages,
+            wait_time_seconds,
+            dead_letter_target_arn,
+        ) = {
             let queue = self
                 .queues
                 .get_mut(queue)
@@ -365,6 +425,7 @@ impl SqsWorld {
             (
                 outcome.received,
                 outcome.dead_letter_messages,
+                wait_time_seconds,
                 queue
                     .redrive_policy_document()
                     .map(|policy| policy.dead_letter_target_arn),
@@ -374,12 +435,24 @@ impl SqsWorld {
         if let Some(target_arn) =
             dead_letter_target_arn.and_then(|value| value.parse().ok())
         {
-            for message in dead_letter_messages {
-                self.enqueue_moved_message(&target_arn, message)?;
-            }
+            let staged_moves = dead_letter_messages
+                .into_iter()
+                .map(|message| {
+                    self.stage_message_move(
+                        queue,
+                        message.source_message_index,
+                        &target_arn,
+                        message.message,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.commit_staged_message_moves(staged_moves)?;
         }
 
-        Ok(received)
+        Ok(ReceiveAttempt {
+            effective_wait_time_seconds: wait_time_seconds,
+            received,
+        })
     }
 
     pub(crate) fn delete_message(
@@ -390,7 +463,7 @@ impl SqsWorld {
         let queue =
             self.queues.get_mut(queue).ok_or(SqsError::QueueDoesNotExist)?;
         let Some(message) = queue.messages.iter_mut().find(|message| {
-            message.issued_receipt_handles.contains(receipt_handle)
+            message.latest_receipt_handle.as_deref() == Some(receipt_handle)
         }) else {
             return Err(SqsError::ReceiptHandleIsInvalid {
                 receipt_handle: receipt_handle.to_owned(),
@@ -438,7 +511,7 @@ impl SqsWorld {
         let queue =
             self.queues.get_mut(queue).ok_or(SqsError::QueueDoesNotExist)?;
         let Some(message) = queue.messages.iter_mut().find(|message| {
-            message.issued_receipt_handles.contains(receipt_handle)
+            message.latest_receipt_handle.as_deref() == Some(receipt_handle)
         }) else {
             return Err(SqsError::ReceiptHandleIsInvalid {
                 receipt_handle: receipt_handle.to_owned(),
@@ -558,7 +631,7 @@ impl QueueRecord {
             .redrive_policy_document()
             .map(|policy| policy.max_receive_count);
 
-        for message in &mut self.messages {
+        for (index, message) in self.messages.iter_mut().enumerate() {
             if outcome.received.len() == max_number_of_messages as usize {
                 break;
             }
@@ -569,9 +642,11 @@ impl QueueRecord {
             if max_receive_count
                 .is_some_and(|limit| message.receive_count + 1 > limit)
             {
-                outcome.dead_letter_messages.push(
-                    message.take_for_queue_move(Some(queue_arn.clone())),
-                );
+                outcome.dead_letter_messages.push(PendingQueueMove {
+                    message: message
+                        .staged_for_queue_move(Some(queue_arn.clone())),
+                    source_message_index: index,
+                });
                 continue;
             }
 
@@ -617,6 +692,7 @@ impl MessageRecord {
         self.receive_count += 1;
         self.visible_at_millis =
             now_millis + u64::from(visibility_timeout).saturating_mul(1_000);
+        self.issued_receipt_handles.clear();
         self.issued_receipt_handles.insert(receipt_handle.clone());
         self.latest_receipt_handle = Some(receipt_handle.clone());
 
@@ -639,12 +715,10 @@ impl MessageRecord {
         }
     }
 
-    pub(crate) fn take_for_queue_move(
-        &mut self,
+    pub(crate) fn staged_for_queue_move(
+        &self,
         dead_letter_source_arn: Option<String>,
     ) -> MessageRecord {
-        self.deleted = true;
-
         MessageRecord {
             body: self.body.clone(),
             dead_letter_source_arn,
@@ -661,6 +735,11 @@ impl MessageRecord {
             visible_at_millis: self.sent_timestamp_millis,
         }
     }
+}
+
+fn long_poll_wait_duration(remaining_millis: u64) -> Duration {
+    let remaining = Duration::from_millis(remaining_millis);
+    remaining.min(LONG_POLL_INTERVAL)
 }
 
 pub(crate) trait BatchEntry {

@@ -6,10 +6,11 @@ use crate::fifo::DeduplicationRecord;
 use crate::messages::{MessageRecord, timestamp_seconds};
 use crate::redrive::validate_redrive_policy_target;
 use crate::scope::{SqsQueueIdentity, SqsScope};
+use aws::Arn;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateQueueInput {
@@ -20,6 +21,19 @@ pub struct CreateQueueInput {
 pub trait SqsIdentifierSource: Send + Sync {
     fn next_message_id(&self) -> String;
     fn next_receipt_handle(&self) -> String;
+}
+
+pub(crate) trait SqsReceiveWaiter: Send + Sync {
+    fn wait(&self, duration: Duration);
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ThreadSleepSqsReceiveWaiter;
+
+impl SqsReceiveWaiter for ThreadSleepSqsReceiveWaiter {
+    fn wait(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -43,6 +57,7 @@ impl SqsIdentifierSource for SequentialSqsIdentifierSource {
 #[derive(Clone)]
 pub struct SqsService {
     pub(crate) identifier_source: Arc<dyn SqsIdentifierSource + Send + Sync>,
+    pub(crate) receive_waiter: Arc<dyn SqsReceiveWaiter + Send + Sync>,
     pub(crate) state: Arc<Mutex<SqsWorld>>,
     pub(crate) time_source: Arc<dyn Fn() -> SystemTime + Send + Sync>,
 }
@@ -55,9 +70,10 @@ impl Default for SqsService {
 
 impl SqsService {
     pub fn new() -> Self {
-        Self::with_sources(
+        Self::with_waiter_sources(
             Arc::new(SystemTime::now),
             Arc::new(SequentialSqsIdentifierSource::default()),
+            Arc::new(ThreadSleepSqsReceiveWaiter),
         )
     }
 
@@ -65,7 +81,24 @@ impl SqsService {
         time_source: Arc<dyn Fn() -> SystemTime + Send + Sync>,
         identifier_source: Arc<dyn SqsIdentifierSource + Send + Sync>,
     ) -> Self {
-        Self { identifier_source, state: Arc::default(), time_source }
+        Self::with_waiter_sources(
+            time_source,
+            identifier_source,
+            Arc::new(ThreadSleepSqsReceiveWaiter),
+        )
+    }
+
+    pub(crate) fn with_waiter_sources(
+        time_source: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+        identifier_source: Arc<dyn SqsIdentifierSource + Send + Sync>,
+        receive_waiter: Arc<dyn SqsReceiveWaiter + Send + Sync>,
+    ) -> Self {
+        Self {
+            identifier_source,
+            receive_waiter,
+            state: Arc::default(),
+            time_source,
+        }
     }
 
     /// Creates an SQS queue within the provided account and region scope.
@@ -135,6 +168,14 @@ impl SqsService {
 #[derive(Debug, Default)]
 pub(crate) struct SqsWorld {
     pub(crate) queues: BTreeMap<SqsQueueIdentity, QueueRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StagedMessageMove {
+    pub(crate) message: MessageRecord,
+    pub(crate) source_message_index: usize,
+    pub(crate) source_queue: SqsQueueIdentity,
+    pub(crate) target_queue: SqsQueueIdentity,
 }
 
 impl SqsWorld {
@@ -213,6 +254,84 @@ impl SqsWorld {
             })
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn stage_message_move(
+        &self,
+        source_queue: &SqsQueueIdentity,
+        source_message_index: usize,
+        target_arn: &Arn,
+        message: MessageRecord,
+    ) -> Result<StagedMessageMove, SqsError> {
+        let target_queue = crate::redrive::parse_queue_identity_from_arn(
+            target_arn, "QueueArn",
+        )?;
+
+        Ok(StagedMessageMove {
+            message,
+            source_message_index,
+            source_queue: source_queue.clone(),
+            target_queue,
+        })
+    }
+
+    pub(crate) fn commit_staged_message_moves(
+        &mut self,
+        staged_moves: Vec<StagedMessageMove>,
+    ) -> Result<(), SqsError> {
+        for staged in &staged_moves {
+            let _ = self
+                .queues
+                .get(&staged.source_queue)
+                .ok_or(SqsError::QueueDoesNotExist)?;
+            let target_queue = self
+                .queues
+                .get(&staged.target_queue)
+                .ok_or(SqsError::QueueDoesNotExist)?;
+            if target_queue.is_fifo()
+                && staged.message.message_group_id.is_none()
+            {
+                return Err(SqsError::InvalidParameterValue {
+                    message:
+                        "The moved FIFO message is missing its MessageGroupId."
+                            .to_owned(),
+                });
+            }
+        }
+
+        for staged in &staged_moves {
+            let source_queue = self
+                .queues
+                .get_mut(&staged.source_queue)
+                .ok_or(SqsError::QueueDoesNotExist)?;
+            let deduplication_id = {
+                let Some(source_message) =
+                    source_queue.messages.get_mut(staged.source_message_index)
+                else {
+                    return Err(SqsError::QueueDoesNotExist);
+                };
+                source_message.deleted = true;
+                source_message.deduplication_id.clone()
+            };
+            if let Some(deduplication_id) = deduplication_id.as_ref() {
+                source_queue.deduplication_records.remove(deduplication_id);
+            }
+        }
+
+        for staged in staged_moves {
+            let target_queue = self
+                .queues
+                .get_mut(&staged.target_queue)
+                .ok_or(SqsError::QueueDoesNotExist)?;
+            let mut message = staged.message;
+            if target_queue.is_fifo() && message.sequence_number.is_none() {
+                message.sequence_number =
+                    Some(target_queue.next_sequence_number());
+            }
+            target_queue.messages.push_back(message);
+        }
+
+        Ok(())
     }
 }
 

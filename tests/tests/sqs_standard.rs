@@ -16,6 +16,7 @@ use aws_sdk_sqs::error::ProvideErrorMetadata;
 use aws_sdk_sqs::types::QueueAttributeName;
 use runtime::SharedRuntimeLease;
 use sdk::SdkSmokeTarget;
+use std::time::Duration;
 
 static SHARED_RUNTIME: runtime::SharedRuntime =
     runtime::SharedRuntime::new("sqs_standard");
@@ -230,5 +231,76 @@ async fn sqs_standard_invalid_receipt_handle_surfaces_explicit_error() {
     assert!(
         error.message().is_some_and(|message| message.contains("garbage"))
     );
+    assert!(runtime.state_directory().exists());
+}
+
+#[tokio::test]
+async fn sqs_standard_stale_receipt_handles_fail_after_a_second_receive() {
+    let runtime = shared_runtime().await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let client = Client::new(&config);
+
+    let created = client
+        .create_queue()
+        .queue_name("orders")
+        .send()
+        .await
+        .expect("queue should be created");
+    let queue_url =
+        created.queue_url().expect("queue URL should be returned").to_owned();
+
+    client
+        .send_message()
+        .queue_url(&queue_url)
+        .message_body("payload")
+        .send()
+        .await
+        .expect("message should send");
+    let first = client
+        .receive_message()
+        .queue_url(&queue_url)
+        .visibility_timeout(1)
+        .wait_time_seconds(0)
+        .send()
+        .await
+        .expect("first receive should succeed");
+    let first_handle = first
+        .messages()
+        .first()
+        .and_then(|message| message.receipt_handle())
+        .expect("first receipt handle should exist")
+        .to_owned();
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let second = client
+        .receive_message()
+        .queue_url(&queue_url)
+        .visibility_timeout(1)
+        .wait_time_seconds(0)
+        .send()
+        .await
+        .expect("second receive should succeed");
+    let second_handle = second
+        .messages()
+        .first()
+        .and_then(|message| message.receipt_handle())
+        .expect("second receipt handle should exist")
+        .to_owned();
+    assert_ne!(first_handle, second_handle);
+
+    let error = client
+        .delete_message()
+        .queue_url(&queue_url)
+        .receipt_handle(first_handle)
+        .send()
+        .await
+        .expect_err("stale receipt handles should fail");
+
+    assert_eq!(error.code(), Some("ReceiptHandleIsInvalid"));
     assert!(runtime.state_directory().exists());
 }
