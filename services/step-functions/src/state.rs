@@ -444,138 +444,75 @@ impl StepFunctionsService {
         input: Value,
     ) {
         let outcome = self.execute_definition(scope, key, definition, input);
+        let Some(terminal_update) = self.terminal_execution_update(outcome)
+        else {
+            return;
+        };
+
+        let should_append = match self.with_execution_mut(key, |execution| {
+            if execution.status != ExecutionStatus::Running {
+                return Ok(false);
+            }
+            terminal_update.apply(execution);
+            Ok(true)
+        }) {
+            Ok(updated) => updated,
+            Err(_) => return,
+        };
+
+        if should_append {
+            let _ = self.append_history_event(key, terminal_update.event);
+        }
+    }
+
+    fn terminal_execution_update(
+        &self,
+        outcome: Result<ExecutionOutcome, StepFunctionsError>,
+    ) -> Option<TerminalExecutionUpdate> {
         match outcome {
             Ok(ExecutionOutcome::Succeeded(output)) => {
                 let stop_date = match self.now_epoch_seconds() {
-                    Ok(timestamp) => timestamp,
-                    Err(_) => return,
+                    Ok(stop_date) => stop_date,
+                    Err(error) => {
+                        return Some(
+                            TerminalExecutionUpdate::runtime_failure(
+                                0,
+                                error.to_string(),
+                            ),
+                        );
+                    }
                 };
-                let output_string = match canonical_json(&output) {
-                    Ok(output_string) => output_string,
-                    Err(_) => return,
-                };
-                if self
-                    .with_execution_mut(key, |execution| {
-                        if execution.status != ExecutionStatus::Running {
-                            return Ok(());
-                        }
-                        execution.output = Some(output_string.clone());
-                        execution.status = ExecutionStatus::Succeeded;
-                        execution.stop_date = Some(stop_date);
-
-                        Ok(())
-                    })
-                    .is_err()
-                {
-                    return;
+                match canonical_json(&output) {
+                    Ok(output) => Some(TerminalExecutionUpdate::succeeded(
+                        stop_date, output,
+                    )),
+                    Err(error) => {
+                        Some(TerminalExecutionUpdate::runtime_failure(
+                            stop_date,
+                            error.to_string(),
+                        ))
+                    }
                 }
-                let _ = self.append_history_event(
-                    key,
-                    HistoryEvent {
-                        execution_aborted_event_details: None,
-                        execution_failed_event_details: None,
-                        execution_started_event_details: None,
-                        execution_succeeded_event_details: Some(
-                            ExecutionSucceededEventDetails {
-                                output: output_string,
-                            },
-                        ),
-                        id: 0,
-                        previous_event_id: None,
-                        state_entered_event_details: None,
-                        state_exited_event_details: None,
-                        task_failed_event_details: None,
-                        task_scheduled_event_details: None,
-                        task_succeeded_event_details: None,
-                        timestamp: stop_date,
-                        event_type: "ExecutionSucceeded".to_owned(),
-                    },
-                );
             }
             Ok(ExecutionOutcome::Failed { error, cause }) => {
                 let stop_date = match self.now_epoch_seconds() {
-                    Ok(timestamp) => timestamp,
-                    Err(_) => return,
-                };
-                if self
-                    .with_execution_mut(key, |execution| {
-                        if execution.status != ExecutionStatus::Running {
-                            return Ok(());
-                        }
-                        execution.error = Some(error.clone());
-                        execution.cause = Some(cause.clone());
-                        execution.status = ExecutionStatus::Failed;
-                        execution.stop_date = Some(stop_date);
-
-                        Ok(())
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                let _ = self.append_history_event(
-                    key,
-                    HistoryEvent {
-                        execution_aborted_event_details: None,
-                        execution_failed_event_details: Some(
-                            ExecutionFailedEventDetails { cause, error },
-                        ),
-                        execution_started_event_details: None,
-                        execution_succeeded_event_details: None,
-                        id: 0,
-                        previous_event_id: None,
-                        state_entered_event_details: None,
-                        state_exited_event_details: None,
-                        task_failed_event_details: None,
-                        task_scheduled_event_details: None,
-                        task_succeeded_event_details: None,
-                        timestamp: stop_date,
-                        event_type: "ExecutionFailed".to_owned(),
-                    },
-                );
-            }
-            Ok(ExecutionOutcome::Aborted) => {}
-            Err(error) => {
-                let stop_date = match self.now_epoch_seconds() {
-                    Ok(timestamp) => timestamp,
-                    Err(_) => return,
-                };
-                let cause = error.to_string();
-                let _ = self.with_execution_mut(key, |execution| {
-                    if execution.status != ExecutionStatus::Running {
-                        return Ok(());
+                    Ok(stop_date) => stop_date,
+                    Err(error) => {
+                        return Some(
+                            TerminalExecutionUpdate::runtime_failure(
+                                0,
+                                error.to_string(),
+                            ),
+                        );
                     }
-                    execution.error = Some("States.Runtime".to_owned());
-                    execution.cause = Some(cause.clone());
-                    execution.status = ExecutionStatus::Failed;
-                    execution.stop_date = Some(stop_date);
-
-                    Ok(())
-                });
-                let _ = self.append_history_event(
-                    key,
-                    HistoryEvent {
-                        execution_aborted_event_details: None,
-                        execution_failed_event_details: Some(
-                            ExecutionFailedEventDetails {
-                                cause,
-                                error: "States.Runtime".to_owned(),
-                            },
-                        ),
-                        execution_started_event_details: None,
-                        execution_succeeded_event_details: None,
-                        id: 0,
-                        previous_event_id: None,
-                        state_entered_event_details: None,
-                        state_exited_event_details: None,
-                        task_failed_event_details: None,
-                        task_scheduled_event_details: None,
-                        task_succeeded_event_details: None,
-                        timestamp: stop_date,
-                        event_type: "ExecutionFailed".to_owned(),
-                    },
-                );
+                };
+                Some(TerminalExecutionUpdate::failed(stop_date, error, cause))
             }
+            Ok(ExecutionOutcome::Aborted) => None,
+            Err(error) => Some(TerminalExecutionUpdate::runtime_failure(
+                self.now_epoch_seconds().unwrap_or(0),
+                error.to_string(),
+            )),
         }
     }
 
@@ -1245,6 +1182,84 @@ enum ExecutionOutcome {
     Succeeded(Value),
     Failed { error: String, cause: String },
     Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TerminalExecutionUpdate {
+    cause: Option<String>,
+    error: Option<String>,
+    event: HistoryEvent,
+    output: Option<String>,
+    status: ExecutionStatus,
+    stop_date: u64,
+}
+
+impl TerminalExecutionUpdate {
+    fn succeeded(stop_date: u64, output: String) -> Self {
+        Self {
+            cause: None,
+            error: None,
+            event: HistoryEvent {
+                execution_aborted_event_details: None,
+                execution_failed_event_details: None,
+                execution_started_event_details: None,
+                execution_succeeded_event_details: Some(
+                    ExecutionSucceededEventDetails { output: output.clone() },
+                ),
+                id: 0,
+                previous_event_id: None,
+                state_entered_event_details: None,
+                state_exited_event_details: None,
+                task_failed_event_details: None,
+                task_scheduled_event_details: None,
+                task_succeeded_event_details: None,
+                timestamp: stop_date,
+                event_type: "ExecutionSucceeded".to_owned(),
+            },
+            output: Some(output),
+            status: ExecutionStatus::Succeeded,
+            stop_date,
+        }
+    }
+
+    fn failed(stop_date: u64, error: String, cause: String) -> Self {
+        Self {
+            cause: Some(cause.clone()),
+            error: Some(error.clone()),
+            event: HistoryEvent {
+                execution_aborted_event_details: None,
+                execution_failed_event_details: Some(
+                    ExecutionFailedEventDetails { cause, error },
+                ),
+                execution_started_event_details: None,
+                execution_succeeded_event_details: None,
+                id: 0,
+                previous_event_id: None,
+                state_entered_event_details: None,
+                state_exited_event_details: None,
+                task_failed_event_details: None,
+                task_scheduled_event_details: None,
+                task_succeeded_event_details: None,
+                timestamp: stop_date,
+                event_type: "ExecutionFailed".to_owned(),
+            },
+            output: None,
+            status: ExecutionStatus::Failed,
+            stop_date,
+        }
+    }
+
+    fn runtime_failure(stop_date: u64, cause: String) -> Self {
+        Self::failed(stop_date, "States.Runtime".to_owned(), cause)
+    }
+
+    fn apply(&self, execution: &mut StoredExecution) {
+        execution.output = self.output.clone();
+        execution.error = self.error.clone();
+        execution.cause = self.cause.clone();
+        execution.status = self.status;
+        execution.stop_date = Some(self.stop_date);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2734,6 +2749,28 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SequenceClock {
+        times: Mutex<Vec<SystemTime>>,
+    }
+
+    impl SequenceClock {
+        fn new(times: Vec<SystemTime>) -> Self {
+            Self { times: Mutex::new(times) }
+        }
+    }
+
+    impl Clock for SequenceClock {
+        fn now(&self) -> SystemTime {
+            let mut times = recover(self.times.lock());
+            if times.len() <= 1 {
+                return *times.first().unwrap_or(&UNIX_EPOCH);
+            }
+
+            times.remove(0)
+        }
+    }
+
     impl StepFunctionsExecutionSpawner for InlineSpawner {
         fn spawn(
             &self,
@@ -3237,6 +3274,95 @@ mod tests {
         assert_eq!(described.status, ExecutionStatus::Failed);
         assert_eq!(described.error.as_deref(), Some("Lambda.Unknown"));
         assert_eq!(described.cause.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn step_functions_terminalization_converts_pre_unix_clock_to_states_runtime()
+     {
+        let service = StepFunctionsService::new(
+            &StorageFactory::new(StorageConfig::new(
+                std::env::temp_dir()
+                    .join("cloudish-step-functions-terminal-runtime"),
+                StorageMode::Memory,
+            )),
+            StepFunctionsServiceDependencies {
+                clock: Arc::new(SequenceClock::new(vec![
+                    UNIX_EPOCH + Duration::from_secs(10),
+                    UNIX_EPOCH + Duration::from_secs(11),
+                    UNIX_EPOCH + Duration::from_secs(12),
+                    UNIX_EPOCH + Duration::from_secs(13),
+                    UNIX_EPOCH - Duration::from_secs(1),
+                ])),
+                execution_spawner: Arc::new(InlineSpawner),
+                sleeper: Arc::new(RecordingSleeper::default()),
+                task_adapter: Arc::new(StaticTaskAdapter::default()),
+            },
+        );
+        let definition = json!({
+            "StartAt": "Done",
+            "States": {
+                "Done": {
+                    "Type": "Succeed"
+                }
+            }
+        })
+        .to_string();
+
+        let created = service
+            .create_state_machine(
+                &scope(),
+                CreateStateMachineInput {
+                    definition,
+                    name: "runtime-fail".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/demo".to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("state machine should create");
+        let started = service
+            .start_execution(
+                &scope(),
+                StartExecutionInput {
+                    input: None,
+                    name: Some("run-runtime".to_owned()),
+                    state_machine_arn: created.state_machine_arn,
+                    trace_header: None,
+                },
+            )
+            .expect("execution should start");
+        let described = service
+            .describe_execution(
+                &scope(),
+                DescribeExecutionInput {
+                    execution_arn: started.execution_arn.clone(),
+                },
+            )
+            .expect("execution should describe");
+        let history = service
+            .get_execution_history(
+                &scope(),
+                GetExecutionHistoryInput {
+                    execution_arn: started.execution_arn,
+                    include_execution_data: Some(true),
+                    max_results: None,
+                    next_token: None,
+                    reverse_order: Some(false),
+                },
+            )
+            .expect("history should load");
+
+        assert_eq!(described.status, ExecutionStatus::Failed);
+        assert_eq!(described.error.as_deref(), Some("States.Runtime"));
+        assert!(
+            described
+                .cause
+                .as_deref()
+                .is_some_and(|cause| cause.contains("later than self"))
+        );
+        assert_eq!(
+            history.events.last().map(|event| event.event_type.as_str()),
+            Some("ExecutionFailed")
+        );
     }
 
     #[test]
