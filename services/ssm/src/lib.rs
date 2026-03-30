@@ -162,7 +162,11 @@ impl SsmService {
             match self.get_parameter(scope, SsmGetParameterInput { reference })
             {
                 Ok(parameter) => parameters.push(parameter),
-                Err(_) => invalid_parameters.push(name),
+                Err(SsmError::ParameterNotFound)
+                | Err(SsmError::ParameterVersionNotFound) => {
+                    invalid_parameters.push(name);
+                }
+                Err(error) => return Err(error),
             }
         }
 
@@ -483,6 +487,7 @@ fn parse_parameter_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -676,6 +681,45 @@ mod tests {
         assert_eq!(
             output.invalid_parameters,
             vec!["/a:99".to_owned(), "/missing".to_owned()]
+        );
+    }
+
+    #[test]
+    fn ssm_get_parameters_returns_internal_failures_for_corrupted_state() {
+        let service = service_with_max_history(
+            "services-ssm-get-parameters-corrupt",
+            5,
+            Arc::new(SequenceClock::new(vec![])),
+        );
+        let scope = scope("eu-west-2");
+        let name = parameter_name("/broken");
+
+        service
+            .parameter_store
+            .put(
+                storage_key(&scope, &name),
+                StoredParameter {
+                    history: Vec::new(),
+                    name: name.clone(),
+                    tags: BTreeMap::new(),
+                },
+            )
+            .expect("corrupted state should write");
+
+        let error = service
+            .get_parameters(
+                &scope,
+                SsmGetParametersInput { names: vec![name.to_string()] },
+            )
+            .expect_err("corrupted state should fail");
+
+        assert_eq!(
+            error,
+            SsmError::InternalFailure {
+                message:
+                    "SSM parameter state is corrupted: missing latest version."
+                        .to_owned(),
+            }
         );
     }
 
