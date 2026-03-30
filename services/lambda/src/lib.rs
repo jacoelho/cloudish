@@ -7,6 +7,8 @@ pub mod event_source_mappings;
 pub mod functions;
 pub mod invocation;
 pub mod permissions;
+#[doc(hidden)]
+pub mod request_runtime;
 pub mod scope;
 mod state;
 pub mod urls;

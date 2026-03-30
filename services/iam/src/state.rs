@@ -19,7 +19,11 @@ use aws::{
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::SystemTime;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 const DEFAULT_PATH: &str = "/";
 const MAX_ACCESS_KEYS_PER_USER: usize = 2;
@@ -28,18 +32,24 @@ const MAX_POLICY_VERSIONS: usize = 5;
 const MAX_SESSION_DURATION: u32 = 43_200;
 const MAX_TAGS: usize = 50;
 const MIN_SESSION_DURATION: u32 = 3_600;
-const REQUEST_DATE_PREFIX: &str = "2026-03-24";
 const USER_NAME_MAX: usize = 64;
 const ENTITY_NAME_MAX: usize = 128;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct IamService {
     state: Arc<Mutex<IamWorld>>,
+    time_source: Arc<dyn Fn() -> SystemTime + Send + Sync>,
 }
 
 impl IamService {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_time_source(Arc::new(SystemTime::now))
+    }
+
+    pub fn with_time_source(
+        time_source: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    ) -> Self {
+        Self { state: Arc::new(Mutex::new(IamWorld::new())), time_source }
     }
 
     /// Performs the requested IAM operation for the provided scoped state.
@@ -148,7 +158,11 @@ impl IamService {
             self.state.lock().unwrap_or_else(|poison| poison.into_inner());
         let (access_key_id, secret_access_key) =
             guard.next_access_key_material();
-        let state = guard.scopes.entry(scope_key(scope)).or_default();
+        let time_source = Arc::clone(&self.time_source);
+        let state = guard
+            .scopes
+            .entry(scope_key(scope))
+            .or_insert_with(move || ScopedIamState::new(time_source));
         state.create_access_key(
             access_key_id,
             secret_access_key,
@@ -1066,7 +1080,8 @@ impl IamService {
         let guard =
             self.state.lock().unwrap_or_else(|poison| poison.into_inner());
         let key = scope_key(scope);
-        action(guard.scopes.get(&key).unwrap_or(&EMPTY_SCOPE))
+        let empty = ScopedIamState::default();
+        action(guard.scopes.get(&key).unwrap_or(&empty))
     }
 
     fn with_scope_mut<T>(
@@ -1076,8 +1091,18 @@ impl IamService {
     ) -> T {
         let mut guard =
             self.state.lock().unwrap_or_else(|poison| poison.into_inner());
-        let state = guard.scopes.entry(scope_key(scope)).or_default();
+        let time_source = Arc::clone(&self.time_source);
+        let state = guard
+            .scopes
+            .entry(scope_key(scope))
+            .or_insert_with(move || ScopedIamState::new(time_source));
         action(state)
+    }
+}
+
+impl Default for IamService {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1149,7 +1174,6 @@ impl IamInstanceProfileLookup for IamService {
     }
 }
 
-#[derive(Debug)]
 struct IamWorld {
     next_access_key_sequence: u64,
     scopes: BTreeMap<ScopeKey, ScopedIamState>,
@@ -1182,17 +1206,14 @@ fn scope_key(scope: &IamScope) -> ScopeKey {
     ScopeKey { account_id: scope.account_id().clone() }
 }
 
-static EMPTY_SCOPE: ScopedIamState = ScopedIamState::new_const();
-
-#[derive(Debug)]
 struct ScopedIamState {
     access_keys: BTreeMap<String, StoredAccessKey>,
-    event_counter: u64,
     next_identifier: u64,
     groups: BTreeMap<String, StoredGroup>,
     instance_profiles: BTreeMap<String, StoredInstanceProfile>,
     policies: BTreeMap<String, StoredPolicy>,
     roles: BTreeMap<String, StoredRole>,
+    time_source: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     users: BTreeMap<String, StoredUser>,
 }
 
@@ -1200,27 +1221,27 @@ impl Default for ScopedIamState {
     fn default() -> Self {
         Self {
             access_keys: BTreeMap::new(),
-            event_counter: 0,
             next_identifier: 1,
             groups: BTreeMap::new(),
             instance_profiles: BTreeMap::new(),
             policies: BTreeMap::new(),
             roles: BTreeMap::new(),
+            time_source: Arc::new(SystemTime::now),
             users: BTreeMap::new(),
         }
     }
 }
 
 impl ScopedIamState {
-    const fn new_const() -> Self {
+    fn new(time_source: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Self {
         Self {
             access_keys: BTreeMap::new(),
-            event_counter: 0,
             next_identifier: 1,
             groups: BTreeMap::new(),
             instance_profiles: BTreeMap::new(),
             policies: BTreeMap::new(),
             roles: BTreeMap::new(),
+            time_source,
             users: BTreeMap::new(),
         }
     }
@@ -2399,15 +2420,15 @@ impl ScopedIamState {
     }
 
     fn next_timestamp(&mut self) -> String {
-        let value = self.event_counter;
-        self.event_counter += 1;
-        let hours = value / 3_600;
-        let minutes = (value / 60) % 60;
-        let seconds = value % 60;
-        format!(
-            "{REQUEST_DATE_PREFIX}T{:02}:{minutes:02}:{seconds:02}Z",
-            hours % 24
-        )
+        OffsetDateTime::from((self.time_source)())
+            .replace_nanosecond(0)
+            .unwrap_or_else(|_| OffsetDateTime::UNIX_EPOCH)
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| {
+                OffsetDateTime::UNIX_EPOCH
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+            })
     }
 
     fn next_identifier(&mut self, prefix: &str) -> String {
@@ -2755,6 +2776,8 @@ mod tests {
         AccountId, IamAccessKeyLookup, IamAccessKeyStatus,
         IamInstanceProfileLookup, RegionId,
     };
+    use std::sync::Arc;
+    use std::time::UNIX_EPOCH;
 
     fn scope() -> IamScope {
         scope_in_region("eu-west-2")
@@ -2773,6 +2796,55 @@ mod tests {
 
     fn managed_policy_document() -> String {
         r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#.to_owned()
+    }
+
+    #[test]
+    fn iam_create_dates_follow_the_injected_time_source() {
+        let service = IamService::with_time_source(Arc::new(|| {
+            UNIX_EPOCH + std::time::Duration::from_secs(60)
+        }));
+        let scope = scope();
+
+        let user = service
+            .create_user(
+                &scope,
+                CreateUserInput {
+                    path: "/".to_owned(),
+                    tags: Vec::new(),
+                    user_name: "alice".to_owned(),
+                },
+            )
+            .expect("user should be created");
+        let group = service
+            .create_group(
+                &scope,
+                CreateGroupInput {
+                    group_name: "team".to_owned(),
+                    path: "/".to_owned(),
+                },
+            )
+            .expect("group should be created");
+        let role = service
+            .create_role(
+                &scope,
+                CreateRoleInput {
+                    assume_role_policy_document: trust_policy(),
+                    description: "role".to_owned(),
+                    max_session_duration: 3_600,
+                    path: "/".to_owned(),
+                    role_name: "demo-role".to_owned(),
+                    tags: Vec::new(),
+                },
+            )
+            .expect("role should be created");
+        let access_key = service
+            .create_access_key(&scope, "alice")
+            .expect("access key should be created");
+
+        assert_eq!(user.create_date, "1970-01-01T00:01:00Z");
+        assert_eq!(group.create_date, "1970-01-01T00:01:00Z");
+        assert_eq!(role.create_date, "1970-01-01T00:01:00Z");
+        assert_eq!(access_key.create_date, "1970-01-01T00:01:00Z");
     }
 
     #[test]

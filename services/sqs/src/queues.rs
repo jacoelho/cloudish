@@ -23,16 +23,70 @@ pub trait SqsIdentifierSource: Send + Sync {
     fn next_receipt_handle(&self) -> String;
 }
 
+pub(crate) trait SqsReceiveCancellation: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqsReceiveWaitOutcome {
+    Cancelled,
+    Completed,
+}
+
 pub(crate) trait SqsReceiveWaiter: Send + Sync {
-    fn wait(&self, duration: Duration);
+    fn wait(
+        &self,
+        duration: Duration,
+        cancellation: &dyn SqsReceiveCancellation,
+    ) -> SqsReceiveWaitOutcome;
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct ThreadSleepSqsReceiveWaiter;
 
+const RECEIVE_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 impl SqsReceiveWaiter for ThreadSleepSqsReceiveWaiter {
-    fn wait(&self, duration: Duration) {
-        std::thread::sleep(duration);
+    fn wait(
+        &self,
+        duration: Duration,
+        cancellation: &dyn SqsReceiveCancellation,
+    ) -> SqsReceiveWaitOutcome {
+        let mut remaining = duration;
+        while !remaining.is_zero() {
+            if cancellation.is_cancelled() {
+                return SqsReceiveWaitOutcome::Cancelled;
+            }
+
+            let wait_for = remaining.min(RECEIVE_CANCELLATION_POLL_INTERVAL);
+            std::thread::sleep(wait_for);
+            remaining = remaining.saturating_sub(wait_for);
+        }
+
+        if cancellation.is_cancelled() {
+            SqsReceiveWaitOutcome::Cancelled
+        } else {
+            SqsReceiveWaitOutcome::Completed
+        }
+    }
+}
+
+pub(crate) struct CallbackSqsReceiveCancellation<'a, F: ?Sized> {
+    is_cancelled: &'a F,
+}
+
+impl<'a, F: ?Sized> CallbackSqsReceiveCancellation<'a, F> {
+    pub(crate) fn new(is_cancelled: &'a F) -> Self {
+        Self { is_cancelled }
+    }
+}
+
+impl<F> SqsReceiveCancellation for CallbackSqsReceiveCancellation<'_, F>
+where
+    F: Fn() -> bool + Send + Sync + ?Sized,
+{
+    fn is_cancelled(&self) -> bool {
+        (self.is_cancelled)()
     }
 }
 

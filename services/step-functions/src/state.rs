@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::tasks::StepFunctionsSpawnHandle;
 use crate::{
     choice_eval::{ChoiceRule, evaluate_choice_rules, parse_choice_rule},
     definitions::{
@@ -34,7 +36,7 @@ use aws::{
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use std::time::{Duration, UNIX_EPOCH};
 use storage::{StorageFactory, StorageHandle};
@@ -42,12 +44,29 @@ use storage::{StorageFactory, StorageHandle};
 const STEP_FUNCTIONS_SERVICE: &str = "step-functions";
 const DEFAULT_INPUT: &str = "{}";
 
+#[derive(Debug)]
+struct StepFunctionsMutationState {
+    instance_ids_seeded: bool,
+    next_state_machine_instance_id: u64,
+    pending_executions: BTreeSet<ExecutionStorageKey>,
+}
+
+impl Default for StepFunctionsMutationState {
+    fn default() -> Self {
+        Self {
+            instance_ids_seeded: false,
+            next_state_machine_instance_id: 1,
+            pending_executions: BTreeSet::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StepFunctionsService {
     clock: Arc<dyn Clock>,
     execution_spawner: Arc<dyn StepFunctionsExecutionSpawner>,
     sleeper: Arc<dyn StepFunctionsSleeper>,
-    state_lock: Arc<Mutex<()>>,
+    mutation_state: Arc<Mutex<StepFunctionsMutationState>>,
     state_machine_store:
         StorageHandle<StateMachineStorageKey, StoredStateMachine>,
     task_adapter: Arc<dyn StepFunctionsTaskAdapter>,
@@ -63,7 +82,9 @@ impl StepFunctionsService {
             clock: dependencies.clock,
             execution_spawner: dependencies.execution_spawner,
             sleeper: dependencies.sleeper,
-            state_lock: Arc::new(Mutex::new(())),
+            mutation_state: Arc::new(Mutex::new(
+                StepFunctionsMutationState::default(),
+            )),
             state_machine_store: factory
                 .create(STEP_FUNCTIONS_SERVICE, "state-machines"),
             task_adapter: dependencies.task_adapter,
@@ -92,7 +113,7 @@ impl StepFunctionsService {
         parse_state_machine_definition(&input.definition)?;
 
         let key = StateMachineStorageKey::new(scope, &input.name);
-        let _guard = self.lock_state();
+        let mut state = self.lock_state();
         if self.state_machine_store.get(&key).is_some() {
             return Err(StepFunctionsError::StateMachineAlreadyExists {
                 message: format!(
@@ -102,8 +123,11 @@ impl StepFunctionsService {
             });
         }
 
+        self.seed_state_machine_instance_ids(&mut state);
         let creation_date = self.now_epoch_seconds()?;
         let state_machine_arn = state_machine_arn(scope, &input.name);
+        let state_machine_instance_id = state.next_state_machine_instance_id;
+        state.next_state_machine_instance_id += 1;
         self.state_machine_store.put(
             key,
             StoredStateMachine {
@@ -111,6 +135,7 @@ impl StepFunctionsService {
                 definition: input.definition,
                 name: input.name,
                 role_arn: input.role_arn,
+                state_machine_instance_id,
                 state_machine_arn: state_machine_arn.clone(),
                 state_machine_type,
             },
@@ -180,7 +205,8 @@ impl StepFunctionsService {
         state_machine_arn: &str,
     ) -> Result<(), StepFunctionsError> {
         let key = parse_state_machine_arn(scope, state_machine_arn)?;
-        let _guard = self.lock_state();
+        let mut state = self.lock_state();
+        self.seed_state_machine_instance_ids(&mut state);
         if self.state_machine_store.get(&key).is_none() {
             return Err(StepFunctionsError::StateMachineDoesNotExist {
                 message: format!(
@@ -208,87 +234,88 @@ impl StepFunctionsService {
             parse_state_machine_definition(state_machine.definition.as_str())?;
         let input_value = parse_execution_input(input.input.as_deref())?;
         let input_string = canonical_json(&input_value)?;
-        let execution_name = match input.name {
+        let requested_name = match input.name {
             Some(name) => {
                 validate_name(&name, "Execution name")?;
-                name
+                Some(name)
             }
-            None => self.next_execution_name(scope, &state_machine.name),
+            None => None,
         };
-        let key = ExecutionStorageKey::new(
-            scope,
-            &state_machine.name,
-            &execution_name,
-        );
-        let execution_arn =
-            execution_arn(scope, &state_machine.name, &execution_name);
-        let start_date = self.now_epoch_seconds()?;
-        let execution = StoredExecution {
-            cause: None,
-            error: None,
-            execution_arn: execution_arn.clone(),
-            history: Vec::new(),
-            input: input_string.clone(),
-            name: execution_name.clone(),
-            output: None,
-            start_date,
-            state_machine_arn: state_machine.state_machine_arn.clone(),
-            status: ExecutionStatus::Running,
-            stop_date: None,
-        };
-
-        {
-            let _guard = self.lock_state();
-            if self.execution_store.get(&key).is_some() {
-                return Err(StepFunctionsError::ExecutionAlreadyExists {
-                    message: format!(
-                        "Execution Already Exists: {execution_arn}"
-                    ),
-                });
-            }
-            self.execution_store.put(key.clone(), execution)?;
-        }
-
-        self.append_history_event(
-            &key,
-            HistoryEvent {
-                execution_aborted_event_details: None,
-                execution_failed_event_details: None,
-                execution_started_event_details: Some(
-                    ExecutionStartedEventDetails {
-                        input: input_string,
-                        role_arn: state_machine.role_arn,
-                    },
+        let state_machine_key =
+            StateMachineStorageKey::new(scope, &state_machine.name);
+        let reserved = {
+            let mut state = self.lock_state();
+            let execution_name = match requested_name.as_deref() {
+                Some(name) => name.to_owned(),
+                None => self.next_execution_name(
+                    scope,
+                    &state_machine.name,
+                    &state.pending_executions,
                 ),
-                execution_succeeded_event_details: None,
-                id: 0,
-                previous_event_id: None,
-                state_entered_event_details: None,
-                state_exited_event_details: None,
-                task_failed_event_details: None,
-                task_scheduled_event_details: None,
-                task_succeeded_event_details: None,
-                timestamp: start_date,
-                event_type: "ExecutionStarted".to_owned(),
-            },
-        )?;
+            };
+            let key = ExecutionStorageKey::new(
+                scope,
+                &state_machine.name,
+                &execution_name,
+            );
+            let execution_arn =
+                execution_arn(scope, &state_machine.name, &execution_name);
+            self.ensure_execution_name_available(
+                &state,
+                &key,
+                &execution_arn,
+            )?;
+            let start_date = self.now_epoch_seconds()?;
+            state.pending_executions.insert(key.clone());
+
+            StartExecutionReservation {
+                execution_arn,
+                execution_name,
+                key,
+                state_machine_arn: input.state_machine_arn.clone(),
+                state_machine_instance_id: state_machine
+                    .state_machine_instance_id,
+                state_machine_key,
+                start_date,
+            }
+        };
 
         let runner = self.clone();
-        let task_name = format!("step-functions-{execution_name}");
+        let task_name = format!("step-functions-{}", reserved.execution_name);
         let state_machine_scope = scope.clone();
-        self.execution_spawner.spawn(
+        let execution_key = reserved.key.clone();
+        let spawned = match self.execution_spawner.spawn_paused(
             &task_name,
             Box::new(move || {
                 runner.run_execution(
                     &state_machine_scope,
-                    &key,
+                    &execution_key,
                     &definition,
                     input_value,
                 );
             }),
-        )?;
+        ) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                self.release_pending_execution(&reserved.key);
+                return Err(StepFunctionsError::from(error));
+            }
+        };
 
-        Ok(StartExecutionOutput { execution_arn, start_date })
+        if let Err(error) =
+            self.store_started_execution(&reserved, &input_string)
+        {
+            self.release_pending_execution(&reserved.key);
+            drop(spawned);
+            return Err(error);
+        }
+
+        spawned.start();
+
+        Ok(StartExecutionOutput {
+            execution_arn: reserved.execution_arn,
+            start_date: reserved.start_date,
+        })
     }
 
     /// # Errors
@@ -1007,20 +1034,137 @@ impl StepFunctionsService {
         &self,
         scope: &StepFunctionsScope,
         state_machine_name: &str,
+        pending_executions: &BTreeSet<ExecutionStorageKey>,
     ) -> String {
         let account_id = scope.account_id().to_owned();
         let region = scope.region().to_owned();
-        let state_machine_name = state_machine_name.to_owned();
+        let scan_state_machine_name = state_machine_name.to_owned();
         let count = self
             .execution_store
             .scan(&move |key| {
                 key.account_id == account_id
                     && key.region == region
-                    && key.state_machine_name == state_machine_name
+                    && key.state_machine_name == scan_state_machine_name
             })
             .len();
 
-        format!("execution-{}", count + 1)
+        let mut suffix = count + 1;
+        loop {
+            let name = format!("execution-{suffix}");
+            let key =
+                ExecutionStorageKey::new(scope, &state_machine_name, &name);
+            if self.execution_store.get(&key).is_none()
+                && !pending_executions.contains(&key)
+            {
+                return name;
+            }
+            suffix += 1;
+        }
+    }
+
+    fn ensure_execution_name_available(
+        &self,
+        state: &StepFunctionsMutationState,
+        key: &ExecutionStorageKey,
+        execution_arn: &str,
+    ) -> Result<(), StepFunctionsError> {
+        if self.execution_store.get(key).is_none()
+            && !state.pending_executions.contains(key)
+        {
+            return Ok(());
+        }
+
+        Err(StepFunctionsError::ExecutionAlreadyExists {
+            message: format!("Execution Already Exists: {execution_arn}"),
+        })
+    }
+
+    fn release_pending_execution(&self, key: &ExecutionStorageKey) {
+        let mut state = self.lock_state();
+        state.pending_executions.remove(key);
+    }
+
+    fn seed_state_machine_instance_ids(
+        &self,
+        state: &mut StepFunctionsMutationState,
+    ) {
+        if state.instance_ids_seeded {
+            return;
+        }
+        state.next_state_machine_instance_id = self
+            .state_machine_store
+            .scan(&|_| true)
+            .into_iter()
+            .map(|state_machine| state_machine.state_machine_instance_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        state.instance_ids_seeded = true;
+    }
+
+    fn store_started_execution(
+        &self,
+        reservation: &StartExecutionReservation,
+        input: &str,
+    ) -> Result<(), StepFunctionsError> {
+        let mut state = self.lock_state();
+        let state_machine = self
+            .state_machine_store
+            .get(&reservation.state_machine_key)
+            .ok_or_else(|| StepFunctionsError::StateMachineDoesNotExist {
+                message: format!(
+                    "State Machine Does Not Exist: `{}`",
+                    reservation.state_machine_arn
+                ),
+            })?;
+        if state_machine.state_machine_instance_id
+            != reservation.state_machine_instance_id
+        {
+            return Err(StepFunctionsError::StateMachineDoesNotExist {
+                message: format!(
+                    "State Machine Does Not Exist: `{}`",
+                    reservation.state_machine_arn
+                ),
+            });
+        }
+        self.execution_store.put(
+            reservation.key.clone(),
+            StoredExecution {
+                cause: None,
+                error: None,
+                execution_arn: reservation.execution_arn.clone(),
+                history: vec![HistoryEvent {
+                    execution_aborted_event_details: None,
+                    execution_failed_event_details: None,
+                    execution_started_event_details: Some(
+                        ExecutionStartedEventDetails {
+                            input: input.to_owned(),
+                            role_arn: state_machine.role_arn.clone(),
+                        },
+                    ),
+                    execution_succeeded_event_details: None,
+                    id: 1,
+                    previous_event_id: None,
+                    state_entered_event_details: None,
+                    state_exited_event_details: None,
+                    task_failed_event_details: None,
+                    task_scheduled_event_details: None,
+                    task_succeeded_event_details: None,
+                    timestamp: reservation.start_date,
+                    event_type: "ExecutionStarted".to_owned(),
+                }],
+                input: input.to_owned(),
+                name: reservation.execution_name.clone(),
+                output: None,
+                start_date: reservation.start_date,
+                state_machine_arn: state_machine.state_machine_arn.clone(),
+                status: ExecutionStatus::Running,
+                stop_date: None,
+            },
+        )?;
+        state.pending_executions.remove(&reservation.key);
+
+        Ok(())
     }
 
     fn lookup_state_machine(
@@ -1093,9 +1237,20 @@ impl StepFunctionsService {
             })
     }
 
-    fn lock_state(&self) -> MutexGuard<'_, ()> {
-        recover(self.state_lock.lock())
+    fn lock_state(&self) -> MutexGuard<'_, StepFunctionsMutationState> {
+        recover(self.mutation_state.lock())
     }
+}
+
+#[derive(Debug, Clone)]
+struct StartExecutionReservation {
+    execution_arn: String,
+    execution_name: String,
+    key: ExecutionStorageKey,
+    state_machine_arn: String,
+    state_machine_instance_id: u64,
+    state_machine_key: StateMachineStorageKey,
+    start_date: u64,
 }
 
 #[derive(
@@ -1158,6 +1313,10 @@ struct StoredStateMachine {
     definition: String,
     name: String,
     role_arn: String,
+    // `0` is reserved for persisted snapshots written before instance IDs
+    // existed. Fresh state machines always receive IDs starting at `1`.
+    #[serde(default)]
+    state_machine_instance_id: u64,
     state_machine_arn: String,
     state_machine_type: StateMachineType,
 }
@@ -2726,7 +2885,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::SystemTime;
     use storage::{StorageConfig, StorageFactory, StorageMode};
@@ -2772,13 +2931,13 @@ mod tests {
     }
 
     impl StepFunctionsExecutionSpawner for InlineSpawner {
-        fn spawn(
+        fn spawn_paused(
             &self,
             _task_name: &str,
             task: Box<dyn FnOnce() + Send>,
-        ) -> Result<(), InfrastructureError> {
-            task();
-            Ok(())
+        ) -> Result<Box<dyn StepFunctionsSpawnHandle>, InfrastructureError>
+        {
+            Ok(Box::new(InlineSpawnHandle { task: Some(task) }))
         }
     }
 
@@ -2786,15 +2945,24 @@ mod tests {
     struct ThreadSpawner;
 
     impl StepFunctionsExecutionSpawner for ThreadSpawner {
-        fn spawn(
+        fn spawn_paused(
             &self,
             task_name: &str,
             task: Box<dyn FnOnce() + Send>,
-        ) -> Result<(), InfrastructureError> {
+        ) -> Result<Box<dyn StepFunctionsSpawnHandle>, InfrastructureError>
+        {
+            let (start_tx, start_rx) = mpsc::channel();
             thread::Builder::new()
                 .name(task_name.to_owned())
-                .spawn(task)
-                .map(|_| ())
+                .spawn(move || {
+                    if matches!(start_rx.recv(), Ok(true)) {
+                        task();
+                    }
+                })
+                .map(|_| {
+                    Box::new(ThreadSpawnHandle { start_tx: Some(start_tx) })
+                        as Box<dyn StepFunctionsSpawnHandle>
+                })
                 .map_err(|source| {
                     InfrastructureError::scheduler(
                         "spawn",
@@ -2802,6 +2970,98 @@ mod tests {
                         source,
                     )
                 })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingSpawner;
+
+    impl StepFunctionsExecutionSpawner for FailingSpawner {
+        fn spawn_paused(
+            &self,
+            task_name: &str,
+            _task: Box<dyn FnOnce() + Send>,
+        ) -> Result<Box<dyn StepFunctionsSpawnHandle>, InfrastructureError>
+        {
+            Err(InfrastructureError::scheduler(
+                "spawn",
+                task_name.to_owned(),
+                std::io::Error::other("spawner failed"),
+            ))
+        }
+    }
+
+    struct PausingSpawner {
+        entered_tx: Mutex<Option<mpsc::Sender<()>>>,
+        release_rx: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl PausingSpawner {
+        fn new() -> (Arc<Self>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+
+            (
+                Arc::new(Self {
+                    entered_tx: Mutex::new(Some(entered_tx)),
+                    release_rx: Mutex::new(release_rx),
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    impl StepFunctionsExecutionSpawner for PausingSpawner {
+        fn spawn_paused(
+            &self,
+            _task_name: &str,
+            task: Box<dyn FnOnce() + Send>,
+        ) -> Result<Box<dyn StepFunctionsSpawnHandle>, InfrastructureError>
+        {
+            if let Some(entered_tx) = recover(self.entered_tx.lock()).take() {
+                entered_tx
+                    .send(())
+                    .expect("test should wait for the blocked spawn");
+                recover(self.release_rx.lock())
+                    .recv()
+                    .expect("test should release the blocked spawn");
+            }
+
+            Ok(Box::new(InlineSpawnHandle { task: Some(task) }))
+        }
+    }
+
+    #[derive(Default)]
+    struct InlineSpawnHandle {
+        task: Option<Box<dyn FnOnce() + Send>>,
+    }
+
+    impl StepFunctionsSpawnHandle for InlineSpawnHandle {
+        fn start(mut self: Box<Self>) {
+            if let Some(task) = self.task.take() {
+                task();
+            }
+        }
+    }
+
+    struct ThreadSpawnHandle {
+        start_tx: Option<mpsc::Sender<bool>>,
+    }
+
+    impl StepFunctionsSpawnHandle for ThreadSpawnHandle {
+        fn start(mut self: Box<Self>) {
+            if let Some(start_tx) = self.start_tx.take() {
+                let _ = start_tx.send(true);
+            }
+        }
+    }
+
+    impl Drop for ThreadSpawnHandle {
+        fn drop(&mut self) {
+            if let Some(start_tx) = self.start_tx.take() {
+                let _ = start_tx.send(false);
+            }
         }
     }
 
@@ -3362,6 +3622,868 @@ mod tests {
         assert_eq!(
             history.events.last().map(|event| event.event_type.as_str()),
             Some("ExecutionFailed")
+        );
+    }
+
+    #[test]
+    fn step_functions_pending_start_stays_invisible_until_spawner_accepts() {
+        let (spawner, entered_rx, release_tx) = PausingSpawner::new();
+        let service = StepFunctionsService::new(
+            &StorageFactory::new(StorageConfig::new(
+                std::env::temp_dir()
+                    .join("cloudish-step-functions-pending-start"),
+                StorageMode::Memory,
+            )),
+            StepFunctionsServiceDependencies {
+                clock: Arc::new(FixedClock::new(
+                    UNIX_EPOCH + Duration::from_secs(20),
+                )),
+                execution_spawner: spawner,
+                sleeper: Arc::new(RecordingSleeper::default()),
+                task_adapter: Arc::new(StaticTaskAdapter::default()),
+            },
+        );
+        let definition = json!({
+            "StartAt": "Done",
+            "States": {
+                "Done": {
+                    "Type": "Succeed"
+                }
+            }
+        })
+        .to_string();
+
+        let created = service
+            .create_state_machine(
+                &scope(),
+                CreateStateMachineInput {
+                    definition,
+                    name: "pending-start".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/demo".to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("state machine should create");
+        let pending_execution_arn =
+            "arn:aws:states:eu-west-2:000000000000:execution:pending-start:run-1"
+                .to_owned();
+        let thread_service = service.clone();
+        let state_machine_arn = created.state_machine_arn.clone();
+        let start_handle = thread::spawn(move || {
+            thread_service.start_execution(
+                &scope(),
+                StartExecutionInput {
+                    input: None,
+                    name: Some("run-1".to_owned()),
+                    state_machine_arn,
+                    trace_header: None,
+                },
+            )
+        });
+
+        entered_rx
+            .recv()
+            .expect("test should observe the paused spawn attempt");
+
+        assert!(matches!(
+            service.describe_execution(
+                &scope(),
+                DescribeExecutionInput {
+                    execution_arn: pending_execution_arn.clone(),
+                },
+            ),
+            Err(StepFunctionsError::ExecutionDoesNotExist { .. })
+        ));
+        assert_eq!(
+            service
+                .list_executions(
+                    &scope(),
+                    ListExecutionsInput {
+                        max_results: None,
+                        next_token: None,
+                        state_machine_arn: created.state_machine_arn.clone(),
+                        status_filter: None,
+                    },
+                )
+                .expect("pending execution should stay out of lists"),
+            ListExecutionsOutput { executions: Vec::new() }
+        );
+        assert!(matches!(
+            service.start_execution(
+                &scope(),
+                StartExecutionInput {
+                    input: None,
+                    name: Some("run-1".to_owned()),
+                    state_machine_arn: created.state_machine_arn.clone(),
+                    trace_header: None,
+                },
+            ),
+            Err(StepFunctionsError::ExecutionAlreadyExists { .. })
+        ));
+
+        release_tx.send(()).expect("test should release the paused spawn");
+        let started = start_handle
+            .join()
+            .expect("start thread should finish cleanly")
+            .expect("execution should start after release");
+        let described = service
+            .describe_execution(
+                &scope(),
+                DescribeExecutionInput {
+                    execution_arn: started.execution_arn.clone(),
+                },
+            )
+            .expect("accepted execution should become visible");
+
+        assert_eq!(started.execution_arn, pending_execution_arn);
+        assert_eq!(described.name, "run-1");
+    }
+
+    #[test]
+    fn step_functions_delete_state_machine_wins_over_pending_start_commit() {
+        let (spawner, entered_rx, release_tx) = PausingSpawner::new();
+        let service = StepFunctionsService::new(
+            &StorageFactory::new(StorageConfig::new(
+                std::env::temp_dir()
+                    .join("cloudish-step-functions-delete-pending-start"),
+                StorageMode::Memory,
+            )),
+            StepFunctionsServiceDependencies {
+                clock: Arc::new(FixedClock::new(
+                    UNIX_EPOCH + Duration::from_secs(20),
+                )),
+                execution_spawner: spawner,
+                sleeper: Arc::new(RecordingSleeper::default()),
+                task_adapter: Arc::new(StaticTaskAdapter::default()),
+            },
+        );
+        let definition = json!({
+            "StartAt": "Done",
+            "States": {
+                "Done": {
+                    "Type": "Succeed"
+                }
+            }
+        })
+        .to_string();
+
+        let created = service
+            .create_state_machine(
+                &scope(),
+                CreateStateMachineInput {
+                    definition,
+                    name: "delete-pending-start".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/demo".to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("state machine should create");
+        let execution_arn =
+            "arn:aws:states:eu-west-2:000000000000:execution:delete-pending-start:run-1"
+                .to_owned();
+        let thread_service = service.clone();
+        let state_machine_arn = created.state_machine_arn.clone();
+        let start_handle = thread::spawn(move || {
+            thread_service.start_execution(
+                &scope(),
+                StartExecutionInput {
+                    input: None,
+                    name: Some("run-1".to_owned()),
+                    state_machine_arn,
+                    trace_header: None,
+                },
+            )
+        });
+
+        entered_rx
+            .recv()
+            .expect("test should observe the paused spawn attempt");
+        service
+            .delete_state_machine(&scope(), &created.state_machine_arn)
+            .expect("delete should win while start is still pending");
+        release_tx.send(()).expect("test should release the paused spawn");
+
+        let error = start_handle
+            .join()
+            .expect("start thread should finish cleanly")
+            .expect_err(
+                "start should fail after the state machine is deleted",
+            );
+
+        assert!(matches!(
+            error,
+            StepFunctionsError::StateMachineDoesNotExist { .. }
+        ));
+        assert!(matches!(
+            service.describe_execution(
+                &scope(),
+                DescribeExecutionInput { execution_arn },
+            ),
+            Err(StepFunctionsError::ExecutionDoesNotExist { .. })
+        ));
+    }
+
+    #[test]
+    fn step_functions_recreated_state_machine_rejects_pending_start_from_old_instance()
+     {
+        let (spawner, entered_rx, release_tx) = PausingSpawner::new();
+        let service = StepFunctionsService::new(
+            &StorageFactory::new(StorageConfig::new(
+                std::env::temp_dir()
+                    .join("cloudish-step-functions-recreate-pending-start"),
+                StorageMode::Memory,
+            )),
+            StepFunctionsServiceDependencies {
+                clock: Arc::new(FixedClock::new(
+                    UNIX_EPOCH + Duration::from_secs(20),
+                )),
+                execution_spawner: spawner,
+                sleeper: Arc::new(RecordingSleeper::default()),
+                task_adapter: Arc::new(StaticTaskAdapter::default()),
+            },
+        );
+        let original_definition = json!({
+            "StartAt": "Done",
+            "States": {
+                "Done": {
+                    "Type": "Succeed"
+                }
+            }
+        })
+        .to_string();
+        let recreated_definition = json!({
+            "StartAt": "Done",
+            "States": {
+                "Done": {
+                    "Type": "Pass",
+                    "Result": {
+                        "replacement": true
+                    },
+                    "End": true
+                }
+            }
+        })
+        .to_string();
+
+        let created = service
+            .create_state_machine(
+                &scope(),
+                CreateStateMachineInput {
+                    definition: original_definition,
+                    name: "recreate-pending-start".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/demo".to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("state machine should create");
+        let execution_arn =
+            "arn:aws:states:eu-west-2:000000000000:execution:recreate-pending-start:run-1"
+                .to_owned();
+        let thread_service = service.clone();
+        let state_machine_arn = created.state_machine_arn.clone();
+        let start_handle = thread::spawn(move || {
+            thread_service.start_execution(
+                &scope(),
+                StartExecutionInput {
+                    input: None,
+                    name: Some("run-1".to_owned()),
+                    state_machine_arn,
+                    trace_header: None,
+                },
+            )
+        });
+
+        entered_rx
+            .recv()
+            .expect("test should observe the paused spawn attempt");
+        service
+            .delete_state_machine(&scope(), &created.state_machine_arn)
+            .expect("delete should win while start is still pending");
+        let recreated = service
+            .create_state_machine(
+                &scope(),
+                CreateStateMachineInput {
+                    definition: recreated_definition,
+                    name: "recreate-pending-start".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/recreated"
+                        .to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("replacement state machine should create");
+        release_tx.send(()).expect("test should release the paused spawn");
+
+        let error = start_handle
+            .join()
+            .expect("start thread should finish cleanly")
+            .expect_err(
+                "pending start should fail after delete and recreate with the same name",
+            );
+
+        assert_eq!(created.state_machine_arn, recreated.state_machine_arn);
+        assert!(matches!(
+            error,
+            StepFunctionsError::StateMachineDoesNotExist { .. }
+        ));
+        assert!(matches!(
+            service.describe_execution(
+                &scope(),
+                DescribeExecutionInput {
+                    execution_arn: execution_arn.clone(),
+                },
+            ),
+            Err(StepFunctionsError::ExecutionDoesNotExist { .. })
+        ));
+
+        let started = service
+            .start_execution(
+                &scope(),
+                StartExecutionInput {
+                    input: None,
+                    name: Some("run-2".to_owned()),
+                    state_machine_arn: recreated.state_machine_arn,
+                    trace_header: None,
+                },
+            )
+            .expect("replacement state machine should accept new starts");
+        let described = service
+            .describe_execution(
+                &scope(),
+                DescribeExecutionInput {
+                    execution_arn: started.execution_arn,
+                },
+            )
+            .expect("replacement execution should describe");
+
+        assert_eq!(described.status, ExecutionStatus::Succeeded);
+        assert_eq!(
+            described.output,
+            Some(json!({ "replacement": true }).to_string())
+        );
+    }
+
+    #[test]
+    fn step_functions_recreated_persisted_state_machine_rejects_pending_start_from_old_instance_after_restart()
+     {
+        let storage_root = std::env::temp_dir().join(format!(
+            "cloudish-step-functions-recreate-persisted-start-{}",
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&storage_root);
+        let step_functions_scope = scope();
+        let original_definition = json!({
+            "StartAt": "Done",
+            "States": {
+                "Done": {
+                    "Type": "Succeed"
+                }
+            }
+        })
+        .to_string();
+        let recreated_definition = json!({
+            "StartAt": "Done",
+            "States": {
+                "Done": {
+                    "Type": "Pass",
+                    "Result": {
+                        "replacement": true
+                    },
+                    "End": true
+                }
+            }
+        })
+        .to_string();
+        let initial_factory = StorageFactory::new(StorageConfig::new(
+            &storage_root,
+            StorageMode::Persistent,
+        ));
+        let initial_service = StepFunctionsService::new(
+            &initial_factory,
+            StepFunctionsServiceDependencies {
+                clock: Arc::new(FixedClock::new(
+                    UNIX_EPOCH + Duration::from_secs(20),
+                )),
+                execution_spawner: Arc::new(InlineSpawner),
+                sleeper: Arc::new(RecordingSleeper::default()),
+                task_adapter: Arc::new(StaticTaskAdapter::default()),
+            },
+        );
+
+        let created = initial_service
+            .create_state_machine(
+                &step_functions_scope,
+                CreateStateMachineInput {
+                    definition: original_definition,
+                    name: "recreate-persisted-start".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/demo".to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("persisted state machine should create");
+        initial_factory
+            .shutdown_all()
+            .expect("initial state machine should flush to disk");
+
+        let reloaded_factory = StorageFactory::new(StorageConfig::new(
+            &storage_root,
+            StorageMode::Persistent,
+        ));
+        let (spawner, entered_rx, release_tx) = PausingSpawner::new();
+        let service = StepFunctionsService::new(
+            &reloaded_factory,
+            StepFunctionsServiceDependencies {
+                clock: Arc::new(FixedClock::new(
+                    UNIX_EPOCH + Duration::from_secs(20),
+                )),
+                execution_spawner: spawner,
+                sleeper: Arc::new(RecordingSleeper::default()),
+                task_adapter: Arc::new(StaticTaskAdapter::default()),
+            },
+        );
+        reloaded_factory
+            .load_all()
+            .expect("persisted state machine should reload");
+
+        let execution_arn =
+            "arn:aws:states:eu-west-2:000000000000:execution:recreate-persisted-start:run-1"
+                .to_owned();
+        let thread_service = service.clone();
+        let thread_scope = step_functions_scope.clone();
+        let state_machine_arn = created.state_machine_arn.clone();
+        let start_handle = thread::spawn(move || {
+            thread_service.start_execution(
+                &thread_scope,
+                StartExecutionInput {
+                    input: None,
+                    name: Some("run-1".to_owned()),
+                    state_machine_arn,
+                    trace_header: None,
+                },
+            )
+        });
+
+        entered_rx
+            .recv()
+            .expect("test should observe the paused spawn attempt");
+        service
+            .delete_state_machine(
+                &step_functions_scope,
+                &created.state_machine_arn,
+            )
+            .expect("delete should win while start is still pending");
+        let recreated = service
+            .create_state_machine(
+                &step_functions_scope,
+                CreateStateMachineInput {
+                    definition: recreated_definition,
+                    name: "recreate-persisted-start".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/recreated"
+                        .to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("replacement persisted state machine should create");
+        release_tx.send(()).expect("test should release the paused spawn");
+
+        let error = start_handle
+            .join()
+            .expect("start thread should finish cleanly")
+            .expect_err(
+                "pending start should fail after delete and recreate across restart",
+            );
+
+        assert_eq!(created.state_machine_arn, recreated.state_machine_arn);
+        assert!(matches!(
+            error,
+            StepFunctionsError::StateMachineDoesNotExist { .. }
+        ));
+        assert!(matches!(
+            service.describe_execution(
+                &step_functions_scope,
+                DescribeExecutionInput {
+                    execution_arn: execution_arn.clone(),
+                },
+            ),
+            Err(StepFunctionsError::ExecutionDoesNotExist { .. })
+        ));
+
+        let started = service
+            .start_execution(
+                &step_functions_scope,
+                StartExecutionInput {
+                    input: None,
+                    name: Some("run-2".to_owned()),
+                    state_machine_arn: recreated.state_machine_arn,
+                    trace_header: None,
+                },
+            )
+            .expect(
+                "replacement persisted state machine should accept new starts",
+            );
+        let described = service
+            .describe_execution(
+                &step_functions_scope,
+                DescribeExecutionInput {
+                    execution_arn: started.execution_arn,
+                },
+            )
+            .expect("replacement persisted execution should describe");
+
+        assert_eq!(described.status, ExecutionStatus::Succeeded);
+        assert_eq!(
+            described.output,
+            Some(json!({ "replacement": true }).to_string())
+        );
+
+        reloaded_factory
+            .shutdown_all()
+            .expect("reloaded state machine should flush cleanly");
+        let _ = std::fs::remove_dir_all(&storage_root);
+    }
+
+    #[test]
+    fn step_functions_loads_legacy_persisted_state_machine_without_instance_id()
+     {
+        let storage_root = std::env::temp_dir().join(format!(
+            "cloudish-step-functions-legacy-state-machine-{}",
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&storage_root);
+        let factory = StorageFactory::new(StorageConfig::new(
+            &storage_root,
+            StorageMode::Persistent,
+        ));
+        let scope = scope();
+        let definition = json!({
+            "StartAt": "Done",
+            "States": {
+                "Done": {
+                    "Type": "Succeed"
+                }
+            }
+        })
+        .to_string();
+        let state_machine_arn = state_machine_arn(&scope, "legacy");
+        let snapshot_path = factory.persistent_snapshot_path(
+            STEP_FUNCTIONS_SERVICE,
+            "state-machines",
+        );
+        std::fs::create_dir_all(
+            snapshot_path
+                .parent()
+                .expect("persistent snapshot path should have a parent"),
+        )
+        .expect("snapshot directory should be creatable");
+        std::fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&json!([
+                {
+                    "key": {
+                        "account_id": scope.account_id(),
+                        "region": scope.region(),
+                        "name": "legacy",
+                    },
+                    "value": {
+                        "creation_date": 10,
+                        "definition": definition,
+                        "name": "legacy",
+                        "role_arn": "arn:aws:iam::000000000000:role/demo",
+                        "state_machine_arn": state_machine_arn.clone(),
+                        "state_machine_type": "STANDARD",
+                    }
+                }
+            ]))
+            .expect("legacy snapshot should serialize"),
+        )
+        .expect("legacy snapshot should write");
+        let service = StepFunctionsService::new(
+            &factory,
+            StepFunctionsServiceDependencies {
+                clock: Arc::new(FixedClock::new(
+                    UNIX_EPOCH + Duration::from_secs(10),
+                )),
+                execution_spawner: Arc::new(InlineSpawner),
+                sleeper: Arc::new(RecordingSleeper::default()),
+                task_adapter: Arc::new(StaticTaskAdapter::default()),
+            },
+        );
+
+        factory.load_all().expect("legacy snapshot should load");
+
+        assert_eq!(
+            service
+                .describe_state_machine(&scope, &state_machine_arn)
+                .expect("legacy state machine should describe"),
+            DescribeStateMachineOutput {
+                creation_date: 10,
+                definition: json!({
+                    "StartAt": "Done",
+                    "States": {
+                        "Done": {
+                            "Type": "Succeed"
+                        }
+                    }
+                })
+                .to_string(),
+                name: "legacy".to_owned(),
+                role_arn: "arn:aws:iam::000000000000:role/demo".to_owned(),
+                status: StateMachineStatus::Active,
+                state_machine_arn: state_machine_arn.clone(),
+                state_machine_type: StateMachineType::Standard,
+            }
+        );
+
+        let started = service
+            .start_execution(
+                &scope,
+                StartExecutionInput {
+                    input: None,
+                    name: Some("legacy-run".to_owned()),
+                    state_machine_arn: state_machine_arn.clone(),
+                    trace_header: None,
+                },
+            )
+            .expect("legacy state machine should still execute");
+        let described = service
+            .describe_execution(
+                &scope,
+                DescribeExecutionInput {
+                    execution_arn: started.execution_arn,
+                },
+            )
+            .expect("execution should describe");
+
+        assert_eq!(described.status, ExecutionStatus::Succeeded);
+        let _ = std::fs::remove_dir_all(&storage_root);
+    }
+
+    #[test]
+    fn step_functions_reloaded_state_machine_uses_next_persisted_instance_id()
+    {
+        let storage_root = std::env::temp_dir().join(format!(
+            "cloudish-step-functions-instance-id-reload-{}",
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&storage_root);
+        let scope = scope();
+        let key = StateMachineStorageKey::new(&scope, "persisted");
+        let initial_factory = StorageFactory::new(StorageConfig::new(
+            &storage_root,
+            StorageMode::Persistent,
+        ));
+        let initial_service = StepFunctionsService::new(
+            &initial_factory,
+            StepFunctionsServiceDependencies {
+                clock: Arc::new(FixedClock::new(
+                    UNIX_EPOCH + Duration::from_secs(10),
+                )),
+                execution_spawner: Arc::new(InlineSpawner),
+                sleeper: Arc::new(RecordingSleeper::default()),
+                task_adapter: Arc::new(StaticTaskAdapter::default()),
+            },
+        );
+        let created = initial_service
+            .create_state_machine(
+                &scope,
+                CreateStateMachineInput {
+                    definition: json!({
+                        "StartAt": "Done",
+                        "States": {
+                            "Done": {
+                                "Type": "Succeed"
+                            }
+                        }
+                    })
+                    .to_string(),
+                    name: "persisted".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/demo".to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("initial state machine should create");
+        assert_eq!(
+            initial_service
+                .state_machine_store
+                .get(&key)
+                .expect("state machine should persist")
+                .state_machine_instance_id,
+            1
+        );
+        initial_factory.shutdown_all().expect("initial state should flush");
+
+        let reloaded_factory = StorageFactory::new(StorageConfig::new(
+            &storage_root,
+            StorageMode::Persistent,
+        ));
+        let reloaded_service = StepFunctionsService::new(
+            &reloaded_factory,
+            StepFunctionsServiceDependencies {
+                clock: Arc::new(FixedClock::new(
+                    UNIX_EPOCH + Duration::from_secs(20),
+                )),
+                execution_spawner: Arc::new(InlineSpawner),
+                sleeper: Arc::new(RecordingSleeper::default()),
+                task_adapter: Arc::new(StaticTaskAdapter::default()),
+            },
+        );
+        reloaded_factory.load_all().expect("reloaded state should load");
+
+        reloaded_service
+            .delete_state_machine(&scope, &created.state_machine_arn)
+            .expect("persisted state machine should delete");
+        reloaded_service
+            .create_state_machine(
+                &scope,
+                CreateStateMachineInput {
+                    definition: json!({
+                        "StartAt": "Done",
+                        "States": {
+                            "Done": {
+                                "Type": "Succeed"
+                            }
+                        }
+                    })
+                    .to_string(),
+                    name: "persisted".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/reloaded"
+                        .to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("replacement state machine should create");
+
+        assert_eq!(
+            reloaded_service
+                .state_machine_store
+                .get(&key)
+                .expect("replacement state machine should persist")
+                .state_machine_instance_id,
+            2
+        );
+
+        reloaded_factory.shutdown_all().expect("reloaded state should flush");
+        let _ = std::fs::remove_dir_all(&storage_root);
+    }
+
+    #[test]
+    fn step_functions_start_execution_removes_state_when_spawner_fails() {
+        let service = StepFunctionsService::new(
+            &StorageFactory::new(StorageConfig::new(
+                std::env::temp_dir()
+                    .join("cloudish-step-functions-spawn-failure"),
+                StorageMode::Memory,
+            )),
+            StepFunctionsServiceDependencies {
+                clock: Arc::new(FixedClock::new(
+                    UNIX_EPOCH + Duration::from_secs(20),
+                )),
+                execution_spawner: Arc::new(FailingSpawner),
+                sleeper: Arc::new(RecordingSleeper::default()),
+                task_adapter: Arc::new(StaticTaskAdapter::default()),
+            },
+        );
+        let definition = json!({
+            "StartAt": "Done",
+            "States": {
+                "Done": {
+                    "Type": "Succeed"
+                }
+            }
+        })
+        .to_string();
+
+        let created = service
+            .create_state_machine(
+                &scope(),
+                CreateStateMachineInput {
+                    definition,
+                    name: "spawn-failure".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/demo".to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("state machine should create");
+        let error = service
+            .start_execution(
+                &scope(),
+                StartExecutionInput {
+                    input: None,
+                    name: Some("run-1".to_owned()),
+                    state_machine_arn: created.state_machine_arn,
+                    trace_header: None,
+                },
+            )
+            .expect_err("spawn failure should fail the start request");
+        assert!(matches!(error, StepFunctionsError::Infrastructure(_)));
+        assert!(matches!(
+            service.describe_execution(
+                &scope(),
+                DescribeExecutionInput {
+                    execution_arn: "arn:aws:states:eu-west-2:000000000000:execution:spawn-failure:run-1".to_owned(),
+                },
+            ),
+            Err(StepFunctionsError::ExecutionDoesNotExist { .. })
+        ));
+    }
+
+    #[test]
+    fn step_functions_unnamed_execution_retries_past_existing_execution_names()
+    {
+        let service = service(
+            StaticTaskAdapter::default(),
+            Arc::new(RecordingSleeper::default()),
+        );
+        let definition = json!({
+            "StartAt": "Done",
+            "States": {
+                "Done": {
+                    "Type": "Succeed"
+                }
+            }
+        })
+        .to_string();
+
+        let created = service
+            .create_state_machine(
+                &scope(),
+                CreateStateMachineInput {
+                    definition,
+                    name: "auto-name".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/demo".to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("state machine should create");
+        let duplicate = service
+            .start_execution(
+                &scope(),
+                StartExecutionInput {
+                    input: None,
+                    name: Some("execution-1".to_owned()),
+                    state_machine_arn: created.state_machine_arn.clone(),
+                    trace_header: None,
+                },
+            )
+            .expect("named execution should start");
+        assert!(
+            duplicate.execution_arn.ends_with(":execution-1"),
+            "explicit execution name should be preserved"
+        );
+
+        let started = service
+            .start_execution(
+                &scope(),
+                StartExecutionInput {
+                    input: None,
+                    name: None,
+                    state_machine_arn: created.state_machine_arn,
+                    trace_header: None,
+                },
+            )
+            .expect("unnamed execution should retry until a free name exists");
+        assert!(
+            started.execution_arn.ends_with(":execution-2"),
+            "unnamed execution should skip the existing execution-1 slot"
         );
     }
 

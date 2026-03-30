@@ -2,7 +2,10 @@ use crate::attributes::{
     DEFAULT_DELAY_SECONDS, MAX_DELAY_SECONDS, MAX_VISIBILITY_TIMEOUT,
 };
 use crate::errors::SqsError;
-use crate::queues::{QueueRecord, SqsService, SqsWorld};
+use crate::queues::{
+    CallbackSqsReceiveCancellation, QueueRecord, SqsReceiveWaitOutcome,
+    SqsService, SqsWorld,
+};
 use crate::scope::SqsQueueIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,7 +30,7 @@ pub struct SendMessageOutput {
     pub sequence_number: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiveMessageInput {
     pub max_number_of_messages: Option<u32>,
     pub visibility_timeout: Option<u32>,
@@ -121,8 +124,8 @@ pub(crate) struct PendingQueueMove {
     pub(crate) source_message_index: usize,
 }
 
-#[derive(Debug)]
-pub(crate) struct ReceiveAttempt {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReceiveMessageAttempt {
     pub(crate) effective_wait_time_seconds: u32,
     pub(crate) received: Vec<ReceivedMessage>,
 }
@@ -159,24 +162,38 @@ impl SqsService {
         queue: &SqsQueueIdentity,
         input: ReceiveMessageInput,
     ) -> Result<Vec<ReceivedMessage>, SqsError> {
+        self.receive_message_with_cancellation(queue, input, &|| false)
+    }
+
+    /// Receives messages and allows request-scoped callers to stop a long poll
+    /// when their own shutdown boundary is reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqsError`] when the queue does not exist or the receive parameters are invalid.
+    pub(crate) fn receive_message_with_cancellation(
+        &self,
+        queue: &SqsQueueIdentity,
+        input: ReceiveMessageInput,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<Vec<ReceivedMessage>, SqsError> {
         let mut next_receipt_handle =
             || self.identifier_source.next_receipt_handle();
         let now_millis = timestamp_millis((self.time_source)());
-        let first_attempt = {
-            let mut state =
-                self.state.lock().unwrap_or_else(|poison| poison.into_inner());
-            state.receive_message(
-                queue,
-                input.clone(),
-                now_millis,
-                &mut next_receipt_handle,
-            )?
-        };
-
+        let first_attempt = self.receive_message_attempt(
+            queue,
+            input,
+            now_millis,
+            &mut next_receipt_handle,
+        )?;
         if !first_attempt.received.is_empty()
             || first_attempt.effective_wait_time_seconds == 0
         {
             return Ok(first_attempt.received);
+        }
+        let cancellation = CallbackSqsReceiveCancellation::new(is_cancelled);
+        if is_cancelled() {
+            return Ok(Vec::new());
         }
 
         let deadline_millis = now_millis.saturating_add(
@@ -186,32 +203,43 @@ impl SqsService {
         let mut current_millis = now_millis;
 
         while current_millis < deadline_millis {
-            self.receive_waiter.wait(long_poll_wait_duration(
-                deadline_millis - current_millis,
-            ));
+            if self.receive_waiter.wait(
+                long_poll_wait_duration(deadline_millis - current_millis),
+                &cancellation,
+            ) == SqsReceiveWaitOutcome::Cancelled
+            {
+                return Ok(Vec::new());
+            }
             current_millis = timestamp_millis((self.time_source)());
             if current_millis >= deadline_millis {
                 break;
             }
 
-            let attempt = {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                state.receive_message(
-                    queue,
-                    input.clone(),
-                    current_millis,
-                    &mut next_receipt_handle,
-                )?
-            };
+            let attempt = self.receive_message_attempt(
+                queue,
+                input,
+                current_millis,
+                &mut next_receipt_handle,
+            )?;
             if !attempt.received.is_empty() {
                 return Ok(attempt.received);
             }
         }
 
         Ok(Vec::new())
+    }
+
+    fn receive_message_attempt(
+        &self,
+        queue: &SqsQueueIdentity,
+        input: ReceiveMessageInput,
+        now_millis: u64,
+        next_receipt_handle: &mut dyn FnMut() -> String,
+    ) -> Result<ReceiveMessageAttempt, SqsError> {
+        let mut state =
+            self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        state.receive_message(queue, input, now_millis, next_receipt_handle)
     }
 
     /// Sends multiple messages and returns per-entry successes and failures.
@@ -383,7 +411,7 @@ impl SqsWorld {
         input: ReceiveMessageInput,
         now_millis: u64,
         next_receipt_handle: &mut dyn FnMut() -> String,
-    ) -> Result<ReceiveAttempt, SqsError> {
+    ) -> Result<ReceiveMessageAttempt, SqsError> {
         let (
             received,
             dead_letter_messages,
@@ -449,7 +477,7 @@ impl SqsWorld {
             self.commit_staged_message_moves(staged_moves)?;
         }
 
-        Ok(ReceiveAttempt {
+        Ok(ReceiveMessageAttempt {
             effective_wait_time_seconds: wait_time_seconds,
             received,
         })

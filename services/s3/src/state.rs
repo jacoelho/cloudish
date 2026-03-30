@@ -1749,7 +1749,7 @@ impl S3Service {
             &input.key,
             &input.upload_id,
         )?;
-        if input.part_number == 0 {
+        if !(1..=10_000).contains(&input.part_number) {
             return Err(S3Error::InvalidArgument {
                 code: "InvalidArgument",
                 message: "Part number must be between 1 and 10000.".to_owned(),
@@ -4562,6 +4562,44 @@ mod tests {
 
         assert!(after_abort.uploads.is_empty());
         assert!(matches!(complete_after_abort, S3Error::NoSuchUpload { .. }));
+    }
+
+    #[test]
+    fn s3_advanced_upload_part_rejects_part_numbers_above_ten_thousand() {
+        let service = service(1_710_000_011);
+        let scope = scope();
+        create_bucket(&service, &scope, "demo");
+
+        let upload = service
+            .create_multipart_upload(
+                &scope,
+                CreateMultipartUploadInput {
+                    bucket: "demo".to_owned(),
+                    content_type: None,
+                    key: "large.txt".to_owned(),
+                    metadata: BTreeMap::new(),
+                    tags: BTreeMap::new(),
+                },
+            )
+            .expect("multipart upload should start");
+
+        let error = service
+            .upload_part(
+                &scope,
+                super::UploadPartInput {
+                    body: b"payload".to_vec(),
+                    bucket: "demo".to_owned(),
+                    key: "large.txt".to_owned(),
+                    part_number: 10_001,
+                    upload_id: upload.upload_id,
+                },
+            )
+            .expect_err("part number above 10000 should fail");
+
+        assert!(matches!(
+            error,
+            S3Error::InvalidArgument { code: "InvalidArgument", .. }
+        ));
     }
 
     #[test]

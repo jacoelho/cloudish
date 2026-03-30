@@ -15,18 +15,21 @@ use super::messages::{
     validate_wait_time_seconds,
 };
 use super::queues::{
-    CreateQueueInput, QueueRecord, SqsIdentifierSource, SqsReceiveWaiter,
+    CreateQueueInput, QueueRecord, SqsIdentifierSource,
+    SqsReceiveCancellation, SqsReceiveWaitOutcome, SqsReceiveWaiter,
     SqsService,
 };
 use super::redrive::{
     StartMessageMoveTaskInput, encode_move_task_handle,
     parse_queue_identity_from_arn, parse_redrive_policy,
 };
+use super::request_runtime::SqsRequestRuntime;
 use super::scope::{SqsQueueIdentity, SqsScope};
 use aws::{AccountId, Arn, RegionId};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 struct TestIdentifierSource {
@@ -115,12 +118,24 @@ impl TestWaiter {
 }
 
 impl SqsReceiveWaiter for TestWaiter {
-    fn wait(&self, duration: Duration) {
+    fn wait(
+        &self,
+        duration: Duration,
+        cancellation: &dyn SqsReceiveCancellation,
+    ) -> SqsReceiveWaitOutcome {
+        if cancellation.is_cancelled() {
+            return SqsReceiveWaitOutcome::Cancelled;
+        }
         self.waits
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .push(duration);
         self.clock.advance(duration);
+        if cancellation.is_cancelled() {
+            SqsReceiveWaitOutcome::Cancelled
+        } else {
+            SqsReceiveWaitOutcome::Completed
+        }
     }
 }
 
@@ -1172,7 +1187,7 @@ fn sqs_receive_message_uses_queue_default_wait_time_when_request_omits_it() {
                 wait_time_seconds: None,
             },
         )
-        .expect("long poll should succeed");
+        .expect("receive should succeed");
 
     assert!(received.is_empty());
     assert_eq!(waiter.total_wait(), Duration::from_secs(2));
@@ -1210,10 +1225,105 @@ fn sqs_receive_message_request_wait_time_overrides_queue_default() {
                 wait_time_seconds: Some(1),
             },
         )
-        .expect("long poll should succeed");
+        .expect("receive should succeed");
 
     assert!(received.is_empty());
     assert_eq!(waiter.total_wait(), Duration::from_secs(1));
+}
+
+#[test]
+fn sqs_receive_message_cancellation_is_scoped_to_the_current_receive() {
+    let service = SqsService::new();
+    let request_runtime = SqsRequestRuntime::new(service.clone());
+    let scope = scope();
+    let queue = service
+        .create_queue(&scope, queue_input("orders"))
+        .expect("queue should be created");
+    let receiver = request_runtime.clone();
+    let receive_queue = queue.clone();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let receive_cancelled = Arc::clone(&cancelled);
+    let receive = std::thread::spawn(move || {
+        let started_at = Instant::now();
+        let is_cancelled = move || receive_cancelled.load(Ordering::SeqCst);
+        let received = receiver
+            .receive_message(
+                &receive_queue,
+                ReceiveMessageInput {
+                    max_number_of_messages: Some(1),
+                    visibility_timeout: None,
+                    wait_time_seconds: Some(5),
+                },
+                &is_cancelled,
+            )
+            .expect("receive should succeed");
+
+        (started_at.elapsed(), received)
+    });
+
+    std::thread::sleep(Duration::from_millis(100));
+    cancelled.store(true, Ordering::SeqCst);
+
+    let (elapsed, received) = receive.join().expect("receive should finish");
+
+    assert!(received.is_empty());
+    assert!(elapsed < Duration::from_secs(1));
+
+    let started_at = Instant::now();
+    let received = service
+        .receive_message(
+            &queue,
+            ReceiveMessageInput {
+                max_number_of_messages: Some(1),
+                visibility_timeout: None,
+                wait_time_seconds: Some(1),
+            },
+        )
+        .expect("ordinary receive should still succeed");
+
+    assert!(received.is_empty());
+    assert!(started_at.elapsed() >= Duration::from_millis(900));
+}
+
+#[test]
+fn sqs_receive_message_returns_messages_arriving_during_wait_window() {
+    let service = SqsService::new();
+    let scope = scope();
+    let queue = service
+        .create_queue(
+            &scope,
+            CreateQueueInput {
+                attributes: BTreeMap::from([(
+                    "ReceiveMessageWaitTimeSeconds".to_owned(),
+                    "1".to_owned(),
+                )]),
+                queue_name: "orders".to_owned(),
+            },
+        )
+        .expect("queue should be created");
+    let sender = service.clone();
+    let delayed_queue = queue.clone();
+    let delayed_send = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        sender
+            .send_message(&delayed_queue, send_input("payload", Some(0)))
+            .expect("message should send");
+    });
+
+    let received = service
+        .receive_message(
+            &queue,
+            ReceiveMessageInput {
+                max_number_of_messages: Some(1),
+                visibility_timeout: None,
+                wait_time_seconds: None,
+            },
+        )
+        .expect("receive should succeed");
+    delayed_send.join().expect("delayed sender should finish");
+
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].body, "payload");
 }
 
 fn queue_identities() -> (SqsQueueIdentity, SqsQueueIdentity) {
