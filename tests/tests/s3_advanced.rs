@@ -17,8 +17,9 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::presigning::{PresignedRequest, PresigningConfig};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
+    BucketLocationConstraint,
     BucketVersioningStatus as SdkBucketVersioningStatus,
-    VersioningConfiguration,
+    CreateBucketConfiguration, VersioningConfiguration,
 };
 use reqwest::Method;
 use runtime::RuntimeServer;
@@ -40,12 +41,30 @@ async fn s3_client(target: &SdkSmokeTarget) -> S3Client {
     S3Client::from_conf(config)
 }
 
+fn s3_target(runtime: &RuntimeServer) -> SdkSmokeTarget {
+    SdkSmokeTarget::new(runtime.localhost_endpoint_url(), "eu-west-2")
+}
+
+async fn create_bucket(client: &S3Client, bucket: &str) {
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::EuWest2)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("bucket should be created");
+}
+
 fn assert_target(target: &SdkSmokeTarget, runtime: &RuntimeServer) {
     assert!(runtime.state_directory().exists());
     assert_eq!(target.access_key_id(), "test");
     assert_eq!(target.secret_access_key(), "test");
     assert_eq!(target.region(), "eu-west-2");
-    assert_eq!(target.endpoint_url(), format!("http://{}", runtime.address()));
+    assert_eq!(target.endpoint_url(), runtime.localhost_endpoint_url());
 }
 
 async fn execute_presigned(
@@ -70,19 +89,11 @@ async fn execute_presigned(
 #[tokio::test]
 async fn s3_advanced_versioning_delete_markers_and_historical_reads() {
     let runtime = shared_runtime().await;
-    let target = SdkSmokeTarget::new(
-        format!("http://{}", runtime.address()),
-        "eu-west-2",
-    );
+    let target = s3_target(&runtime);
     assert_target(&target, &runtime);
     let client = s3_client(&target).await;
 
-    client
-        .create_bucket()
-        .bucket("sdk-s3-advanced-versioning")
-        .send()
-        .await
-        .expect("bucket should be created");
+    create_bucket(&client, "sdk-s3-advanced-versioning").await;
     client
         .put_bucket_versioning()
         .bucket("sdk-s3-advanced-versioning")
@@ -174,19 +185,11 @@ async fn s3_advanced_versioning_delete_markers_and_historical_reads() {
 #[tokio::test]
 async fn s3_advanced_presigned_put_get_and_expiry_work() {
     let runtime = shared_runtime().await;
-    let target = SdkSmokeTarget::new(
-        format!("http://{}", runtime.address()),
-        "eu-west-2",
-    );
+    let target = s3_target(&runtime);
     assert_target(&target, &runtime);
     let client = s3_client(&target).await;
 
-    client
-        .create_bucket()
-        .bucket("sdk-s3-advanced-presign")
-        .send()
-        .await
-        .expect("bucket should be created");
+    create_bucket(&client, "sdk-s3-advanced-presign").await;
 
     let put_presigned = client
         .put_object()
@@ -271,19 +274,11 @@ async fn s3_advanced_presigned_put_get_and_expiry_work() {
 #[tokio::test]
 async fn s3_advanced_multipart_abort_cleanup_and_validation_failures() {
     let runtime = shared_runtime().await;
-    let target = SdkSmokeTarget::new(
-        format!("http://{}", runtime.address()),
-        "eu-west-2",
-    );
+    let target = s3_target(&runtime);
     assert_target(&target, &runtime);
     let client = s3_client(&target).await;
 
-    client
-        .create_bucket()
-        .bucket("sdk-s3-advanced-multipart")
-        .send()
-        .await
-        .expect("bucket should be created");
+    create_bucket(&client, "sdk-s3-advanced-multipart").await;
 
     let aborted = client
         .create_multipart_upload()
@@ -352,8 +347,8 @@ async fn s3_advanced_multipart_abort_cleanup_and_validation_failures() {
     let malformed_body = "<CompleteMultipartUpload></CompleteMultipartUpload>";
     let malformed_response = reqwest::Client::new()
         .post(format!(
-            "http://{}/sdk-s3-advanced-multipart/invalid.bin?uploadId={invalid_upload_id}",
-            runtime.address()
+            "{}/sdk-s3-advanced-multipart/invalid.bin?uploadId={invalid_upload_id}",
+            runtime.localhost_endpoint_url()
         ))
         .header("content-type", "application/xml")
         .body(malformed_body.to_owned())

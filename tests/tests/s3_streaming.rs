@@ -42,7 +42,7 @@ async fn given_a_signed_aws_chunked_put_object_when_sent_over_raw_http_then_the_
  {
     let runtime = shared_runtime().await;
     let target = sdk::SdkSmokeTarget::new(
-        format!("http://{}", runtime.address()),
+        runtime.localhost_endpoint_url(),
         "us-east-1",
     );
     let client = s3_client(&target).await;

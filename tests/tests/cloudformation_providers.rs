@@ -212,13 +212,15 @@ async fn cloudformation_providers_stack_lifecycle_provisions_supported_catalog()
         format!("http://{}", runtime.address()),
         "eu-west-2",
     );
+    let s3_target =
+        SdkSmokeTarget::new(runtime.localhost_endpoint_url(), "eu-west-2");
     let shared = target.load().await;
     let cloudformation = CloudFormationClient::new(&shared);
     let dynamodb = DynamoDbClient::new(&shared);
     let iam = IamClient::new(&shared);
     let kms = KmsClient::new(&shared);
     let lambda = LambdaClient::new(&shared);
-    let s3 = s3_client(&target).await;
+    let s3 = s3_client(&s3_target).await;
     let secrets_manager = SecretsManagerClient::new(&shared);
     let sns = SnsClient::new(&shared);
     let sqs = SqsClient::new(&shared);

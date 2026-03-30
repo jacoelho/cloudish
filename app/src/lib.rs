@@ -475,6 +475,19 @@ mod tests {
         .expect("test defaults should be valid")
     }
 
+    fn create_bucket_request(path: &str) -> String {
+        let body = concat!(
+            "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+            "<LocationConstraint>eu-west-2</LocationConstraint>",
+            "</CreateBucketConfiguration>",
+        );
+
+        format!(
+            "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
     #[test]
     fn load_runtime_defaults_reports_missing_fields() {
         let error = load_runtime_defaults(|name| match name {
@@ -836,10 +849,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let create_bucket = tokio::task::spawn_blocking(move || {
-            send_http_request(
-                address,
-                "PUT /transport-content-length HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-            )
+            let request = create_bucket_request("/transport-content-length");
+            send_http_request(address, &request)
         })
         .await
         .expect("bucket creation task should complete")
@@ -905,10 +916,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let create_bucket = tokio::task::spawn_blocking(move || {
-            send_http_request(
-                address,
-                "PUT /transport-chunked HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-            )
+            let request = create_bucket_request("/transport-chunked");
+            send_http_request(address, &request)
         })
         .await
         .expect("bucket creation task should complete")

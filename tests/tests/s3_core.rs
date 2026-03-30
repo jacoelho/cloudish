@@ -25,6 +25,13 @@ async fn shared_runtime() -> SharedRuntimeLease<'static> {
     SHARED_RUNTIME.acquire().await
 }
 
+fn s3_target(
+    runtime: &runtime::RuntimeServer,
+    region: &str,
+) -> SdkSmokeTarget {
+    SdkSmokeTarget::new(runtime.localhost_endpoint_url(), region)
+}
+
 async fn s3_client(target: &SdkSmokeTarget) -> S3Client {
     let shared = target.load().await;
     let config = S3ConfigBuilder::from(&shared).force_path_style(true).build();
@@ -35,14 +42,11 @@ async fn s3_client(target: &SdkSmokeTarget) -> S3Client {
 async fn s3_core_put_get_head_copy_and_list_objects() {
     let runtime = shared_runtime().await;
     assert!(runtime.state_directory().exists());
-    let target = SdkSmokeTarget::new(
-        format!("http://{}", runtime.address()),
-        "us-east-1",
-    );
+    let target = s3_target(&runtime, "us-east-1");
     assert_eq!(target.access_key_id(), "test");
     assert_eq!(target.secret_access_key(), "test");
     assert_eq!(target.region(), "us-east-1");
-    assert_eq!(target.endpoint_url(), format!("http://{}", runtime.address()));
+    assert_eq!(target.endpoint_url(), runtime.localhost_endpoint_url());
     let client = s3_client(&target).await;
 
     client
@@ -134,14 +138,11 @@ async fn s3_core_put_get_head_copy_and_list_objects() {
 async fn s3_core_missing_key_and_non_empty_bucket_errors_are_shaped() {
     let runtime = shared_runtime().await;
     assert!(runtime.state_directory().exists());
-    let target = SdkSmokeTarget::new(
-        format!("http://{}", runtime.address()),
-        "us-east-1",
-    );
+    let target = s3_target(&runtime, "us-east-1");
     assert_eq!(target.access_key_id(), "test");
     assert_eq!(target.secret_access_key(), "test");
     assert_eq!(target.region(), "us-east-1");
-    assert_eq!(target.endpoint_url(), format!("http://{}", runtime.address()));
+    assert_eq!(target.endpoint_url(), runtime.localhost_endpoint_url());
     let client = s3_client(&target).await;
 
     client
@@ -180,14 +181,8 @@ async fn s3_core_missing_key_and_non_empty_bucket_errors_are_shaped() {
 #[tokio::test]
 async fn s3_core_bucket_requests_from_the_wrong_region_fail_cleanly() {
     let runtime = shared_runtime().await;
-    let bucket_target = SdkSmokeTarget::new(
-        format!("http://{}", runtime.address()),
-        "eu-west-2",
-    );
-    let wrong_region_target = SdkSmokeTarget::new(
-        format!("http://{}", runtime.address()),
-        "us-east-1",
-    );
+    let bucket_target = s3_target(&runtime, "eu-west-2");
+    let wrong_region_target = s3_target(&runtime, "us-east-1");
     let bucket_client = s3_client(&bucket_target).await;
     let wrong_region_client = s3_client(&wrong_region_target).await;
 

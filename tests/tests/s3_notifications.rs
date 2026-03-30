@@ -16,14 +16,15 @@ use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{
-    CsvInput, CsvOutput, DefaultRetention, Event as NotificationEvent,
-    ExpressionType, FileHeaderInfo, FilterRule, FilterRuleName,
-    InputSerialization, NotificationConfiguration,
-    NotificationConfigurationFilter, ObjectLockConfiguration,
-    ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
-    ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode,
-    ObjectLockRule, OutputSerialization, QueueConfiguration, RestoreRequest,
-    S3KeyFilter, SelectObjectContentEventStream,
+    BucketLocationConstraint, CreateBucketConfiguration, CsvInput, CsvOutput,
+    DefaultRetention, Event as NotificationEvent, ExpressionType,
+    FileHeaderInfo, FilterRule, FilterRuleName, InputSerialization,
+    NotificationConfiguration, NotificationConfigurationFilter,
+    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold,
+    ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
+    ObjectLockRetentionMode, ObjectLockRule, OutputSerialization,
+    QueueConfiguration, RestoreRequest, S3KeyFilter,
+    SelectObjectContentEventStream,
 };
 use aws_sdk_sqs::Client as SqsClient;
 use aws_sdk_sqs::types::QueueAttributeName;
@@ -48,29 +49,55 @@ async fn shared_clients(target: &SdkSmokeTarget) -> (S3Client, SqsClient) {
     (s3, sqs)
 }
 
+fn s3_target(runtime: &RuntimeServer) -> SdkSmokeTarget {
+    SdkSmokeTarget::new(runtime.localhost_endpoint_url(), "eu-west-2")
+}
+
+async fn create_bucket(client: &S3Client, bucket: &str) {
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::EuWest2)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("bucket should be created");
+}
+
+async fn create_object_lock_bucket(client: &S3Client, bucket: &str) {
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::EuWest2)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("object-lock bucket should be created");
+}
+
 fn assert_target(target: &SdkSmokeTarget, runtime: &RuntimeServer) {
     assert!(runtime.state_directory().exists());
     assert_eq!(target.access_key_id(), "test");
     assert_eq!(target.secret_access_key(), "test");
     assert_eq!(target.region(), "eu-west-2");
-    assert_eq!(target.endpoint_url(), format!("http://{}", runtime.address()));
+    assert_eq!(target.endpoint_url(), runtime.localhost_endpoint_url());
 }
 
 #[tokio::test]
 async fn s3_notifications_sqs_event_configuration_and_delivery_round_trip() {
     let runtime = shared_runtime().await;
-    let target = SdkSmokeTarget::new(
-        format!("http://{}", runtime.address()),
-        "eu-west-2",
-    );
+    let target = s3_target(&runtime);
     assert_target(&target, &runtime);
     let (s3, sqs) = shared_clients(&target).await;
 
-    s3.create_bucket()
-        .bucket("sdk-s3-notifications-events")
-        .send()
-        .await
-        .expect("bucket should be created");
+    create_bucket(&s3, "sdk-s3-notifications-events").await;
 
     let queue = sqs
         .create_queue()
@@ -217,19 +244,11 @@ async fn s3_notifications_sqs_event_configuration_and_delivery_round_trip() {
 #[tokio::test]
 async fn s3_notifications_object_lock_select_and_restore_behave_explicitly() {
     let runtime = shared_runtime().await;
-    let target = SdkSmokeTarget::new(
-        format!("http://{}", runtime.address()),
-        "eu-west-2",
-    );
+    let target = s3_target(&runtime);
     assert_target(&target, &runtime);
     let (s3, _) = shared_clients(&target).await;
 
-    s3.create_bucket()
-        .bucket("sdk-s3-notifications-lock")
-        .object_lock_enabled_for_bucket(true)
-        .send()
-        .await
-        .expect("object-lock bucket should be created");
+    create_object_lock_bucket(&s3, "sdk-s3-notifications-lock").await;
     s3.put_object_lock_configuration()
         .bucket("sdk-s3-notifications-lock")
         .object_lock_configuration(
@@ -398,11 +417,7 @@ async fn s3_notifications_object_lock_select_and_restore_behave_explicitly() {
         Some(&ObjectLockLegalHoldStatus::On)
     );
 
-    s3.create_bucket()
-        .bucket("sdk-s3-notifications-select")
-        .send()
-        .await
-        .expect("select bucket should be created");
+    create_bucket(&s3, "sdk-s3-notifications-select").await;
     s3.put_object()
         .bucket("sdk-s3-notifications-select")
         .key("reports/input.csv")

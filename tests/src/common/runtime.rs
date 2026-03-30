@@ -71,6 +71,10 @@ impl RuntimeServer {
         self.address
     }
 
+    pub fn localhost_endpoint_url(&self) -> String {
+        format!("http://localhost:{}", self.address.port())
+    }
+
     pub fn state_directory(&self) -> &Path {
         &self.state_directory
     }
