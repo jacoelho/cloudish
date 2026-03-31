@@ -395,14 +395,14 @@ fn wait_for_child_output(
     function_name: &str,
     is_cancelled: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<std::process::Output, InfrastructureError> {
-    let stdout = child.stdout.take().ok_or_else(|| {
+    let mut stdout = child.stdout.take().ok_or_else(|| {
         InfrastructureError::container(
             "wait",
             function_name,
             io::Error::new(io::ErrorKind::NotFound, "lambda stdout pipe not configured"),
         )
     })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
+    let mut stderr = child.stderr.take().ok_or_else(|| {
         InfrastructureError::container(
             "wait",
             function_name,
