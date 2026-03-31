@@ -71,7 +71,13 @@ pub trait EventBridgeDeliveryDispatcher: Send + Sync {
         target: &EventBridgeTarget,
     ) -> Result<(), EventBridgeError>;
 
-    fn dispatch(&self, deliveries: Vec<EventBridgePlannedDelivery>);
+    /// # Errors
+    ///
+    /// Returns an error when the deliveries cannot be enqueued for dispatch.
+    fn dispatch(
+        &self,
+        deliveries: Vec<EventBridgePlannedDelivery>,
+    ) -> Result<(), EventBridgeError>;
 }
 
 #[derive(Debug, Default)]
@@ -87,7 +93,12 @@ impl EventBridgeDeliveryDispatcher for NoopEventBridgeDeliveryDispatcher {
         Ok(())
     }
 
-    fn dispatch(&self, _deliveries: Vec<EventBridgePlannedDelivery>) {}
+    fn dispatch(
+        &self,
+        _deliveries: Vec<EventBridgePlannedDelivery>,
+    ) -> Result<(), EventBridgeError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

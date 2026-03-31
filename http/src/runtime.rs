@@ -136,9 +136,9 @@ impl EdgeRouter {
         self.runtime.begin_shutdown();
     }
 
-    pub fn shutdown(&self) {
+    pub fn shutdown(&self) -> Vec<edge_runtime::ShutdownWarning> {
         self.begin_shutdown();
-        self.runtime.shutdown();
+        self.runtime.shutdown()
     }
 
     pub fn handle_bytes(&self, request: &[u8]) -> EdgeResponse {
