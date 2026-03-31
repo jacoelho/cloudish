@@ -4,7 +4,7 @@ use aws::{
 };
 use serde_json::json;
 use std::fs::{self, File};
-use std::io::{self, Cursor, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -395,10 +395,35 @@ fn wait_for_child_output(
     function_name: &str,
     is_cancelled: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<std::process::Output, InfrastructureError> {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        InfrastructureError::container(
+            "wait",
+            function_name,
+            io::Error::new(io::ErrorKind::NotFound, "lambda stdout pipe not configured"),
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        InfrastructureError::container(
+            "wait",
+            function_name,
+            io::Error::new(io::ErrorKind::NotFound, "lambda stderr pipe not configured"),
+        )
+    })?;
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).map(|_| output)
+    });
+
     loop {
         if is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(InfrastructureError::container(
                 "wait",
                 function_name,
@@ -413,12 +438,52 @@ fn wait_for_child_output(
             InfrastructureError::container("wait", function_name, source)
         })? {
             Some(_) => {
-                return child.wait_with_output().map_err(|source| {
-                    InfrastructureError::container(
-                        "wait",
-                        function_name,
-                        source,
-                    )
+                let status = child.wait().map_err(|source| {
+                    InfrastructureError::container("wait", function_name, source)
+                })?;
+                let stdout = stdout_reader
+                    .join()
+                    .map_err(|_| {
+                        InfrastructureError::container(
+                            "wait",
+                            function_name,
+                            io::Error::new(
+                                io::ErrorKind::Other,
+                                "lambda stdout reader thread panicked",
+                            ),
+                        )
+                    })?
+                    .map_err(|source| {
+                        InfrastructureError::container(
+                            "wait",
+                            function_name,
+                            source,
+                        )
+                    })?;
+                let stderr = stderr_reader
+                    .join()
+                    .map_err(|_| {
+                        InfrastructureError::container(
+                            "wait",
+                            function_name,
+                            io::Error::new(
+                                io::ErrorKind::Other,
+                                "lambda stderr reader thread panicked",
+                            ),
+                        )
+                    })?
+                    .map_err(|source| {
+                        InfrastructureError::container(
+                            "wait",
+                            function_name,
+                            source,
+                        )
+                    })?;
+
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
                 });
             }
             None => thread::sleep(
@@ -649,5 +714,30 @@ mod tests {
             error.to_string().contains("lambda invocation cancelled"),
             "unexpected cancellation error: {error}",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_lambda_executor_does_not_deadlock_with_large_stdout() {
+        let executor = ProcessLambdaExecutor::new(temporary_directory(
+            "hosting-lambda-executor-large-stdout",
+        ));
+        let archive = zip_with_entries(&[(
+            "bootstrap",
+            "#!/bin/sh\ncat /dev/zero | tr '\\0' 'x' | head -c 2000000\n",
+        )]);
+        let request = LambdaInvocationRequest::new(
+            "large-output",
+            "$LATEST",
+            "provided.al2",
+            "ignored.handler",
+            LambdaExecutionPackage::ZipArchive(archive),
+            br#"{}"#.to_vec(),
+        );
+
+        let result = executor.invoke(&request).expect("invoke should succeed");
+
+        assert_eq!(result.function_error(), None);
+        assert!(result.payload().len() > 1_900_000);
     }
 }
