@@ -9,15 +9,19 @@ pub use crate::state::{
     TaskInvocationResult,
 };
 
+pub trait StepFunctionsSpawnHandle: Send {
+    fn start(self: Box<Self>);
+}
+
 pub trait StepFunctionsExecutionSpawner: Send + Sync {
     /// # Errors
     ///
     /// Returns an error when the underlying runtime cannot schedule the task.
-    fn spawn(
+    fn spawn_paused(
         &self,
         task_name: &str,
         task: Box<dyn FnOnce() + Send>,
-    ) -> Result<(), InfrastructureError>;
+    ) -> Result<Box<dyn StepFunctionsSpawnHandle>, InfrastructureError>;
 }
 
 pub trait StepFunctionsSleeper: Send + Sync {

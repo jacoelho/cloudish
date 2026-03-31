@@ -14,11 +14,9 @@ use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
-use std::io::Write as _;
-use std::io::{ErrorKind, Read};
-use std::net::TcpStream;
 use tests::common::runtime;
 use tests::common::sdk;
+use test_support::send_http_request_bytes;
 use time::OffsetDateTime;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -61,8 +59,13 @@ async fn given_a_signed_aws_chunked_put_object_when_sent_over_raw_http_then_the_
         &sigv4_timestamp_now(),
         payload,
     );
-    let response = send_raw_request(runtime.address(), &request)
-        .expect("signed aws-chunked request should receive a response");
+    let response = tokio::task::spawn_blocking(move || {
+        send_http_request_bytes(runtime.address(), &request)
+    })
+    .await
+    .expect("raw request task should complete")
+    .expect("signed aws-chunked request should receive a response");
+
 
     let object = client
         .get_object()
@@ -85,36 +88,6 @@ async fn given_a_signed_aws_chunked_put_object_when_sent_over_raw_http_then_the_
     );
     assert_eq!(body.as_ref(), payload);
 }
-
-fn send_raw_request(
-    address: std::net::SocketAddr,
-    request: &[u8],
-) -> std::io::Result<Vec<u8>> {
-    let mut stream = TcpStream::connect(address)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_millis(250)))?;
-    stream.write_all(request)?;
-
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => response.extend_from_slice(&buffer[..read]),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::TimedOut | ErrorKind::WouldBlock
-                ) =>
-            {
-                break;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    Ok(response)
-}
-
 fn aws_chunked_put_object_request(
     path: &str,
     host: &str,

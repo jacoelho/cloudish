@@ -1,5 +1,9 @@
+#[cfg(feature = "eventbridge")]
+use crate::EventBridgeDeliveryShutdown;
 #[cfg(feature = "lambda")]
 use crate::ManagedBackgroundTasks;
+#[cfg(feature = "eventbridge")]
+use crate::adapters::ThreadWorkQueue;
 #[cfg(feature = "apigateway")]
 use apigateway::{
     ApiGatewayScope, ExecuteApiError, ExecuteApiIntegrationExecutor,
@@ -7,10 +11,14 @@ use apigateway::{
     ExecuteApiPreparedResponse, map_lambda_proxy_response,
     map_lambda_proxy_response_v2,
 };
+#[cfg(feature = "lambda")]
+use aws::BackgroundScheduler;
+#[cfg(any(feature = "eventbridge", feature = "lambda"))]
+use aws::InfrastructureError;
 use aws::ServiceName;
 use aws::{Arn, HttpForwardRequest, HttpForwarder, SharedAdvertisedEdge};
-#[cfg(feature = "lambda")]
-use aws::{BackgroundScheduler, InfrastructureError};
+#[cfg(feature = "sns")]
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 #[cfg(feature = "eventbridge")]
 use eventbridge::{
     EventBridgeDeliveryDispatcher, EventBridgeError,
@@ -23,9 +31,13 @@ use eventbridge::{
 ))]
 use lambda::LambdaService;
 #[cfg(feature = "apigateway")]
+use lambda::request_runtime::LambdaRequestRuntime;
+#[cfg(feature = "apigateway")]
 use lambda::{ApiGatewayInvokeInput, LambdaScope};
 #[cfg(any(feature = "sns", feature = "step-functions"))]
 use lambda::{InvokeInput, LambdaInvocationType};
+#[cfg(feature = "sns")]
+use rsa::{RsaPrivateKey, pkcs1v15::Pkcs1v15Sign, pkcs8::DecodePrivateKey};
 #[cfg(feature = "s3")]
 use s3::{S3Error, S3EventNotification, S3NotificationTransport, S3Scope};
 #[cfg(feature = "sns")]
@@ -41,8 +53,8 @@ use sns::{
 use sqs::{SendMessageInput, SqsService};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-#[cfg(feature = "eventbridge")]
-use std::thread;
+#[cfg(feature = "sns")]
+use std::sync::OnceLock;
 #[cfg(feature = "lambda")]
 use std::time::Duration;
 #[cfg(feature = "sns")]
@@ -86,13 +98,13 @@ pub(crate) fn start_lambda_background_tasks(
 #[derive(Clone)]
 pub struct ApiGatewayIntegrationExecutor {
     http_forwarder: Option<Arc<dyn HttpForwarder + Send + Sync>>,
-    lambda: LambdaService,
+    lambda: Option<LambdaRequestRuntime>,
 }
 
 #[cfg(feature = "apigateway")]
 impl ApiGatewayIntegrationExecutor {
     pub fn new(
-        lambda: LambdaService,
+        lambda: Option<LambdaRequestRuntime>,
         http_forwarder: Option<Arc<dyn HttpForwarder + Send + Sync>>,
     ) -> Self {
         Self { http_forwarder, lambda }
@@ -106,6 +118,15 @@ impl ExecuteApiIntegrationExecutor for ApiGatewayIntegrationExecutor {
         scope: &ApiGatewayScope,
         invocation: &ExecuteApiInvocation,
     ) -> Result<ExecuteApiPreparedResponse, ExecuteApiError> {
+        self.execute_with_cancellation(scope, invocation, &|| false)
+    }
+
+    fn execute_with_cancellation(
+        &self,
+        scope: &ApiGatewayScope,
+        invocation: &ExecuteApiInvocation,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<ExecuteApiPreparedResponse, ExecuteApiError> {
         match invocation.integration() {
             ExecuteApiIntegrationPlan::Mock(response) => Ok(response.clone()),
             ExecuteApiIntegrationPlan::Http(request) => {
@@ -116,7 +137,7 @@ impl ExecuteApiIntegrationExecutor for ApiGatewayIntegrationExecutor {
                     });
                 };
                 forwarder
-                    .forward(request)
+                    .forward_with_cancellation(request, is_cancelled)
                     .map(|response| {
                         ExecuteApiPreparedResponse::new(
                             response.status_code(),
@@ -130,8 +151,13 @@ impl ExecuteApiIntegrationExecutor for ApiGatewayIntegrationExecutor {
                     })
             }
             ExecuteApiIntegrationPlan::LambdaProxy(plan) => {
-                let output = self
-                    .lambda
+                let Some(lambda) = self.lambda.as_ref() else {
+                    return Err(ExecuteApiError::IntegrationFailure {
+                        message: "Internal server error".to_owned(),
+                        status_code: 500,
+                    });
+                };
+                let output = lambda
                     .invoke_apigateway(
                         &LambdaScope::new(
                             scope.account_id().clone(),
@@ -142,6 +168,7 @@ impl ExecuteApiIntegrationExecutor for ApiGatewayIntegrationExecutor {
                             source_arn: plan.source_arn().clone(),
                             target: plan.target().clone(),
                         },
+                        is_cancelled,
                     )
                     .map_err(|_| ExecuteApiError::IntegrationFailure {
                         message: "Internal server error".to_owned(),
@@ -182,7 +209,9 @@ pub fn build_sns_service(
 ) -> SnsService {
     dependencies.advertised_edge = advertised_edge;
     if dependencies.http_signer.is_none() {
-        dependencies.http_signer = Some(Arc::new(CloudishSnsHttpSigner));
+        dependencies.http_signer = Some(Arc::new(CloudishSnsHttpSigner::new(
+            dependencies.advertised_edge.clone(),
+        )));
     }
     SnsService::with_transport(
         time_source,
@@ -192,19 +221,99 @@ pub fn build_sns_service(
 }
 
 #[cfg(feature = "sns")]
-#[derive(Clone, Default)]
-struct CloudishSnsHttpSigner;
+const CLOUDISH_SNS_SIGNING_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCzlgpV4C+kMkWm
+fHDmvMVXB29yPqVC96A3pnUFGOwFnwqR4CLPtjTf5u8iFAc3UwQiHfK6LPBJN+Mg
+DOwHGJS3i19O993Ca9HKYZqjf6MqrNJPUQe0fUmjPafw6EGFiDC22CrdDrzTCDYE
+R2Th6i8hc7mr4bfQAibdQMoUUbJNqic2amiZhd4BFQXozXBQ2aja08kZZzlR83rg
+cL6HyQ9cNQss8O3fO1zIUXl7ffMLL3TQ7El9GJlSg/KTttfYcPt1kclYLSwT90CE
+0hBnN8RpJOyDwHPhtunhjzvcdHGDLb2F1FBUlZIxtpMjtxapf3KeYhAGvpWV7gS1
+q6GY5agFAgMBAAECggEALVMee6sPyxynCIxawFl/YuYtAgP+mMa/qJv559Xw58BK
+niOYFZ1yfdoem5a7dYKdxfCSDNv/rzMMP1ATl/zjt+lUni0fyoyEz9PPgBlcOI6S
+q9MTI0IFvk32323273k+dj9bnhw0mvx1CaJtOzlsOMCo6VEYH8cTQP8zoWo3GrN9
+VEJkYYMBwAhB5Mi5e2vhKLN4XUcFrK8tFfbabohdCuP6oOrXfldOaCumjXO3tJtQ
+HW3CWcOlR74HWTPkw4/QxUMg2puRlZcSHiOzjlVfyFvDprxozbhKdlFsFsSiziLO
+d3m0zN09KdZKFwnVxl+2mL6oUwK82k3eh55gnzslVwKBgQDds+s4Laf5aSOj5pIe
+19HOLr+uEi2GrqXRjFiTYB4EfBJrqPKZu/hUk9sqfBw3zI5kLfdKAlWazhL9ESxQ
+vx1w54t8O5TdRW0NkPs7Yl8cN7Th5fhMKc8OHlE3FuczymI9ddsAhACnt9Tx3J8E
+NZZ66+9UhjykEnrZLZ3UWXaY+wKBgQDPXi0ei/Xc7oWjxUHyM2qizGKW2XQUEjkG
+tTD65iAiP/Y2ClP1Guo+VDR1Ibit/7jRqfpVUMWvwXxzDKHiHu2Gry2idu+0U6gR
+FdB5x9AudDKazy8bzoQwwPoFazVCkdpHgyEHlunG2q8bHdk63j79doREWTPPH2D8
+qLhLYJLy/wKBgCE5+8C5pvkMNtkzjyasNbdu7i9KbiRHPHbBT+0WdKk7Zw9XjLRZ
+pYgXeLtPSnNaZuTAttUSsH248MOYtUmMuv7W1OLTkyXuZ7+mwOBPh+2Us7k/XA0e
+HvgAty9IcXIjnMGVTjMvlWGNfY6aAAMDfQADKCVE0QXN9zdhTMwsdEfNAoGATuHC
+RBZ1pl9Nkujclyeb7uXUsxFxKJlt+/E8+pRDsQOnwxLWsSxV4vPhKJV1TSszwP3p
+7j5VlPADSTiK9BtTu6Izt9OKh4wzKJylu02ZEbK99UnO38MFYg5mjV0k23fkEsP8
+8ogj0bMqXSRTmCMmzwAgfGd6X9XN7Q65XGMWQz0CgYEAk+nyf5oyYThIDmvhkE8W
+m9BL7zkiFKUZ6S6jChN6H+H6E1woD08Li5mH98mVE8NWUVqKoXnROApBWnYlkaeS
+yRp+ZEUsuGEnfYvlG3XV4sRRFBNTxpj4QsNLQCGM+UyL7L7W5zDX39izaydjKsmU
+u1wVSdLMaZ0bh9EzaTJKtVI=
+-----END PRIVATE KEY-----
+"#;
+
+#[cfg(feature = "sns")]
+const CLOUDISH_SNS_SIGNING_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDGzCCAgOgAwIBAgIUY6l51sYMiDRC4gv5mXbgxtLw6YEwDQYJKoZIhvcNAQEL
+BQAwHTEbMBkGA1UEAwwSY2xvdWRpc2gtc25zLmxvY2FsMB4XDTI2MDMzMDEzMzA0
+MloXDTM2MDMyNzEzMzA0MlowHTEbMBkGA1UEAwwSY2xvdWRpc2gtc25zLmxvY2Fs
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs5YKVeAvpDJFpnxw5rzF
+Vwdvcj6lQvegN6Z1BRjsBZ8KkeAiz7Y03+bvIhQHN1MEIh3yuizwSTfjIAzsBxiU
+t4tfTvfdwmvRymGao3+jKqzST1EHtH1Joz2n8OhBhYgwttgq3Q680wg2BEdk4eov
+IXO5q+G30AIm3UDKFFGyTaonNmpomYXeARUF6M1wUNmo2tPJGWc5UfN64HC+h8kP
+XDULLPDt3ztcyFF5e33zCy900OxJfRiZUoPyk7bX2HD7dZHJWC0sE/dAhNIQZzfE
+aSTsg8Bz4bbp4Y873HRxgy29hdRQVJWSMbaTI7cWqX9ynmIQBr6Vle4EtauhmOWo
+BQIDAQABo1MwUTAdBgNVHQ4EFgQUnAPQcNWbNSTQUQ3JOe839WgYbUMwHwYDVR0j
+BBgwFoAUnAPQcNWbNSTQUQ3JOe839WgYbUMwDwYDVR0TAQH/BAUwAwEB/zANBgkq
+hkiG9w0BAQsFAAOCAQEAPBeSNojBJqpJF6+5H0+L/MzpojgeBH88vvV5WXYBoNUO
+4mQYIjZpLJjkUXCoEFO6RxB6OpHkbQn+xbaiKHhOaP71ED9yZnlGW1BMDjrUP9qQ
+jSqPKXfO1yypci4hlFMJMouPve5IeYkQlmXDbmCg3SAxcmTK80yGaU3KUOZCrSBQ
+hSKjQhXg++tMRuRKD9EkD+kfdQ0ZAvMPnap8IRfD2A0lS/oIKz2OMzWnqu2XQazI
+OXREKq3QG7ltAClZxBQUxpNL1Inpd/HbOs5333ddLBAN2BXP99a/fLgLjenueHGh
+G/lNp5qXpLwhj+zMgs4QwyMmkLTyLy9hnwg0BS7XFg==
+-----END CERTIFICATE-----
+"#;
+
+#[cfg(feature = "sns")]
+pub fn cloudish_sns_signing_cert_pem() -> &'static [u8] {
+    CLOUDISH_SNS_SIGNING_CERT_PEM.as_bytes()
+}
+
+#[cfg(feature = "sns")]
+fn cloudish_sns_signing_key() -> &'static RsaPrivateKey {
+    static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
+
+    KEY.get_or_init(|| {
+        RsaPrivateKey::from_pkcs8_pem(CLOUDISH_SNS_SIGNING_PRIVATE_KEY_PEM)
+            .expect("embedded SNS signing key should parse")
+    })
+}
+
+#[cfg(feature = "sns")]
+#[derive(Clone)]
+struct CloudishSnsHttpSigner {
+    advertised_edge: SharedAdvertisedEdge,
+}
+
+#[cfg(feature = "sns")]
+impl CloudishSnsHttpSigner {
+    fn new(advertised_edge: SharedAdvertisedEdge) -> Self {
+        Self { advertised_edge }
+    }
+}
 
 #[cfg(feature = "sns")]
 impl SnsHttpSigner for CloudishSnsHttpSigner {
     fn sign(&self, string_to_sign: &str) -> String {
-        let mut hasher = Sha1::new();
-        hasher.update(string_to_sign.as_bytes());
-        format!("{:x}", hasher.finalize())
+        let digest = Sha1::digest(string_to_sign.as_bytes());
+        let signature = cloudish_sns_signing_key()
+            .sign(Pkcs1v15Sign::new::<Sha1>(), &digest)
+            .expect("embedded SNS signing key should sign");
+
+        STANDARD.encode(signature)
     }
 
     fn signing_cert_url(&self) -> String {
-        "https://cloudish.invalid/sns.pem".to_owned()
+        self.advertised_edge.current().sns_signing_cert_url()
     }
 }
 
@@ -217,10 +326,43 @@ pub(crate) struct EventBridgeDispatcherDependencies {
 }
 
 #[cfg(feature = "eventbridge")]
+pub(crate) struct EventBridgeDispatcherAssembly {
+    pub dispatcher: Arc<dyn EventBridgeDeliveryDispatcher>,
+    pub shutdown: EventBridgeDeliveryShutdown,
+}
+
+#[cfg(feature = "eventbridge")]
 pub(crate) fn build_eventbridge_dispatcher(
     dependencies: EventBridgeDispatcherDependencies,
-) -> Arc<dyn EventBridgeDeliveryDispatcher> {
-    Arc::new(EventBridgeDispatcher { dependencies })
+) -> Result<EventBridgeDispatcherAssembly, InfrastructureError> {
+    let worker_dependencies = dependencies.clone();
+    let worker = Arc::new(ThreadWorkQueue::spawn(
+        "eventbridge-delivery".to_owned(),
+        move |deliveries: Vec<EventBridgePlannedDelivery>, stop_token| {
+            dispatch_eventbridge_deliveries(
+                &worker_dependencies,
+                deliveries,
+                stop_token,
+            );
+        },
+    )?);
+    let shutdown_worker = Arc::clone(&worker);
+    let shutdown_hard_stop_worker = Arc::clone(&worker);
+    let shutdown_finish_worker = Arc::clone(&worker);
+
+    Ok(EventBridgeDispatcherAssembly {
+        dispatcher: Arc::new(EventBridgeDispatcher {
+            dependencies,
+            delivery_worker: worker,
+        }),
+        shutdown: EventBridgeDeliveryShutdown::new(
+            Arc::new(move || shutdown_worker.begin_shutdown()),
+            Arc::new(move || shutdown_hard_stop_worker.request_hard_stop()),
+            Arc::new(move |timeout| {
+                shutdown_finish_worker.finish_shutdown(Some(timeout))
+            }),
+        ),
+    })
 }
 
 #[cfg(feature = "s3")]
@@ -317,6 +459,7 @@ struct SnsDeliveryDispatcher {
 #[derive(Clone)]
 struct EventBridgeDispatcher {
     dependencies: EventBridgeDispatcherDependencies,
+    delivery_worker: Arc<ThreadWorkQueue<Vec<EventBridgePlannedDelivery>>>,
 }
 
 #[cfg(feature = "sns")]
@@ -380,9 +523,10 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
                     None,
                     InvokeInput {
                         invocation_type: LambdaInvocationType::Event,
-                        payload: delivery
-                            .payload
-                            .lambda_event(&advertised_edge),
+                        payload: delivery.payload.lambda_event(
+                            &advertised_edge,
+                            self.http_signer().as_ref(),
+                        ),
                     },
                 );
             }
@@ -400,6 +544,7 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
                         body: delivery.payload.sqs_body(
                             delivery.raw_message_delivery,
                             &advertised_edge,
+                            self.http_signer().as_ref(),
                         ),
                         delay_seconds: None,
                         message_deduplication_id: delivery
@@ -435,10 +580,11 @@ impl SnsDeliveryDispatcher {
     }
 
     fn http_signer(&self) -> Arc<dyn SnsHttpSigner + Send + Sync> {
-        self.dependencies
-            .http_signer
-            .clone()
-            .unwrap_or_else(|| Arc::new(CloudishSnsHttpSigner))
+        self.dependencies.http_signer.clone().unwrap_or_else(|| {
+            Arc::new(CloudishSnsHttpSigner::new(
+                self.dependencies.advertised_edge.clone(),
+            ))
+        })
     }
 }
 
@@ -489,26 +635,19 @@ impl EventBridgeDeliveryDispatcher for EventBridgeDispatcher {
     }
 
     fn dispatch(&self, deliveries: Vec<EventBridgePlannedDelivery>) {
-        let dependencies = self.dependencies.clone();
-        let _ = thread::Builder::new()
-            .name("eventbridge-dispatch".to_owned())
-            .spawn(move || {
-                for delivery in deliveries {
-                    dispatch_eventbridge_delivery(&dependencies, delivery);
-                }
-            });
+        let _ = self.delivery_worker.enqueue(deliveries);
     }
 }
 
 #[cfg(feature = "step-functions")]
 #[derive(Clone)]
 pub struct LambdaStepFunctionsTaskAdapter {
-    lambda: LambdaService,
+    lambda: Option<LambdaService>,
 }
 
 #[cfg(feature = "step-functions")]
 impl LambdaStepFunctionsTaskAdapter {
-    pub fn new(lambda: LambdaService) -> Self {
+    pub fn new(lambda: Option<LambdaService>) -> Self {
         Self { lambda }
     }
 }
@@ -520,6 +659,14 @@ impl StepFunctionsTaskAdapter for LambdaStepFunctionsTaskAdapter {
         scope: &StepFunctionsScope,
         request: &TaskInvocationRequest,
     ) -> Result<TaskInvocationResult, TaskInvocationFailure> {
+        let Some(lambda) = self.lambda.as_ref() else {
+            return Err(TaskInvocationFailure::new(
+                "ResourceNotFoundException",
+                "Lambda service is disabled.",
+                request.resource(),
+                request.resource_type(),
+            ));
+        };
         let payload =
             serde_json::to_vec(request.payload()).map_err(|error| {
                 TaskInvocationFailure::new(
@@ -533,8 +680,7 @@ impl StepFunctionsTaskAdapter for LambdaStepFunctionsTaskAdapter {
             scope.account_id().clone(),
             scope.region().clone(),
         );
-        let output = self
-            .lambda
+        let output = lambda
             .invoke_target(
                 &lambda_scope,
                 request.target(),
@@ -745,6 +891,20 @@ fn dispatch_eventbridge_delivery(
     }
 }
 
+#[cfg(feature = "eventbridge")]
+fn dispatch_eventbridge_deliveries(
+    dependencies: &EventBridgeDispatcherDependencies,
+    deliveries: Vec<EventBridgePlannedDelivery>,
+    stop_token: &crate::adapters::ThreadWorkQueueStopToken,
+) {
+    for delivery in deliveries {
+        if stop_token.is_stop_requested() {
+            break;
+        }
+        dispatch_eventbridge_delivery(dependencies, delivery);
+    }
+}
+
 #[cfg(any(feature = "s3", feature = "sns"))]
 fn format_epoch_rfc3339(epoch_seconds: u64) -> String {
     OffsetDateTime::from_unix_timestamp(epoch_seconds as i64)
@@ -780,29 +940,35 @@ fn missing_target_error(target_arn: &Arn) -> EventBridgeError {
 #[cfg(all(test, feature = "all-services"))]
 mod tests {
     use super::{
+        ApiGatewayIntegrationExecutor, CloudishSnsHttpSigner,
         LambdaStepFunctionsTaskAdapter, S3NotificationDispatcher,
-        SnsServiceDependencies, build_sns_service,
+        SnsServiceDependencies, build_sns_service, cloudish_sns_signing_key,
         start_lambda_background_tasks,
     };
     use crate::{
-        FixedClock, ManualBackgroundScheduler, MemoryBlobStore,
-        SequenceRandomSource,
+        ApiGatewayScope, ExecuteApiError, ExecuteApiIntegrationExecutor,
+        ExecuteApiIntegrationPlan, ExecuteApiInvocation,
+        ExecuteApiLambdaProxyPlan, FixedClock, ManualBackgroundScheduler,
+        MemoryBlobStore, SequenceRandomSource,
     };
     use aws::{
-        AccountId, Arn, BackgroundScheduler, HttpForwardResponse,
-        HttpForwarder, InfrastructureError, LambdaExecutor,
-        LambdaInvocationRequest, LambdaInvocationResult, RegionId,
-        SharedAdvertisedEdge,
+        AccountId, Arn, BackgroundScheduler, ExecuteApiSourceArn,
+        HttpForwardResponse, HttpForwarder, InfrastructureError,
+        LambdaExecutor, LambdaFunctionTarget, LambdaInvocationRequest,
+        LambdaInvocationResult, RegionId, SharedAdvertisedEdge,
     };
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use iam::{CreateRoleInput, IamScope, IamService};
     use lambda::{
         CreateFunctionInput, LambdaCodeInput, LambdaPackageType, LambdaScope,
         LambdaService, LambdaServiceDependencies,
     };
+    use rsa::pkcs1v15::Pkcs1v15Sign;
     use s3::{
         S3EventNotification, S3NotificationTransport, S3Scope, S3Service,
     };
     use serde_json::json;
+    use sha1::{Digest, Sha1};
     use sns::{CreateTopicInput, SnsHttpSigner, SnsScope, SubscribeInput};
     use sqs::{CreateQueueInput, ReceiveMessageInput, SqsScope, SqsService};
     use std::collections::BTreeMap;
@@ -814,6 +980,7 @@ mod tests {
         StartExecutionInput, StepFunctionsExecutionSpawner,
         StepFunctionsScope, StepFunctionsService,
         StepFunctionsServiceDependencies, StepFunctionsSleeper,
+        StepFunctionsSpawnHandle,
     };
     use storage::{StorageConfig, StorageFactory, StorageMode};
 
@@ -880,6 +1047,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cloudish_sns_http_signer_produces_verifiable_base64_signatures() {
+        let signer =
+            CloudishSnsHttpSigner::new(SharedAdvertisedEdge::default());
+        let string_to_sign =
+            "Message\nhello\nTimestamp\n1970-01-01T00:00:01Z\n";
+        let signature = STANDARD
+            .decode(signer.sign(string_to_sign))
+            .expect("signature should be base64");
+        let digest = Sha1::digest(string_to_sign.as_bytes());
+        let public_key = cloudish_sns_signing_key().to_public_key();
+
+        public_key
+            .verify(Pkcs1v15Sign::new::<Sha1>(), &digest, &signature)
+            .expect("signature should verify with the embedded key");
+        assert_eq!(
+            signer.signing_cert_url(),
+            "http://localhost:4566/__aws/sns/signing-cert.pem"
+        );
+    }
+
     #[derive(Debug, Clone)]
     struct FakeLambdaExecutor {
         response: Arc<Mutex<LambdaInvocationResult>>,
@@ -940,13 +1128,26 @@ mod tests {
     struct InlineSpawner;
 
     impl StepFunctionsExecutionSpawner for InlineSpawner {
-        fn spawn(
+        fn spawn_paused(
             &self,
             _task_name: &str,
             task: Box<dyn FnOnce() + Send>,
-        ) -> Result<(), InfrastructureError> {
-            task();
-            Ok(())
+        ) -> Result<Box<dyn StepFunctionsSpawnHandle>, InfrastructureError>
+        {
+            Ok(Box::new(InlineSpawnHandle { task: Some(task) }))
+        }
+    }
+
+    #[derive(Default)]
+    struct InlineSpawnHandle {
+        task: Option<Box<dyn FnOnce() + Send>>,
+    }
+
+    impl StepFunctionsSpawnHandle for InlineSpawnHandle {
+        fn start(mut self: Box<Self>) {
+            if let Some(task) = self.task.take() {
+                task();
+            }
         }
     }
 
@@ -1087,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn lambda_background_tasks_are_owned_by_app_runtime() {
+    fn lambda_background_tasks_can_be_cancelled() {
         let scheduler = Arc::new(ManualBackgroundScheduler::new());
         let sqs = SqsService::new();
         let lambda = lambda_service(
@@ -1351,6 +1552,50 @@ mod tests {
     }
 
     #[test]
+    fn api_gateway_integration_executor_rejects_missing_lambda_dependency()
+    -> TestResult<()> {
+        let executor = ApiGatewayIntegrationExecutor::new(None, None);
+        let invocation = ExecuteApiInvocation::new(
+            "api-id".to_owned(),
+            ExecuteApiIntegrationPlan::LambdaProxy(Box::new(
+                ExecuteApiLambdaProxyPlan::new(
+                    LambdaFunctionTarget::parse(
+                        "arn:aws:lambda:eu-west-2:000000000000:function:demo",
+                    )?,
+                    br#"{"path":"/pets"}"#.to_vec(),
+                    ExecuteApiSourceArn::from_resource(
+                        &region_id()?,
+                        &account_id()?,
+                        "api-id/dev/GET/pets",
+                    )?,
+                    false,
+                ),
+            )),
+            "/dev/pets".to_owned(),
+            "resource-id".to_owned(),
+            "/pets".to_owned(),
+            "dev".to_owned(),
+        );
+
+        let error = executor
+            .execute(
+                &ApiGatewayScope::new(account_id()?, region_id()?),
+                &invocation,
+            )
+            .expect_err("missing Lambda dependency should fail");
+
+        assert_eq!(
+            error,
+            ExecuteApiError::IntegrationFailure {
+                message: "Internal server error".to_owned(),
+                status_code: 500,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn lambda_step_functions_task_adapter_invokes_lambda_and_returns_json() {
         let sqs = SqsService::new();
         let lambda = lambda_service(
@@ -1366,7 +1611,7 @@ mod tests {
             "arn:aws:lambda:eu-west-2:000000000000:function:demo".to_owned();
         let service = step_functions_service(
             "success",
-            Arc::new(LambdaStepFunctionsTaskAdapter::new(lambda)),
+            Arc::new(LambdaStepFunctionsTaskAdapter::new(Some(lambda))),
         );
         let definition = json!({
             "StartAt": "Task",
@@ -1434,7 +1679,7 @@ mod tests {
             "arn:aws:lambda:eu-west-2:000000000000:function:demo".to_owned();
         let service = step_functions_service(
             "error",
-            Arc::new(LambdaStepFunctionsTaskAdapter::new(lambda)),
+            Arc::new(LambdaStepFunctionsTaskAdapter::new(Some(lambda))),
         );
         let definition = json!({
             "StartAt": "Task",
@@ -1487,6 +1732,71 @@ mod tests {
         assert_eq!(
             described.cause.as_deref(),
             Some("{\"errorMessage\":\"boom\"}")
+        );
+    }
+
+    #[test]
+    fn lambda_step_functions_task_adapter_rejects_missing_lambda_dependency() {
+        let function_arn =
+            "arn:aws:lambda:eu-west-2:000000000000:function:demo".to_owned();
+        let service = step_functions_service(
+            "missing",
+            Arc::new(LambdaStepFunctionsTaskAdapter::new(None)),
+        );
+        let definition = json!({
+            "StartAt": "Task",
+            "States": {
+                "Task": {
+                    "Type": "Task",
+                    "Resource": function_arn,
+                    "End": true
+                }
+            }
+        })
+        .to_string();
+
+        let created = service
+            .create_state_machine(
+                &step_functions_scope()
+                    .expect("Step Functions scope should build"),
+                CreateStateMachineInput {
+                    definition,
+                    name: "missing".to_owned(),
+                    role_arn: "arn:aws:iam::000000000000:role/demo".to_owned(),
+                    state_machine_type: None,
+                },
+            )
+            .expect("state machine should create");
+        let started = service
+            .start_execution(
+                &step_functions_scope()
+                    .expect("Step Functions scope should build"),
+                StartExecutionInput {
+                    input: None,
+                    name: Some("run-missing".to_owned()),
+                    state_machine_arn: created.state_machine_arn,
+                    trace_header: None,
+                },
+            )
+            .expect("execution should start");
+        let described = service
+            .describe_execution(
+                &step_functions_scope()
+                    .expect("Step Functions scope should build"),
+                DescribeExecutionInput {
+                    execution_arn: started.execution_arn,
+                },
+            )
+            .expect("execution should describe");
+
+        assert_eq!(described.status, ExecutionStatus::Failed);
+        assert_eq!(
+            described.error.as_deref(),
+            Some("ResourceNotFoundException")
+        );
+        assert_eq!(
+            described.cause.as_deref(),
+            Some("Lambda service is disabled.")
         );
     }
 }

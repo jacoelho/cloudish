@@ -31,6 +31,6 @@ pub use scope::StepFunctionsScope;
 pub use tasks::{
     StepFunctionsExecutionSpawner, StepFunctionsService,
     StepFunctionsServiceDependencies, StepFunctionsSleeper,
-    StepFunctionsTaskAdapter, TaskInvocationFailure, TaskInvocationRequest,
-    TaskInvocationResult,
+    StepFunctionsSpawnHandle, StepFunctionsTaskAdapter, TaskInvocationFailure,
+    TaskInvocationRequest, TaskInvocationResult,
 };

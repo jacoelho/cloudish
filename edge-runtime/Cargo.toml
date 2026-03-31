@@ -62,6 +62,7 @@ apigateway = { path = "../services/apigateway", optional = true }
 async-trait = "0.1.89"
 auth = { path = "../auth" }
 aws = { path = "../aws" }
+base64 = "0.22.1"
 cloudformation = { path = "../services/cloudformation", optional = true }
 cloudwatch = { path = "../services/cloudwatch", optional = true }
 cognito = { path = "../services/cognito", optional = true }
@@ -77,11 +78,12 @@ lambda = { path = "../services/lambda", optional = true }
 opensrv-mysql = { version = "0.7.0", default-features = false }
 pgwire = { version = "0.38.2", default-features = false, features = ["server-api"] }
 rds = { path = "../services/rds", optional = true }
+rsa = "0.9.8"
 s3 = { path = "../services/s3", optional = true }
 secrets-manager = { path = "../services/secrets-manager", optional = true }
 serde.workspace = true
 serde_json.workspace = true
-sha1 = "0.10.6"
+sha1 = { version = "0.10.6", features = ["oid"] }
 sns = { path = "../services/sns", optional = true }
 sqs = { path = "../services/sqs", optional = true }
 ssm = { path = "../services/ssm", optional = true }

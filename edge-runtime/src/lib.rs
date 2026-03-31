@@ -47,7 +47,9 @@ pub use composition::LambdaStepFunctionsTaskAdapter;
 #[cfg(feature = "s3")]
 pub use composition::S3NotificationDispatcher;
 #[cfg(feature = "sns")]
-pub use composition::{SnsServiceDependencies, build_sns_service};
+pub use composition::{
+    SnsServiceDependencies, build_sns_service, cloudish_sns_signing_cert_pem,
+};
 pub use runtime_services::*;
 pub use runtime_services::{
     EnabledServices, RuntimeServices, RuntimeServicesBuilder,

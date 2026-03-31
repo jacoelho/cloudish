@@ -115,6 +115,32 @@ pub(crate) fn validate_put_targets_input(
     Ok(())
 }
 
+pub(crate) fn validate_target_scope(
+    rule_arn: &Arn,
+    target: &EventBridgeTarget,
+) -> Result<(), EventBridgeError> {
+    let Some(rule_account_id) = rule_arn.account_id() else {
+        return Err(validation(
+            "Rule Arn must include an account and region.",
+        ));
+    };
+    let Some(rule_region) = rule_arn.region() else {
+        return Err(validation(
+            "Rule Arn must include an account and region.",
+        ));
+    };
+    if target.arn.account_id() != Some(rule_account_id)
+        || target.arn.region() != Some(rule_region)
+    {
+        return Err(validation(&format!(
+            "Target Arn {} must match the rule account and region.",
+            target.arn
+        )));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn validate_remove_targets_input(
     input: &RemoveTargetsInput,
 ) -> Result<(), EventBridgeError> {

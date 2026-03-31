@@ -121,17 +121,75 @@ pub trait SnsHttpSigner: Send + Sync {
     fn signing_cert_url(&self) -> String;
 }
 
+struct SignedNotificationView<'a> {
+    message_attributes: BTreeMap<String, Value>,
+    payload: &'a NotificationPayload,
+    signature: String,
+    signature_version: &'static str,
+    signing_cert_url: String,
+    unsubscribe_url: String,
+}
+
+impl SignedNotificationView<'_> {
+    fn notification_json(&self) -> Value {
+        let mut body = serde_json::Map::from_iter([
+            ("Type".to_owned(), json!("Notification")),
+            ("MessageId".to_owned(), json!(&self.payload.message_id)),
+            ("TopicArn".to_owned(), json!(&self.payload.topic_arn)),
+            ("Message".to_owned(), json!(&self.payload.message)),
+            ("Timestamp".to_owned(), json!(&self.payload.timestamp)),
+            ("SignatureVersion".to_owned(), json!(self.signature_version)),
+            ("Signature".to_owned(), json!(&self.signature)),
+            ("SigningCertURL".to_owned(), json!(&self.signing_cert_url)),
+            ("UnsubscribeURL".to_owned(), json!(&self.unsubscribe_url)),
+            ("MessageAttributes".to_owned(), json!(&self.message_attributes)),
+        ]);
+        if let Some(subject) = self.payload.subject.as_deref() {
+            body.insert("Subject".to_owned(), json!(subject));
+        }
+
+        Value::Object(body)
+    }
+
+    fn lambda_event_json(&self) -> Value {
+        json!({
+            "Records": [{
+                "EventSource": "aws:sns",
+                "EventVersion": "1.0",
+                "EventSubscriptionArn": &self.payload.subscription_arn,
+                "Sns": {
+                    "Type": "Notification",
+                    "MessageId": &self.payload.message_id,
+                    "TopicArn": &self.payload.topic_arn,
+                    "Subject": &self.payload.subject,
+                    "Message": &self.payload.message,
+                    "Timestamp": &self.payload.timestamp,
+                    "SignatureVersion": self.signature_version,
+                    "Signature": &self.signature,
+                    "SigningCertUrl": &self.signing_cert_url,
+                    "UnsubscribeUrl": &self.unsubscribe_url,
+                    "MessageAttributes": &self.message_attributes,
+                },
+            }],
+        })
+    }
+}
+
 impl NotificationPayload {
     pub fn http_body(
         &self,
         raw_message_delivery: bool,
         advertised_edge: &AdvertisedEdge,
+        signer: &dyn SnsHttpSigner,
     ) -> Vec<u8> {
         if raw_message_delivery {
             return self.message.as_bytes().to_vec();
         }
 
-        self.notification_json(advertised_edge).to_string().into_bytes()
+        self.signed_notification_view(advertised_edge, signer)
+            .notification_json()
+            .to_string()
+            .into_bytes()
     }
 
     pub fn http_request(
@@ -149,7 +207,8 @@ impl NotificationPayload {
         let body = if raw_message_delivery {
             self.message.as_bytes().to_vec()
         } else {
-            self.signed_notification_json(advertised_edge, signer)
+            self.signed_notification_view(advertised_edge, signer)
+                .notification_json()
                 .to_string()
                 .into_bytes()
         };
@@ -157,96 +216,48 @@ impl NotificationPayload {
         SnsHttpRequest::new(body, headers)
     }
 
-    pub fn lambda_event(&self, advertised_edge: &AdvertisedEdge) -> Vec<u8> {
-        json!({
-            "Records": [{
-                "EventSource": "aws:sns",
-                "EventVersion": "1.0",
-                "EventSubscriptionArn": self.subscription_arn,
-                "Sns": {
-                    "Type": "Notification",
-                    "MessageId": self.message_id,
-                    "TopicArn": self.topic_arn,
-                    "Subject": self.subject,
-                    "Message": self.message,
-                    "Timestamp": self.timestamp,
-                    "SignatureVersion": "1",
-                    "Signature": "CLOUDISH",
-                    "SigningCertUrl": "https://cloudish.invalid/sns.pem",
-                    "UnsubscribeUrl": advertised_edge
-                        .sns_unsubscribe_url(&self.subscription_arn),
-                    "MessageAttributes": notification_message_attributes(&self.message_attributes),
-                },
-            }],
-        })
-        .to_string()
-        .into_bytes()
+    pub fn lambda_event(
+        &self,
+        advertised_edge: &AdvertisedEdge,
+        signer: &dyn SnsHttpSigner,
+    ) -> Vec<u8> {
+        self.signed_notification_view(advertised_edge, signer)
+            .lambda_event_json()
+            .to_string()
+            .into_bytes()
     }
 
     pub fn sqs_body(
         &self,
         raw_message_delivery: bool,
         advertised_edge: &AdvertisedEdge,
+        signer: &dyn SnsHttpSigner,
     ) -> String {
         if raw_message_delivery {
             self.message.clone()
         } else {
-            self.notification_json(advertised_edge).to_string()
+            self.signed_notification_view(advertised_edge, signer)
+                .notification_json()
+                .to_string()
         }
     }
 
-    fn notification_json(&self, advertised_edge: &AdvertisedEdge) -> Value {
-        json!({
-            "Type": "Notification",
-            "MessageId": self.message_id,
-            "TopicArn": self.topic_arn,
-            "Subject": self.subject,
-            "Message": self.message,
-            "Timestamp": self.timestamp,
-            "SignatureVersion": "1",
-            "Signature": "CLOUDISH",
-            "SigningCertURL": "https://cloudish.invalid/sns.pem",
-            "UnsubscribeURL": advertised_edge
-                .sns_unsubscribe_url(&self.subscription_arn),
-            "MessageAttributes": notification_message_attributes(&self.message_attributes),
-        })
-    }
-
-    fn signed_notification_json(
+    fn signed_notification_view(
         &self,
         advertised_edge: &AdvertisedEdge,
         signer: &dyn SnsHttpSigner,
-    ) -> Value {
-        let signature_version = "1";
-        let signature = signer.sign(&notification_string_to_sign(self));
-        let mut body = serde_json::Map::from_iter([
-            ("Type".to_owned(), json!("Notification")),
-            ("MessageId".to_owned(), json!(self.message_id)),
-            ("TopicArn".to_owned(), json!(self.topic_arn)),
-            ("Message".to_owned(), json!(self.message)),
-            ("Timestamp".to_owned(), json!(self.timestamp)),
-            ("SignatureVersion".to_owned(), json!(signature_version)),
-            ("Signature".to_owned(), json!(signature)),
-            ("SigningCertURL".to_owned(), json!(signer.signing_cert_url())),
-            (
-                "UnsubscribeURL".to_owned(),
-                json!(
-                    advertised_edge
-                        .sns_unsubscribe_url(&self.subscription_arn)
-                ),
+    ) -> SignedNotificationView<'_> {
+        SignedNotificationView {
+            message_attributes: notification_message_attributes(
+                &self.message_attributes,
             ),
-            (
-                "MessageAttributes".to_owned(),
-                json!(notification_message_attributes(
-                    &self.message_attributes
-                )),
-            ),
-        ]);
-        if let Some(subject) = &self.subject {
-            body.insert("Subject".to_owned(), json!(subject));
+            payload: self,
+            signature: signer.sign(&notification_string_to_sign(self)),
+            signature_version: "1",
+            signing_cert_url: signer.signing_cert_url(),
+            unsubscribe_url: advertised_edge
+                .sns_unsubscribe_url(&self.subscription_arn),
         }
-
-        Value::Object(body)
     }
 }
 

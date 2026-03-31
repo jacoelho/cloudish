@@ -12,3 +12,4 @@ workspace = true
 aws = { path = "../../aws" }
 serde_json.workspace = true
 thiserror.workspace = true
+time = { version = "0.3.47", features = ["formatting"] }

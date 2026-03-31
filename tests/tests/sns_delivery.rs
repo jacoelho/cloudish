@@ -460,6 +460,70 @@ async fn sns_delivery_publish_batch_reports_partial_failure() {
     assert!(runtime.state_directory().exists());
 }
 
+#[tokio::test]
+async fn sns_delivery_non_raw_sqs_envelope_uses_signed_fields() {
+    let runtime = shared_runtime().await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let sns = SnsClient::new(&config);
+    let sqs = SqsClient::new(&config);
+
+    let queue_name = lambda_fixture::unique_name("sns-signed-queue");
+    let queue_url = sqs
+        .create_queue()
+        .queue_name(&queue_name)
+        .send()
+        .await
+        .expect("queue should create")
+        .queue_url()
+        .expect("queue url should exist")
+        .to_owned();
+    let queue_arn = format!("arn:aws:sqs:eu-west-2:000000000000:{queue_name}");
+    let topic_arn = sns
+        .create_topic()
+        .name(lambda_fixture::unique_name("sns-signed-topic"))
+        .send()
+        .await
+        .expect("topic should create")
+        .topic_arn()
+        .expect("topic arn should exist")
+        .to_owned();
+
+    sns.subscribe()
+        .topic_arn(&topic_arn)
+        .protocol("sqs")
+        .endpoint(&queue_arn)
+        .send()
+        .await
+        .expect("queue subscription should create");
+    sns.publish()
+        .topic_arn(&topic_arn)
+        .message(r#"{"detail":{"kind":"invoice"}}"#)
+        .send()
+        .await
+        .expect("publish should succeed");
+
+    let queue_message =
+        wait_for_message(&sqs, &queue_url, "signed sns sqs delivery").await;
+    let envelope: serde_json::Value = serde_json::from_str(
+        queue_message.body().expect("queue delivery should contain a body"),
+    )
+    .expect("queue delivery should be a JSON SNS envelope");
+
+    assert_eq!(envelope["Type"], "Notification");
+    assert_eq!(envelope["SignatureVersion"], "1");
+    assert_ne!(envelope["Signature"].as_str(), Some("CLOUDISH"),);
+    assert!(
+        envelope["SigningCertURL"]
+            .as_str()
+            .expect("signing cert url should exist")
+            .contains("/__aws/sns/signing-cert.pem")
+    );
+}
+
 async fn wait_for_message(
     sqs: &SqsClient,
     queue_url: &str,

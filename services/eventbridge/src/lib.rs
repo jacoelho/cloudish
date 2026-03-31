@@ -50,7 +50,7 @@ use crate::rules::{
 use crate::targets::{
     normalize_target_limit, put_targets_failure, put_targets_output,
     remove_targets_output, render_target_payload, validate_put_targets_input,
-    validate_remove_targets_input,
+    validate_remove_targets_input, validate_target_scope,
 };
 use aws::{BackgroundScheduler, Clock, ScheduledTaskHandle};
 use std::collections::BTreeMap;
@@ -281,10 +281,7 @@ impl EventBridgeService {
             state: validated.state,
             targets: existing.map(|rule| rule.targets).unwrap_or_default(),
         };
-        self.rule_store
-            .put(key.clone(), stored.clone())
-            .map_err(|source| storage_error("writing rule state", source))?;
-        self.sync_rule_schedule(&key, &stored)?;
+        self.persist_rule_with_schedule(&key, stored)?;
 
         Ok(PutRuleOutput { rule_arn: key.rule_arn() })
     }
@@ -424,6 +421,10 @@ impl EventBridgeService {
         let mut failed_entries = Vec::new();
 
         for target in input.targets {
+            if let Err(error) = validate_target_scope(&rule_arn, &target) {
+                failed_entries.push(put_targets_failure(&target.id, &error));
+                continue;
+            }
             if let Err(error) =
                 self.dispatcher.validate_target(scope, &rule_arn, &target)
             {
@@ -605,6 +606,7 @@ impl EventBridgeService {
             .values()
             .cloned()
             .map(|target| {
+                validate_target_scope(&key.rule_arn(), &target)?;
                 Ok(EventBridgePlannedDelivery {
                     payload: render_target_payload(&target, event)?,
                     rule_arn: key.rule_arn(),
@@ -624,10 +626,7 @@ impl EventBridgeService {
         let key = self.rule_key(scope, event_bus_name, name)?;
         let mut rule = self.load_rule(&key)?;
         rule.state = state;
-        self.rule_store
-            .put(key.clone(), rule.clone())
-            .map_err(|source| storage_error("writing rule state", source))?;
-        self.sync_rule_schedule(&key, &rule)
+        self.persist_rule_with_schedule(&key, rule)
     }
 
     fn rule_key(
@@ -688,12 +687,41 @@ impl EventBridgeService {
         rule: &StoredRule,
     ) -> Result<(), EventBridgeError> {
         let rule_arn = key.rule_arn().to_string();
-        self.cancel_rule_schedule(&rule_arn)?;
+        let handle = self.stage_rule_schedule(key, rule)?;
+        self.replace_rule_schedule(&rule_arn, handle)
+    }
+
+    fn persist_rule_with_schedule(
+        &self,
+        key: &EventBridgeRuleKey,
+        rule: StoredRule,
+    ) -> Result<(), EventBridgeError> {
+        let rule_arn = key.rule_arn().to_string();
+        let staged_handle = self.stage_rule_schedule(key, &rule)?;
+        if let Err(error) = self
+            .rule_store
+            .put(key.clone(), rule)
+            .map_err(|source| storage_error("writing rule state", source))
+        {
+            if let Some(handle) = staged_handle {
+                let _ = handle.cancel();
+            }
+            return Err(error);
+        }
+
+        self.replace_rule_schedule(&rule_arn, staged_handle)
+    }
+
+    fn stage_rule_schedule(
+        &self,
+        key: &EventBridgeRuleKey,
+        rule: &StoredRule,
+    ) -> Result<Option<Box<dyn ScheduledTaskHandle>>, EventBridgeError> {
         let Some(schedule) = rule.schedule_expression.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         if !rule.state.is_enabled() || key.bus_name != DEFAULT_EVENT_BUS_NAME {
-            return Ok(());
+            return Ok(None);
         }
 
         let service = self.clone();
@@ -701,8 +729,7 @@ impl EventBridgeService {
         let bus_name = key.bus_name.clone();
         let rule_name = key.name.clone();
         let scheduled_rule_name = rule_name.clone();
-        let handle = self
-            .scheduler
+        self.scheduler
             .schedule_repeating(
                 format!("eventbridge-rule-{bus_name}-{rule_name}"),
                 schedule.interval(),
@@ -714,15 +741,38 @@ impl EventBridgeService {
                     );
                 }),
             )
+            .map(Some)
             .map_err(|source| EventBridgeError::InternalFailure {
                 message: format!(
                     "Failed to schedule EventBridge rule {rule_name}: {source}"
                 ),
+            })
+    }
+
+    fn replace_rule_schedule(
+        &self,
+        rule_arn: &str,
+        handle: Option<Box<dyn ScheduledTaskHandle>>,
+    ) -> Result<(), EventBridgeError> {
+        let previous = {
+            let mut scheduled_rules = self
+                .scheduled_rules
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match handle {
+                Some(handle) => {
+                    scheduled_rules.insert(rule_arn.to_owned(), handle)
+                }
+                None => scheduled_rules.remove(rule_arn),
+            }
+        };
+        if let Some(handle) = previous {
+            handle.cancel().map_err(|source| EventBridgeError::InternalFailure {
+                message: format!(
+                    "Failed to cancel EventBridge rule schedule {rule_arn}: {source}"
+                ),
             })?;
-        self.scheduled_rules
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(rule_arn, handle);
+        }
 
         Ok(())
     }
@@ -1161,6 +1211,157 @@ mod tests {
         assert_eq!(output.failed_entry_count, 1);
         assert!(output.entries[0].event_id.is_none());
         assert!(output.entries[1].event_id.is_some());
+    }
+
+    #[test]
+    fn put_targets_rejects_cross_account_and_cross_region_target_arns() {
+        let (service, _, _) = service("target-scope");
+        let scope = scope();
+
+        service
+            .put_rule(
+                &scope,
+                PutRuleInput {
+                    description: None,
+                    event_bus_name: None,
+                    event_pattern: Some(
+                        "{\"source\":[\"orders\"]}".to_owned(),
+                    ),
+                    name: "orders-created".to_owned(),
+                    role_arn: None,
+                    schedule_expression: None,
+                    state: None,
+                },
+            )
+            .expect("rule should create");
+
+        let output = service
+            .put_targets(
+                &scope,
+                PutTargetsInput {
+                    event_bus_name: None,
+                    rule: "orders-created".to_owned(),
+                    targets: vec![
+                        EventBridgeTarget {
+                            arn: "arn:aws:sqs:us-east-1:000000000000:orders"
+                                .parse()
+                                .expect("SQS target ARN should parse"),
+                            id: "cross-region".to_owned(),
+                            input: None,
+                            input_path: None,
+                            input_transformer: None,
+                            role_arn: None,
+                        },
+                        EventBridgeTarget {
+                            arn: "arn:aws:lambda:eu-west-2:111111111111:function:processor"
+                                .parse()
+                                .expect("Lambda target ARN should parse"),
+                            id: "cross-account".to_owned(),
+                            input: None,
+                            input_path: None,
+                            input_transformer: None,
+                            role_arn: None,
+                        },
+                    ],
+                },
+            )
+            .expect("put targets should return failure entries");
+
+        assert_eq!(output.failed_entry_count, 2);
+        assert!(output.failed_entries.iter().all(|entry| {
+            entry.error_code == "ValidationException"
+                && entry
+                    .error_message
+                    .contains("must match the rule account and region")
+        }));
+        assert!(
+            service
+                .list_targets_by_rule(
+                    &scope,
+                    ListTargetsByRuleInput {
+                        event_bus_name: None,
+                        limit: Some(10),
+                        next_token: None,
+                        rule: "orders-created".to_owned(),
+                    },
+                )
+                .expect("targets should list")
+                .targets
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn put_events_rejects_persisted_cross_scope_targets_before_dispatch() {
+        let (service, dispatcher, _) = service("persisted-target-scope");
+        let scope = scope();
+
+        service
+            .put_rule(
+                &scope,
+                PutRuleInput {
+                    description: None,
+                    event_bus_name: None,
+                    event_pattern: Some(
+                        "{\"source\":[\"orders\"]}".to_owned(),
+                    ),
+                    name: "orders-created".to_owned(),
+                    role_arn: None,
+                    schedule_expression: None,
+                    state: None,
+                },
+            )
+            .expect("rule should create");
+
+        let key = super::EventBridgeRuleKey::new(
+            &scope,
+            super::DEFAULT_EVENT_BUS_NAME,
+            "orders-created",
+        )
+        .expect("rule key should build");
+        let mut stored =
+            service.rule_store.get(&key).expect("stored rule should exist");
+        stored.targets.insert(
+            "cross-region".to_owned(),
+            EventBridgeTarget {
+                arn: "arn:aws:sqs:us-east-1:000000000000:orders"
+                    .parse()
+                    .expect("SQS target ARN should parse"),
+                id: "cross-region".to_owned(),
+                input: None,
+                input_path: None,
+                input_transformer: None,
+                role_arn: None,
+            },
+        );
+        service
+            .rule_store
+            .put(key, stored)
+            .expect("persisted rule should update");
+
+        let error = service
+            .put_events(
+                &scope,
+                PutEventsInput {
+                    entries: vec![PutEventsRequestEntry {
+                        detail: "{\"kind\":\"queued\"}".to_owned(),
+                        detail_type: "Created".to_owned(),
+                        event_bus_name: None,
+                        resources: Vec::new(),
+                        source: "orders".to_owned(),
+                        time: None,
+                        trace_header: None,
+                    }],
+                },
+            )
+            .expect_err("persisted mismatched target should fail");
+
+        assert!(matches!(
+            error,
+            EventBridgeError::Validation { ref message }
+                if message.contains("must match the rule account and region")
+        ));
+        assert_eq!(dispatcher.delivery_count(), 0);
     }
 
     #[test]

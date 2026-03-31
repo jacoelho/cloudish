@@ -60,9 +60,11 @@ use serde_json::{Value, json};
 use services::FunctionUrlInvocationInput;
 #[cfg(feature = "s3")]
 use services::S3Scope;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 const REQUEST_ID: &str = "0000000000000000";
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 const JSON_10_TARGET_PREFIXES: [(&str, ServiceName); 6] = [
     ("DynamoDB_20120810.", ServiceName::DynamoDb),
     ("DynamoDBStreams_20120810.", ServiceName::DynamoDb),
@@ -104,6 +106,21 @@ pub struct EdgeRouter {
     services: EnabledServices,
 }
 
+#[derive(Clone)]
+pub struct EdgeRequestExecutor {
+    router: EdgeRouter,
+}
+
+impl EdgeRequestExecutor {
+    pub fn execute(
+        &self,
+        request: EdgeRequest,
+        request_cancellation: &AtomicBool,
+    ) -> EdgeResponse {
+        self.router.route(request, request_cancellation)
+    }
+}
+
 impl EdgeRouter {
     pub fn new(
         defaults: RuntimeDefaults,
@@ -115,7 +132,12 @@ impl EdgeRouter {
         Self { advertised_edge, defaults, authenticator, runtime, services }
     }
 
+    pub fn begin_shutdown(&self) {
+        self.runtime.begin_shutdown();
+    }
+
     pub fn shutdown(&self) {
+        self.begin_shutdown();
         self.runtime.shutdown();
     }
 
@@ -130,25 +152,37 @@ impl EdgeRouter {
     }
 
     pub fn handle_request(&self, request: EdgeRequest) -> EdgeResponse {
-        self.route(request)
+        self.route(request, &NEVER_CANCELLED)
     }
 
-    fn route(&self, request: EdgeRequest) -> EdgeResponse {
+    pub fn request_executor(&self) -> EdgeRequestExecutor {
+        EdgeRequestExecutor { router: self.clone() }
+    }
+
+    fn route(
+        &self,
+        request: EdgeRequest,
+        request_cancellation: &AtomicBool,
+    ) -> EdgeResponse {
         if let Some(response) = self.internal_route(&request) {
             return response;
         }
 
-        if let Some(response) =
-            self.route_reserved_lambda_function_url(&request)
+        if let Some(response) = self
+            .route_reserved_lambda_function_url(&request, request_cancellation)
         {
             return response;
         }
 
-        if let Some(response) = self.route_reserved_execute_api(&request) {
+        if let Some(response) =
+            self.route_reserved_execute_api(&request, request_cancellation)
+        {
             return response;
         }
 
-        if let Some(response) = self.route_function_url(&request) {
+        if let Some(response) =
+            self.route_function_url(&request, request_cancellation)
+        {
             return response;
         }
 
@@ -193,15 +227,23 @@ impl EdgeRouter {
             .map(VerifiedSignature::verified_request);
 
         let response = match protocol {
-            ProtocolFamily::Query => {
-                self.route_query(&request, verified_request)
-            }
-            ProtocolFamily::AwsJson10 | ProtocolFamily::AwsJson11 => {
-                self.route_json(&request, protocol, verified_request)
-            }
-            ProtocolFamily::RestJson => {
-                self.route_rest_json(&request, verified_request)
-            }
+            ProtocolFamily::Query => self.route_query(
+                &request,
+                verified_request,
+                request_cancellation,
+            ),
+            ProtocolFamily::AwsJson10 | ProtocolFamily::AwsJson11 => self
+                .route_json(
+                    &request,
+                    protocol,
+                    verified_request,
+                    request_cancellation,
+                ),
+            ProtocolFamily::RestJson => self.route_rest_json(
+                &request,
+                verified_request,
+                request_cancellation,
+            ),
             ProtocolFamily::SmithyRpcV2Cbor => {
                 self.route_smithy_cbor(&request, verified_request)
             }
@@ -217,6 +259,7 @@ impl EdgeRouter {
     fn route_reserved_lambda_function_url(
         &self,
         request: &HttpRequest<'_>,
+        request_cancellation: &AtomicBool,
     ) -> Option<EdgeResponse> {
         let function_url = parse_reserved_lambda_function_url_path(
             request.path_without_query(),
@@ -226,6 +269,7 @@ impl EdgeRouter {
             function_url.region(),
             function_url.url_id(),
             function_url.request_path(),
+            request_cancellation,
         )
     }
 
@@ -233,6 +277,7 @@ impl EdgeRouter {
     fn route_reserved_lambda_function_url(
         &self,
         _request: &HttpRequest<'_>,
+        _request_cancellation: &AtomicBool,
     ) -> Option<EdgeResponse> {
         None
     }
@@ -241,6 +286,7 @@ impl EdgeRouter {
     fn route_function_url(
         &self,
         request: &HttpRequest<'_>,
+        request_cancellation: &AtomicBool,
     ) -> Option<EdgeResponse> {
         let host = request.header("host")?;
         let function_url = parse_function_url_host(host)?;
@@ -250,6 +296,7 @@ impl EdgeRouter {
             &function_url.region,
             &function_url.url_id,
             request.path_without_query(),
+            request_cancellation,
         )
     }
 
@@ -260,6 +307,7 @@ impl EdgeRouter {
         region: &RegionId,
         url_id: &str,
         request_path: &str,
+        request_cancellation: &AtomicBool,
     ) -> Option<EdgeResponse> {
         if !self.services.is_enabled(ServiceName::Lambda) {
             return Some(EdgeResponse::json(
@@ -298,31 +346,37 @@ impl EdgeRouter {
                     return Some(function_url_lambda_error_response(&error));
                 }
             };
-        let output = match self.runtime.lambda().invoke_resolved_function_url(
-            &resolved,
-            FunctionUrlInvocationInput {
-                body: request.body().to_vec(),
-                headers: request
-                    .headers()
-                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
-                    .collect(),
-                method: request.method().to_owned(),
-                path: request_path.to_owned(),
-                protocol: None,
-                query_string: request.query_string().map(str::to_owned),
-                source_ip: request.source_ip().map(str::to_owned),
-                domain_name: self
-                    .advertised_edge
-                    .current()
-                    .lambda_function_domain_name(),
-            },
-            verified_request.as_ref().map(VerifiedRequest::caller_identity),
-        ) {
-            Ok(output) => output,
-            Err(error) => {
-                return Some(function_url_lambda_error_response(&error));
-            }
-        };
+        let output =
+            match self.runtime.lambda_requests().invoke_resolved_function_url(
+                &resolved,
+                FunctionUrlInvocationInput {
+                    body: request.body().to_vec(),
+                    headers: request
+                        .headers()
+                        .map(|(name, value)| {
+                            (name.to_owned(), value.to_owned())
+                        })
+                        .collect(),
+                    method: request.method().to_owned(),
+                    path: request_path.to_owned(),
+                    protocol: None,
+                    query_string: request.query_string().map(str::to_owned),
+                    source_ip: request.source_ip().map(str::to_owned),
+                    domain_name: self
+                        .advertised_edge
+                        .current()
+                        .lambda_function_domain_name(),
+                },
+                verified_request
+                    .as_ref()
+                    .map(VerifiedRequest::caller_identity),
+                &|| request_cancellation.load(Ordering::SeqCst),
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    return Some(function_url_lambda_error_response(&error));
+                }
+            };
 
         let content_type = output
             .headers()
@@ -354,6 +408,7 @@ impl EdgeRouter {
     fn route_function_url(
         &self,
         _request: &HttpRequest<'_>,
+        _request_cancellation: &AtomicBool,
     ) -> Option<EdgeResponse> {
         None
     }
@@ -362,6 +417,7 @@ impl EdgeRouter {
     fn route_reserved_execute_api(
         &self,
         request: &HttpRequest<'_>,
+        request_cancellation: &AtomicBool,
     ) -> Option<EdgeResponse> {
         let execute_api =
             parse_reserved_execute_api_path(request.path_without_query())?;
@@ -369,6 +425,7 @@ impl EdgeRouter {
             request,
             execute_api.api_id(),
             execute_api.request_path(),
+            request_cancellation,
         ))
     }
 
@@ -376,6 +433,7 @@ impl EdgeRouter {
     fn route_reserved_execute_api(
         &self,
         _request: &HttpRequest<'_>,
+        _request_cancellation: &AtomicBool,
     ) -> Option<EdgeResponse> {
         None
     }
@@ -386,6 +444,7 @@ impl EdgeRouter {
         request: &HttpRequest<'_>,
         api_id: &str,
         request_path: &str,
+        request_cancellation: &AtomicBool,
     ) -> EdgeResponse {
         let execute_request = build_execute_api_request(request, request_path);
 
@@ -433,8 +492,12 @@ impl EdgeRouter {
             );
         }
 
-        match self.runtime.execute_api_executor().execute(&scope, &invocation)
-        {
+        let is_cancelled = || request_cancellation.load(Ordering::SeqCst);
+        match self.runtime.execute_api_executor().execute_with_cancellation(
+            &scope,
+            &invocation,
+            &is_cancelled,
+        ) {
             Ok(response) => {
                 let content_type = response
                     .headers()
@@ -514,6 +577,31 @@ impl EdgeRouter {
             });
         }
 
+        #[cfg(feature = "sns")]
+        if request.path_without_query() == "/__aws/sns/signing-cert.pem" {
+            if request.method() != "GET" {
+                return Some(
+                    EdgeResponse::json(
+                        405,
+                        json!({ "message": "method not allowed" }),
+                    )
+                    .with_header("Allow", "GET"),
+                );
+            }
+            if !self.services.is_enabled(ServiceName::Sns) {
+                return Some(EdgeResponse::json(
+                    404,
+                    json!({ "message": "not found" }),
+                ));
+            }
+
+            return Some(EdgeResponse::bytes(
+                200,
+                "application/x-pem-file",
+                edge_runtime::cloudish_sns_signing_cert_pem().to_vec(),
+            ));
+        }
+
         match (request.method(), request.path_without_query()) {
             ("GET", "/__cloudish/health") => Some(self.health_response()),
             ("GET", "/__cloudish/status") => Some(self.status_response()),
@@ -532,6 +620,7 @@ impl EdgeRouter {
         &self,
         request: &HttpRequest<'_>,
         verified_request: Option<&VerifiedRequest>,
+        request_cancellation: &AtomicBool,
     ) -> EdgeResponse {
         let parsed_query = match parse_query_request(request) {
             Ok(Some(parsed_query)) => parsed_query,
@@ -644,11 +733,14 @@ impl EdgeRouter {
         #[cfg(feature = "sqs")]
         if service == ServiceName::Sqs {
             let advertised_edge = self.advertised_edge.current();
+            let sqs_requests = self.runtime.sqs_requests();
             return match sqs::handle_query(
                 self.runtime.sqs(),
+                &sqs_requests,
                 &advertised_edge,
                 &normalized_request,
                 &context,
+                request_cancellation,
             ) {
                 Ok(body) => {
                     EdgeResponse::bytes(200, "text/xml", body.into_bytes())
@@ -738,6 +830,7 @@ impl EdgeRouter {
         request: &HttpRequest<'_>,
         protocol: ProtocolFamily,
         verified_request: Option<&VerifiedRequest>,
+        request_cancellation: &AtomicBool,
     ) -> EdgeResponse {
         let target = request.header("x-amz-target");
         let route = match resolve_json_route(
@@ -766,11 +859,14 @@ impl EdgeRouter {
         #[cfg(feature = "sqs")]
         if route.service == ServiceName::Sqs && route.operation.is_some() {
             let advertised_edge = self.advertised_edge.current();
+            let sqs_requests = self.runtime.sqs_requests();
             return match sqs::handle_json(
                 self.runtime.sqs(),
+                &sqs_requests,
                 &advertised_edge,
                 request,
                 &context,
+                request_cancellation,
             ) {
                 Ok(body) => EdgeResponse::bytes(
                     200,
@@ -1052,6 +1148,7 @@ impl EdgeRouter {
         &self,
         request: &HttpRequest<'_>,
         verified_request: Option<&VerifiedRequest>,
+        request_cancellation: &AtomicBool,
     ) -> EdgeResponse {
         let Some(service) = rest_json_service(request) else {
             return EdgeResponse::json(404, json!({ "message": "not found" }));
@@ -1086,11 +1183,14 @@ impl EdgeRouter {
             #[cfg(feature = "lambda")]
             ServiceName::Lambda => {
                 let advertised_edge = self.advertised_edge.current();
+                let lambda_requests = self.runtime.lambda_requests();
                 match lambda::handle_rest_json(
                     self.runtime.lambda(),
+                    &lambda_requests,
                     &advertised_edge,
                     request,
                     &context,
+                    request_cancellation,
                 ) {
                     Ok(response) => response,
                     Err(error) => {
@@ -4154,6 +4254,37 @@ mod tests {
     }
 
     #[test]
+    fn runtime_sns_signing_cert_route_serves_the_embedded_pem() {
+        let response = router().handle_bytes(
+            b"GET /__aws/sns/signing-cert.pem HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(
+            header_value(&headers, "content-type"),
+            Some("application/x-pem-file")
+        );
+        assert_eq!(body, edge_runtime::cloudish_sns_signing_cert_pem());
+    }
+
+    #[test]
+    fn runtime_sns_signing_cert_route_rejects_non_get_methods() {
+        let response = router().handle_bytes(
+            b"POST /__aws/sns/signing-cert.pem HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+        let body: Value = serde_json::from_slice(body)
+            .expect("error body should be valid JSON");
+
+        assert_eq!(status, "HTTP/1.1 405 Method Not Allowed");
+        assert_eq!(header_value(&headers, "allow"), Some("GET"));
+        assert_eq!(body["message"], "method not allowed");
+    }
+
+    #[test]
     fn runtime_internal_endpoints_reject_non_get_methods() {
         let response = router().handle_bytes(
             b"POST /__cloudish/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -5056,6 +5187,7 @@ mod tests {
             &request,
             ProtocolFamily::AwsJson10,
             Some(&verified_request),
+            &super::NEVER_CANCELLED,
         );
         let response_bytes = response.to_http_bytes();
         let (status, headers, body) = split_response(&response_bytes);
@@ -5389,7 +5521,11 @@ mod tests {
             ),
             None,
         );
-        let response = router().route_query(&request, Some(&verified_request));
+        let response = router().route_query(
+            &request,
+            Some(&verified_request),
+            &super::NEVER_CANCELLED,
+        );
         let response_bytes = response.to_http_bytes();
         let (status, headers, body) = split_response(&response_bytes);
         let body =

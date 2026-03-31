@@ -1053,6 +1053,10 @@ mod tests {
     #[test]
     fn sns_delivery_payload_helpers_encode_http_sqs_and_lambda_messages() {
         let advertised_edge = AdvertisedEdge::default();
+        let signer = TestHttpSigner {
+            signature: "signed-message".to_owned(),
+            signing_cert_url: "https://example.com/cert.pem".to_owned(),
+        };
         let payload = NotificationPayload {
             message: r#"{"hello":"world"}"#.to_owned(),
             message_attributes: BTreeMap::from([(
@@ -1077,30 +1081,42 @@ mod tests {
         };
 
         let http_body: serde_json::Value = serde_json::from_slice(
-            &payload.http_body(false, &advertised_edge),
+            &payload.http_body(false, &advertised_edge, &signer),
         )
         .expect("http body should be JSON");
         assert_eq!(http_body["Type"], "Notification");
         assert_eq!(http_body["Subject"], "Orders");
         assert_eq!(http_body["Message"], r#"{"hello":"world"}"#);
         assert_eq!(
-            payload.sqs_body(true, &advertised_edge),
+            payload.sqs_body(true, &advertised_edge, &signer),
             r#"{"hello":"world"}"#
         );
 
-        let sqs_body: serde_json::Value =
-            serde_json::from_str(&payload.sqs_body(false, &advertised_edge))
-                .expect("sqs body should be JSON");
+        let sqs_body: serde_json::Value = serde_json::from_str(
+            &payload.sqs_body(false, &advertised_edge, &signer),
+        )
+        .expect("sqs body should be JSON");
         assert_eq!(sqs_body["Message"], r#"{"hello":"world"}"#);
         assert_eq!(sqs_body["MessageAttributes"]["store"]["Value"], "eu-west");
+        assert_eq!(sqs_body["Signature"], "signed-message");
+        assert_eq!(sqs_body["SigningCertURL"], "https://example.com/cert.pem");
 
-        let lambda_event: serde_json::Value =
-            serde_json::from_slice(&payload.lambda_event(&advertised_edge))
-                .expect("lambda event should be JSON");
+        let lambda_event: serde_json::Value = serde_json::from_slice(
+            &payload.lambda_event(&advertised_edge, &signer),
+        )
+        .expect("lambda event should be JSON");
         assert_eq!(lambda_event["Records"][0]["EventSource"], "aws:sns");
         assert_eq!(
             lambda_event["Records"][0]["Sns"]["Message"],
             r#"{"hello":"world"}"#
+        );
+        assert_eq!(
+            lambda_event["Records"][0]["Sns"]["Signature"],
+            "signed-message"
+        );
+        assert_eq!(
+            lambda_event["Records"][0]["Sns"]["SigningCertUrl"],
+            "https://example.com/cert.pem"
         );
     }
 

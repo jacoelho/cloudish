@@ -341,19 +341,35 @@ mod tests {
     };
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
+    use step_functions::StepFunctionsSpawnHandle;
     use storage::{StorageConfig, StorageFactory, StorageMode};
 
     #[derive(Debug, Default)]
     struct InlineSpawner;
 
     impl services::StepFunctionsExecutionSpawner for InlineSpawner {
-        fn spawn(
+        fn spawn_paused(
             &self,
             _task_name: &str,
             task: Box<dyn FnOnce() + Send>,
-        ) -> Result<(), services::InfrastructureError> {
-            task();
-            Ok(())
+        ) -> Result<
+            Box<dyn StepFunctionsSpawnHandle>,
+            services::InfrastructureError,
+        > {
+            Ok(Box::new(InlineSpawnHandle { task: Some(task) }))
+        }
+    }
+
+    #[derive(Default)]
+    struct InlineSpawnHandle {
+        task: Option<Box<dyn FnOnce() + Send>>,
+    }
+
+    impl StepFunctionsSpawnHandle for InlineSpawnHandle {
+        fn start(mut self: Box<Self>) {
+            if let Some(task) = self.task.take() {
+                task();
+            }
         }
     }
 

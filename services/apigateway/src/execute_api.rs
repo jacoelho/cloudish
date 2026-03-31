@@ -297,6 +297,23 @@ pub trait ExecuteApiIntegrationExecutor: Send + Sync {
         scope: &ApiGatewayScope,
         invocation: &ExecuteApiInvocation,
     ) -> Result<ExecuteApiPreparedResponse, ExecuteApiError>;
+
+    /// Executes an API Gateway integration with an optional request-scoped
+    /// cancellation boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecuteApiError`] when the downstream integration cannot be
+    /// invoked or its response cannot be mapped into an execute-api response.
+    fn execute_with_cancellation(
+        &self,
+        scope: &ApiGatewayScope,
+        invocation: &ExecuteApiInvocation,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<ExecuteApiPreparedResponse, ExecuteApiError> {
+        let _ = is_cancelled;
+        self.execute(scope, invocation)
+    }
 }
 
 impl ExecuteApiError {

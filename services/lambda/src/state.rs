@@ -108,7 +108,6 @@ const MAX_EVENT_PAYLOAD_BYTES: usize = 1_048_576;
 const MAX_REQUEST_RESPONSE_PAYLOAD_BYTES: usize = 6 * 1_048_576;
 const PRECONDITION_FAILED_MESSAGE: &str = "The Revision Id provided does not match the latest Revision Id. Call the \
      GetFunction/GetAlias API to retrieve the latest Revision Id";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LambdaPackageType {
     Image,
@@ -155,6 +154,22 @@ struct AsyncFailureDelivery<'a> {
     status_code: u16,
     function_error: Option<&'a str>,
     response_payload: serde_json::Value,
+}
+
+enum AsyncInvocationProcessingOutcome {
+    Handled,
+    Retry { attempt_count: u32, pending: PendingAsyncInvocation },
+}
+
+struct AsyncInvocationCycleFailure {
+    error: LambdaError,
+    pending: PendingAsyncInvocation,
+}
+
+impl AsyncInvocationCycleFailure {
+    fn new(pending: &PendingAsyncInvocation, error: LambdaError) -> Self {
+        Self { error, pending: pending.clone() }
+    }
 }
 
 #[derive(Clone)]
@@ -447,6 +462,9 @@ impl LambdaService {
             self.blob_store.delete(&blob_key).map_err(LambdaError::Blob)?;
         }
 
+        self.clear_pending_sqs_batches(
+            state.event_source_mappings.keys().cloned().collect::<Vec<_>>(),
+        );
         self.function_store.delete(scope, &key).map_err(LambdaError::Store)
     }
 
@@ -1512,6 +1530,7 @@ impl LambdaService {
             }
             mapping.last_modified_epoch_seconds =
                 service.now_epoch_seconds()?;
+            service.clear_pending_sqs_batch(&mapping.uuid);
 
             Ok(service.event_source_mapping_output(scope, mapping, None))
         })
@@ -1544,6 +1563,7 @@ impl LambdaService {
             &mapping,
             Some("Deleting"),
         );
+        self.clear_pending_sqs_batch(&mapping.uuid);
         self.function_store
             .put(scope, key, state)
             .map_err(LambdaError::Store)?;
@@ -1587,6 +1607,25 @@ impl LambdaService {
         target: &ResolvedFunctionUrlTarget,
         input: FunctionUrlInvocationInput,
         caller_identity: Option<&CallerIdentity>,
+    ) -> Result<FunctionUrlInvocationOutput, LambdaError> {
+        self.invoke_resolved_function_url_with_cancellation(
+            target,
+            input,
+            caller_identity,
+            &|| false,
+        )
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the resolved function URL target is missing,
+    /// permissions reject the caller, or Lambda execution fails.
+    pub(crate) fn invoke_resolved_function_url_with_cancellation(
+        &self,
+        target: &ResolvedFunctionUrlTarget,
+        input: FunctionUrlInvocationInput,
+        caller_identity: Option<&CallerIdentity>,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<FunctionUrlInvocationOutput, LambdaError> {
         let key =
             LambdaFunctionKey::new(target.scope(), target.function_name());
@@ -1638,11 +1677,12 @@ impl LambdaService {
             self.now_epoch_millis()?,
             self.next_revision_id()?,
         )?;
-        let output = self.execute_request_response(
+        let output = self.execute_request_response_with_cancellation(
             target.scope(),
             target.function_name(),
             target.qualifier(),
             payload,
+            &is_cancelled,
         )?;
 
         map_function_url_response(output.payload())
@@ -1658,6 +1698,27 @@ impl LambdaService {
         url_id: &str,
         input: FunctionUrlInvocationInput,
         caller_identity: Option<&CallerIdentity>,
+    ) -> Result<FunctionUrlInvocationOutput, LambdaError> {
+        self.invoke_function_url_with_cancellation(
+            scope,
+            url_id,
+            input,
+            caller_identity,
+            &|| false,
+        )
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the function URL cannot be resolved, URL
+    /// permissions reject the caller, or Lambda execution fails.
+    fn invoke_function_url_with_cancellation(
+        &self,
+        scope: &LambdaScope,
+        url_id: &str,
+        input: FunctionUrlInvocationInput,
+        caller_identity: Option<&CallerIdentity>,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<FunctionUrlInvocationOutput, LambdaError> {
         let state = self
             .function_store
@@ -1689,7 +1750,12 @@ impl LambdaService {
             config.url_id.clone(),
         );
 
-        self.invoke_resolved_function_url(&target, input, caller_identity)
+        self.invoke_resolved_function_url_with_cancellation(
+            &target,
+            input,
+            caller_identity,
+            is_cancelled,
+        )
     }
 
     /// # Errors
@@ -1700,6 +1766,19 @@ impl LambdaService {
         &self,
         scope: &LambdaScope,
         input: &ApiGatewayInvokeInput,
+    ) -> Result<InvokeOutput, LambdaError> {
+        self.invoke_apigateway_with_cancellation(scope, input, &|| false)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the Lambda target cannot be resolved, API
+    /// Gateway lacks invoke permission, or execution fails.
+    pub(crate) fn invoke_apigateway_with_cancellation(
+        &self,
+        scope: &LambdaScope,
+        input: &ApiGatewayInvokeInput,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<InvokeOutput, LambdaError> {
         let locator = resolve_function_target(scope, &input.target)?;
         let key = LambdaFunctionKey::new(scope, &locator.function_name);
@@ -1740,7 +1819,7 @@ impl LambdaService {
         )?;
         let result = self
             .executor
-            .invoke(&request)
+            .invoke_with_cancellation(&request, &is_cancelled)
             .map_err(LambdaError::InvokeBackend)?;
 
         Ok(invoke_output(
@@ -1812,9 +1891,35 @@ impl LambdaService {
         qualifier: Option<&str>,
         input: InvokeInput,
     ) -> Result<InvokeOutput, LambdaError> {
+        self.invoke_with_cancellation(
+            scope,
+            function_name,
+            qualifier,
+            input,
+            &|| false,
+        )
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the Lambda target cannot be resolved, payload
+    /// validation fails, or execution/enqueue dependencies reject the request.
+    pub(crate) fn invoke_with_cancellation(
+        &self,
+        scope: &LambdaScope,
+        function_name: &str,
+        qualifier: Option<&str>,
+        input: InvokeInput,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<InvokeOutput, LambdaError> {
         let target = resolve_lambda_function_target(function_name, qualifier)?;
 
-        self.invoke_target(scope, &target, input)
+        self.invoke_target_with_cancellation(
+            scope,
+            &target,
+            input,
+            &is_cancelled,
+        )
     }
 
     /// # Errors
@@ -1826,6 +1931,16 @@ impl LambdaService {
         scope: &LambdaScope,
         target: &LambdaFunctionTarget,
         input: InvokeInput,
+    ) -> Result<InvokeOutput, LambdaError> {
+        self.invoke_target_with_cancellation(scope, target, input, &|| false)
+    }
+
+    fn invoke_target_with_cancellation(
+        &self,
+        scope: &LambdaScope,
+        target: &LambdaFunctionTarget,
+        input: InvokeInput,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<InvokeOutput, LambdaError> {
         let locator = resolve_function_target(scope, target)?;
         let key = LambdaFunctionKey::new(scope, &locator.function_name);
@@ -1853,11 +1968,12 @@ impl LambdaService {
                 Ok(invoke_output(executed_version, None, Vec::new(), 204))
             }
             LambdaInvocationType::RequestResponse => self
-                .execute_request_response(
+                .execute_request_response_with_cancellation(
                     scope,
                     &locator.function_name,
                     locator.qualifier.as_deref(),
                     input.payload,
+                    is_cancelled,
                 ),
             LambdaInvocationType::Event => {
                 self.enqueue_async_invocation(
@@ -1961,6 +2077,23 @@ impl LambdaService {
         qualifier: Option<&str>,
         payload: Vec<u8>,
     ) -> Result<InvokeOutput, LambdaError> {
+        self.execute_request_response_with_cancellation(
+            scope,
+            function_name,
+            qualifier,
+            payload,
+            &|| false,
+        )
+    }
+
+    fn execute_request_response_with_cancellation(
+        &self,
+        scope: &LambdaScope,
+        function_name: &str,
+        qualifier: Option<&str>,
+        payload: Vec<u8>,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<InvokeOutput, LambdaError> {
         let locator =
             resolve_function_locator(scope, function_name, qualifier)?;
         let key = LambdaFunctionKey::new(scope, &locator.function_name);
@@ -1986,7 +2119,7 @@ impl LambdaService {
         )?;
         let result = self
             .executor
-            .invoke(&request)
+            .invoke_with_cancellation(&request, is_cancelled)
             .map_err(LambdaError::InvokeBackend)?;
 
         Ok(invoke_output(
@@ -2351,17 +2484,67 @@ impl LambdaService {
         Ok(output)
     }
 
+    fn clear_pending_sqs_batch(&self, uuid: &str) {
+        let mut background_state = self
+            .background_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        background_state.sqs_batches.remove(uuid);
+    }
+
+    fn clear_pending_sqs_batches<I>(&self, uuids: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut background_state = self
+            .background_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for uuid in uuids {
+            background_state.sqs_batches.remove(&uuid);
+        }
+    }
+
+    fn take_pending_sqs_batch(&self, uuid: &str) -> Option<PendingSqsBatch> {
+        let mut background_state = self
+            .background_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        background_state.sqs_batches.remove(uuid)
+    }
+
+    fn store_pending_sqs_batch(&self, uuid: &str, batch: PendingSqsBatch) {
+        let mut background_state = self
+            .background_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        background_state.sqs_batches.insert(uuid.to_owned(), batch);
+    }
+
     fn process_async_invocations(&self) -> Result<(), LambdaError> {
-        let pending = {
+        let mut pending_invocations = {
             let mut background_state = self
                 .background_state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            background_state.async_invocations.drain(..).collect::<Vec<_>>()
+            std::mem::take(&mut background_state.async_invocations)
         };
 
-        for pending_invocation in pending {
-            self.process_pending_async_invocation(pending_invocation)?;
+        while let Some(pending_invocation) = pending_invocations.pop_front() {
+            match self.process_pending_async_invocation(pending_invocation) {
+                Ok(AsyncInvocationProcessingOutcome::Handled) => {}
+                Ok(AsyncInvocationProcessingOutcome::Retry {
+                    attempt_count,
+                    pending,
+                }) => self.requeue_async_invocation(pending, attempt_count),
+                Err(failure) => {
+                    self.restore_async_invocations(
+                        failure.pending,
+                        pending_invocations,
+                    );
+                    return Err(failure.error);
+                }
+            }
         }
 
         Ok(())
@@ -2370,16 +2553,18 @@ impl LambdaService {
     fn process_pending_async_invocation(
         &self,
         pending: PendingAsyncInvocation,
-    ) -> Result<(), LambdaError> {
+    ) -> Result<AsyncInvocationProcessingOutcome, AsyncInvocationCycleFailure>
+    {
         let locator = resolve_function_locator(
             &pending.scope,
             &pending.function_name,
             pending.qualifier.as_deref(),
-        )?;
+        )
+        .map_err(|error| AsyncInvocationCycleFailure::new(&pending, error))?;
         let key =
             LambdaFunctionKey::new(&pending.scope, &locator.function_name);
         let Some(state) = self.function_store.get(&pending.scope, &key) else {
-            return Ok(());
+            return Ok(AsyncInvocationProcessingOutcome::Handled);
         };
         let (version, executed_version) =
             resolve_version_with_execution_target(
@@ -2387,7 +2572,10 @@ impl LambdaService {
                 &locator.function_name,
                 &state,
                 locator.qualifier.as_deref(),
-            )?;
+            )
+            .map_err(|error| {
+                AsyncInvocationCycleFailure::new(&pending, error)
+            })?;
         let config = state
             .event_invoke_configs
             .get(event_invoke_config_key(locator.qualifier.as_deref()))
@@ -2401,7 +2589,9 @@ impl LambdaService {
             .and_then(|config| config.maximum_retry_attempts)
             .unwrap_or(DEFAULT_ASYNC_MAX_RETRY_ATTEMPTS);
         let approximate_invoke_count = pending.attempt_count + 1;
-        let now_epoch_seconds = self.now_epoch_seconds()?;
+        let now_epoch_seconds = self.now_epoch_seconds().map_err(|error| {
+            AsyncInvocationCycleFailure::new(&pending, error)
+        })?;
         if now_epoch_seconds.saturating_sub(pending.enqueued_at_epoch_seconds)
             > i64::from(maximum_event_age_in_seconds)
         {
@@ -2424,8 +2614,9 @@ impl LambdaService {
                         "errorMessage": "Event age exceeded the configured maximum."
                     }),
                 },
-            )?;
-            return Ok(());
+            )
+            .map_err(|error| AsyncInvocationCycleFailure::new(&pending, error))?;
+            return Ok(AsyncInvocationProcessingOutcome::Handled);
         }
 
         let output = self.execute_request_response(
@@ -2447,31 +2638,38 @@ impl LambdaService {
                         &locator.function_name,
                         &executed_version,
                     );
+                    let body = build_async_destination_body(
+                        AsyncDestinationBodyInput {
+                            request_id: &pending.request_id,
+                            request_payload: &pending.payload,
+                            function_arn: &function_arn,
+                            condition: "Success",
+                            approximate_invoke_count,
+                            status_code: output.status_code(),
+                            executed_version: &executed_version,
+                            function_error: output.function_error(),
+                            response_payload: output.payload(),
+                            now_epoch_seconds,
+                        },
+                    )
+                    .map_err(|error| {
+                        AsyncInvocationCycleFailure::new(&pending, error)
+                    })?;
                     self.send_async_destination_message(
                         &target.destination,
-                        build_async_destination_body(
-                            AsyncDestinationBodyInput {
-                                request_id: &pending.request_id,
-                                request_payload: &pending.payload,
-                                function_arn: &function_arn,
-                                condition: "Success",
-                                approximate_invoke_count,
-                                status_code: output.status_code(),
-                                executed_version: &executed_version,
-                                function_error: output.function_error(),
-                                response_payload: output.payload(),
-                                now_epoch_seconds,
-                            },
-                        )?,
-                    )?;
+                        body,
+                    )
+                    .map_err(|error| {
+                        AsyncInvocationCycleFailure::new(&pending, error)
+                    })?;
                 }
             }
             Ok(output) => {
                 if approximate_invoke_count <= maximum_retry_attempts {
-                    self.requeue_async_invocation(
+                    return Ok(AsyncInvocationProcessingOutcome::Retry {
+                        attempt_count: approximate_invoke_count,
                         pending,
-                        approximate_invoke_count,
-                    );
+                    });
                 } else {
                     self.deliver_async_failure(
                         &pending,
@@ -2492,15 +2690,18 @@ impl LambdaService {
                                 output.payload(),
                             ),
                         },
-                    )?;
+                    )
+                    .map_err(|error| {
+                        AsyncInvocationCycleFailure::new(&pending, error)
+                    })?;
                 }
             }
             Err(error) => {
                 if approximate_invoke_count <= maximum_retry_attempts {
-                    self.requeue_async_invocation(
+                    return Ok(AsyncInvocationProcessingOutcome::Retry {
+                        attempt_count: approximate_invoke_count,
                         pending,
-                        approximate_invoke_count,
-                    );
+                    });
                 } else {
                     self.deliver_async_failure(
                         &pending,
@@ -2521,12 +2722,36 @@ impl LambdaService {
                                 "errorMessage": error.to_string()
                             }),
                         },
-                    )?;
+                    )
+                    .map_err(|delivery_error| {
+                        AsyncInvocationCycleFailure::new(
+                            &pending,
+                            delivery_error,
+                        )
+                    })?;
                 }
             }
         }
 
-        Ok(())
+        Ok(AsyncInvocationProcessingOutcome::Handled)
+    }
+
+    fn restore_async_invocations(
+        &self,
+        pending: PendingAsyncInvocation,
+        mut remaining: VecDeque<PendingAsyncInvocation>,
+    ) {
+        let mut background_state = self
+            .background_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut restored = VecDeque::with_capacity(
+            1 + remaining.len() + background_state.async_invocations.len(),
+        );
+        restored.push_back(pending);
+        restored.append(&mut remaining);
+        restored.append(&mut background_state.async_invocations);
+        background_state.async_invocations = restored;
     }
 
     fn deliver_async_failure(
@@ -2676,11 +2901,11 @@ impl LambdaService {
     ) -> Result<(), LambdaError> {
         let queue_identity =
             self.validate_sqs_event_source_arn(&mapping.event_source_arn)?;
-        let messages =
-            self.receive_sqs_batch(&queue_identity, mapping.batch_size)?;
-        if messages.is_empty() {
+        let Some(messages) =
+            self.receive_sqs_batch(&queue_identity, mapping)?
+        else {
             return Ok(());
-        }
+        };
 
         let payload = build_sqs_event(
             &mapping.event_source_arn,
@@ -2707,32 +2932,90 @@ impl LambdaService {
     fn receive_sqs_batch(
         &self,
         queue_identity: &SqsQueueIdentity,
-        requested_batch_size: u32,
-    ) -> Result<Vec<ReceivedMessage>, LambdaError> {
-        let mut messages = Vec::new();
-
-        while (messages.len() as u32) < requested_batch_size {
-            let remaining = requested_batch_size - messages.len() as u32;
-            let batch = self
-                .sqs
-                .receive_message(
-                    queue_identity,
-                    ReceiveMessageInput {
-                        max_number_of_messages: Some(remaining.min(10)),
-                        visibility_timeout: None,
-                        wait_time_seconds: Some(0),
-                    },
-                )
-                .map_err(|error| LambdaError::InvalidParameterValue {
-                    message: error.to_string(),
-                })?;
-            if batch.is_empty() {
-                break;
+        mapping: &LambdaEventSourceMappingState,
+    ) -> Result<Option<Vec<ReceivedMessage>>, LambdaError> {
+        let requested_batch_size = mapping.batch_size;
+        let maximum_batching_window_in_seconds =
+            mapping.maximum_batching_window_in_seconds;
+        if let Some(mut pending) = self.take_pending_sqs_batch(&mapping.uuid) {
+            let now_epoch_millis = self.now_epoch_millis()?;
+            if pending_sqs_batch_is_ready(
+                pending.messages.len(),
+                requested_batch_size,
+                now_epoch_millis,
+                pending.deadline_epoch_millis,
+            ) {
+                return Ok(Some(pending.messages));
             }
-            messages.extend(batch);
+
+            let remaining = requested_batch_size
+                .saturating_sub(pending.messages.len() as u32);
+            if remaining == 0 {
+                return Ok(Some(pending.messages));
+            }
+
+            let batch =
+                self.receive_sqs_messages(queue_identity, remaining.min(10))?;
+            if !batch.is_empty() {
+                pending.messages.extend(batch);
+            }
+            if pending_sqs_batch_is_ready(
+                pending.messages.len(),
+                requested_batch_size,
+                self.now_epoch_millis()?,
+                pending.deadline_epoch_millis,
+            ) {
+                return Ok(Some(pending.messages));
+            }
+
+            self.store_pending_sqs_batch(&mapping.uuid, pending);
+            return Ok(None);
         }
 
-        Ok(messages)
+        let messages = self.receive_sqs_messages(
+            queue_identity,
+            requested_batch_size.min(10),
+        )?;
+        if messages.is_empty() {
+            return Ok(None);
+        }
+        if (messages.len() as u32) >= requested_batch_size
+            || maximum_batching_window_in_seconds == 0
+        {
+            return Ok(Some(messages));
+        }
+
+        self.store_pending_sqs_batch(
+            &mapping.uuid,
+            PendingSqsBatch {
+                deadline_epoch_millis: self
+                    .now_epoch_millis()?
+                    .saturating_add(
+                        u64::from(maximum_batching_window_in_seconds) * 1_000,
+                    ),
+                messages,
+            },
+        );
+        Ok(None)
+    }
+
+    fn receive_sqs_messages(
+        &self,
+        queue_identity: &SqsQueueIdentity,
+        max_number_of_messages: u32,
+    ) -> Result<Vec<ReceivedMessage>, LambdaError> {
+        self.sqs
+            .receive_message(
+                queue_identity,
+                ReceiveMessageInput {
+                    max_number_of_messages: Some(max_number_of_messages),
+                    visibility_timeout: None,
+                    wait_time_seconds: Some(0),
+                },
+            )
+            .map_err(|error| LambdaError::InvalidParameterValue {
+                message: error.to_string(),
+            })
     }
 
     fn resolve_code_input(
@@ -3116,6 +3399,7 @@ struct LambdaEventSourceMappingState {
 #[derive(Debug, Default)]
 struct LambdaBackgroundState {
     async_invocations: VecDeque<PendingAsyncInvocation>,
+    sqs_batches: BTreeMap<String, PendingSqsBatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3127,6 +3411,12 @@ struct PendingAsyncInvocation {
     qualifier: Option<String>,
     request_id: String,
     scope: LambdaScope,
+}
+
+#[derive(Debug)]
+struct PendingSqsBatch {
+    deadline_epoch_millis: u64,
+    messages: Vec<ReceivedMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3156,6 +3446,16 @@ impl LambdaCodeRecord {
 enum LambdaCodePackage {
     Image { image_uri: String },
     Zip { blob_key: BlobKey },
+}
+
+fn pending_sqs_batch_is_ready(
+    pending_message_count: usize,
+    requested_batch_size: u32,
+    now_epoch_millis: u64,
+    deadline_epoch_millis: u64,
+) -> bool {
+    (pending_message_count as u32) >= requested_batch_size
+        || now_epoch_millis >= deadline_epoch_millis
 }
 
 fn ensure_revision_matches(
@@ -3407,9 +3707,9 @@ mod tests {
         CreateQueueInput, ReceiveMessageInput, SendMessageInput,
         SqsQueueIdentity, SqsScope, SqsService,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::io;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use storage::{InMemoryStorage, ScopedStorage, ScopedStorageKey};
@@ -3452,6 +3752,53 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct ManualClock {
+        epoch_millis: Arc<AtomicU64>,
+    }
+
+    impl ManualClock {
+        fn new(epoch_millis: u64) -> Self {
+            Self { epoch_millis: Arc::new(AtomicU64::new(epoch_millis)) }
+        }
+
+        fn advance(&self, duration: Duration) {
+            let advance_millis = u64::try_from(duration.as_millis())
+                .expect("duration should fit in u64 millis");
+            self.epoch_millis.fetch_add(advance_millis, Ordering::Relaxed);
+        }
+    }
+
+    impl Clock for ManualClock {
+        fn now(&self) -> SystemTime {
+            UNIX_EPOCH
+                + Duration::from_millis(
+                    self.epoch_millis.load(Ordering::Relaxed),
+                )
+        }
+    }
+
+    #[derive(Clone)]
+    struct SwitchableClock {
+        current: Arc<Mutex<SystemTime>>,
+    }
+
+    impl SwitchableClock {
+        fn new(current: SystemTime) -> Self {
+            Self { current: Arc::new(Mutex::new(current)) }
+        }
+
+        fn set(&self, current: SystemTime) {
+            *recover(self.current.lock()) = current;
+        }
+    }
+
+    impl Clock for SwitchableClock {
+        fn now(&self) -> SystemTime {
+            *recover(self.current.lock())
+        }
+    }
+
+    #[derive(Clone)]
     struct SequenceRandom {
         cursor: Arc<AtomicU8>,
     }
@@ -3478,6 +3825,9 @@ mod tests {
 
     struct RecordingExecutor {
         async_invocations: Mutex<Vec<LambdaInvocationRequest>>,
+        queued_outcomes: Mutex<
+            VecDeque<Result<LambdaInvocationResult, InfrastructureError>>,
+        >,
         next_result: Mutex<LambdaInvocationResult>,
         sync_invocations: Mutex<Vec<LambdaInvocationRequest>>,
         validate_error: Mutex<Option<InfrastructureError>>,
@@ -3488,6 +3838,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 async_invocations: Mutex::new(Vec::new()),
+                queued_outcomes: Mutex::new(VecDeque::new()),
                 next_result: Mutex::new(LambdaInvocationResult::new(
                     Vec::new(),
                     Option::<String>::None,
@@ -3504,6 +3855,10 @@ mod tests {
             *recover(self.next_result.lock()) = result;
         }
 
+        fn push_result(&self, result: LambdaInvocationResult) {
+            recover(self.queued_outcomes.lock()).push_back(Ok(result));
+        }
+
         fn set_validate_error(&self, error: InfrastructureError) {
             *recover(self.validate_error.lock()) = Some(error);
         }
@@ -3515,6 +3870,12 @@ mod tests {
             request: &LambdaInvocationRequest,
         ) -> Result<LambdaInvocationResult, InfrastructureError> {
             recover(self.sync_invocations.lock()).push(request.clone());
+            if let Some(outcome) =
+                recover(self.queued_outcomes.lock()).pop_front()
+            {
+                return outcome;
+            }
+
             Ok(recover(self.next_result.lock()).clone())
         }
 
@@ -3570,6 +3931,18 @@ mod tests {
         executor: Arc<RecordingExecutor>,
         blob_store: Arc<MemoryBlobStore>,
     ) -> (LambdaService, SqsService) {
+        service_with_sqs_and_clock(
+            executor,
+            blob_store,
+            Arc::new(FixedClock(UNIX_EPOCH + Duration::from_secs(60))),
+        )
+    }
+
+    fn service_with_sqs_and_clock(
+        executor: Arc<RecordingExecutor>,
+        blob_store: Arc<MemoryBlobStore>,
+        clock: Arc<dyn Clock>,
+    ) -> (LambdaService, SqsService) {
         let iam = IamService::new();
         for scope in [scope(), alternate_scope()] {
             iam.create_role(
@@ -3594,7 +3967,7 @@ mod tests {
                 storage::StorageMode::Memory,
             )),
             blob_store.clone(),
-            Arc::new(FixedClock(UNIX_EPOCH + Duration::from_secs(60))),
+            clock.clone(),
         )
         .unwrap();
         let sqs = SqsService::new();
@@ -3612,9 +3985,7 @@ mod tests {
                     iam,
                     s3,
                     sqs: sqs.clone(),
-                    clock: Arc::new(FixedClock(
-                        UNIX_EPOCH + Duration::from_secs(60),
-                    )),
+                    clock,
                     random: Arc::new(SequenceRandom::new()),
                 },
             )
@@ -3929,6 +4300,437 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(recover(executor.sync_invocations.lock()).len(), 1);
+    }
+
+    #[test]
+    fn lambda_core_async_cycle_processes_the_backlog_and_defers_retries() {
+        let executor = Arc::new(RecordingExecutor::default());
+        executor.push_result(LambdaInvocationResult::new(
+            br#"{"errorMessage":"boom"}"#.to_vec(),
+            Some("Unhandled"),
+        ));
+        executor.push_result(LambdaInvocationResult::new(
+            br#"{"ok":true}"#.to_vec(),
+            Option::<String>::None,
+        ));
+        executor.push_result(LambdaInvocationResult::new(
+            br#"{"ok":true}"#.to_vec(),
+            Option::<String>::None,
+        ));
+        let service =
+            service(executor.clone(), Arc::new(MemoryBlobStore::default()));
+
+        service
+            .create_function(
+                &scope(),
+                CreateFunctionInput {
+                    code: inline_zip(),
+                    dead_letter_target_arn: None,
+                    description: None,
+                    environment: BTreeMap::new(),
+                    function_name: "demo".to_owned(),
+                    handler: Some("bootstrap.handler".to_owned()),
+                    memory_size: None,
+                    package_type: LambdaPackageType::Zip,
+                    publish: false,
+                    role: role_arn().to_owned(),
+                    runtime: Some("provided.al2".to_owned()),
+                    timeout: None,
+                },
+            )
+            .unwrap();
+        service
+            .put_function_event_invoke_config(
+                &scope(),
+                "demo",
+                None,
+                PutFunctionEventInvokeConfigInput {
+                    destination_config: None,
+                    maximum_event_age_in_seconds: None,
+                    maximum_retry_attempts: Some(1),
+                },
+            )
+            .unwrap();
+        for payload in [br#"{"job":1}"#, br#"{"job":2}"#] {
+            service
+                .invoke(
+                    &scope(),
+                    "demo",
+                    None,
+                    InvokeInput {
+                        invocation_type: LambdaInvocationType::Event,
+                        payload: payload.to_vec(),
+                    },
+                )
+                .unwrap();
+        }
+
+        service.run_background_cycle().unwrap();
+
+        let queued = recover(service.background_state.lock())
+            .async_invocations
+            .iter()
+            .map(|pending| {
+                String::from_utf8_lossy(&pending.payload).into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(queued, vec![r#"{"job":1}"#]);
+        assert_eq!(recover(executor.sync_invocations.lock()).len(), 2);
+
+        service.run_background_cycle().unwrap();
+
+        assert!(
+            recover(service.background_state.lock())
+                .async_invocations
+                .is_empty()
+        );
+        assert_eq!(recover(executor.sync_invocations.lock()).len(), 3);
+    }
+
+    #[test]
+    fn lambda_core_async_cycle_preserves_the_backlog_after_fatal_errors() {
+        let executor = Arc::new(RecordingExecutor::default());
+        executor.push_result(LambdaInvocationResult::new(
+            br#"{"ok":true}"#.to_vec(),
+            Option::<String>::None,
+        ));
+        let clock = SwitchableClock::new(UNIX_EPOCH + Duration::from_secs(60));
+        let (service, _sqs) = service_with_sqs_and_clock(
+            executor.clone(),
+            Arc::new(MemoryBlobStore::default()),
+            Arc::new(clock.clone()),
+        );
+
+        service
+            .create_function(
+                &scope(),
+                CreateFunctionInput {
+                    code: inline_zip(),
+                    dead_letter_target_arn: None,
+                    description: None,
+                    environment: BTreeMap::new(),
+                    function_name: "demo".to_owned(),
+                    handler: Some("bootstrap.handler".to_owned()),
+                    memory_size: None,
+                    package_type: LambdaPackageType::Zip,
+                    publish: false,
+                    role: role_arn().to_owned(),
+                    runtime: Some("provided.al2".to_owned()),
+                    timeout: None,
+                },
+            )
+            .unwrap();
+        for payload in [br#"{"job":1}"#, br#"{"job":2}"#] {
+            service
+                .invoke(
+                    &scope(),
+                    "demo",
+                    None,
+                    InvokeInput {
+                        invocation_type: LambdaInvocationType::Event,
+                        payload: payload.to_vec(),
+                    },
+                )
+                .unwrap();
+        }
+
+        clock.set(UNIX_EPOCH - Duration::from_secs(1));
+        let error = service
+            .run_async_invocation_cycle()
+            .expect_err("fatal backend errors should stop the cycle");
+        assert!(matches!(error, LambdaError::Internal { .. }));
+        let queued = recover(service.background_state.lock())
+            .async_invocations
+            .iter()
+            .map(|pending| {
+                String::from_utf8_lossy(&pending.payload).into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(queued, vec![r#"{"job":1}"#, r#"{"job":2}"#]);
+        assert!(recover(executor.sync_invocations.lock()).is_empty());
+
+        clock.set(UNIX_EPOCH + Duration::from_secs(60));
+        service
+            .run_async_invocation_cycle()
+            .expect("preserved backlog should resume once time recovers");
+
+        assert!(
+            recover(service.background_state.lock())
+                .async_invocations
+                .is_empty()
+        );
+        let payloads = recover(executor.sync_invocations.lock())
+            .iter()
+            .map(|request| {
+                String::from_utf8_lossy(request.payload()).into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(payloads, vec![r#"{"job":1}"#, r#"{"job":2}"#]);
+    }
+
+    #[test]
+    fn lambda_sqs_event_source_mapping_waits_across_cycles_for_batching_window_messages()
+     {
+        let executor = Arc::new(RecordingExecutor::default());
+        executor.set_next_result(LambdaInvocationResult::new(
+            br#"{"ok":true}"#.to_vec(),
+            Option::<String>::None,
+        ));
+        let clock = ManualClock::new(60_000);
+        let (lambda, sqs) = service_with_sqs_and_clock(
+            executor.clone(),
+            Arc::new(MemoryBlobStore::default()),
+            Arc::new(clock.clone()),
+        );
+        let source_queue = create_queue(&sqs, "lambda-batching-window");
+        let source_queue_arn = queue_arn(&sqs, &source_queue);
+
+        lambda
+            .create_function(
+                &scope(),
+                CreateFunctionInput {
+                    code: inline_zip(),
+                    dead_letter_target_arn: None,
+                    description: None,
+                    environment: BTreeMap::new(),
+                    function_name: "batching-demo".to_owned(),
+                    handler: Some("bootstrap.handler".to_owned()),
+                    memory_size: None,
+                    package_type: LambdaPackageType::Zip,
+                    publish: false,
+                    role: role_arn().to_owned(),
+                    runtime: Some("provided.al2".to_owned()),
+                    timeout: None,
+                },
+            )
+            .unwrap();
+        lambda
+            .create_event_source_mapping(
+                &scope(),
+                CreateEventSourceMappingInput {
+                    batch_size: Some(2),
+                    enabled: Some(true),
+                    event_source_arn: source_queue_arn,
+                    function_name: "batching-demo".to_owned(),
+                    maximum_batching_window_in_seconds: Some(1),
+                },
+            )
+            .unwrap();
+
+        sqs.send_message(
+            &source_queue,
+            SendMessageInput {
+                body: r#"{"job":"first"}"#.to_owned(),
+                delay_seconds: None,
+                message_deduplication_id: None,
+                message_group_id: None,
+            },
+        )
+        .unwrap();
+
+        lambda.run_background_cycle().unwrap();
+        assert!(recover(executor.sync_invocations.lock()).is_empty());
+        assert_eq!(
+            recover(lambda.background_state.lock()).sqs_batches.len(),
+            1
+        );
+        sqs.send_message(
+            &source_queue,
+            SendMessageInput {
+                body: r#"{"job":"second"}"#.to_owned(),
+                delay_seconds: None,
+                message_deduplication_id: None,
+                message_group_id: None,
+            },
+        )
+        .unwrap();
+        lambda.run_background_cycle().unwrap();
+
+        let recorded = recover(executor.sync_invocations.lock());
+        let event: serde_json::Value =
+            serde_json::from_slice(recorded.last().unwrap().payload())
+                .unwrap();
+        assert_eq!(event["Records"].as_array().unwrap().len(), 2);
+        assert_eq!(event["Records"][0]["body"], r#"{"job":"first"}"#);
+        assert_eq!(event["Records"][1]["body"], r#"{"job":"second"}"#);
+        assert!(
+            recover(lambda.background_state.lock()).sqs_batches.is_empty()
+        );
+    }
+
+    #[test]
+    fn lambda_sqs_event_source_mapping_flushes_pending_batches_when_window_expires()
+     {
+        let executor = Arc::new(RecordingExecutor::default());
+        executor.set_next_result(LambdaInvocationResult::new(
+            br#"{"ok":true}"#.to_vec(),
+            Option::<String>::None,
+        ));
+        let clock = ManualClock::new(60_000);
+        let (lambda, sqs) = service_with_sqs_and_clock(
+            executor.clone(),
+            Arc::new(MemoryBlobStore::default()),
+            Arc::new(clock.clone()),
+        );
+        let source_queue = create_queue(&sqs, "lambda-batching-window-expiry");
+        let source_queue_arn = queue_arn(&sqs, &source_queue);
+
+        lambda
+            .create_function(
+                &scope(),
+                CreateFunctionInput {
+                    code: inline_zip(),
+                    dead_letter_target_arn: None,
+                    description: None,
+                    environment: BTreeMap::new(),
+                    function_name: "expiry-demo".to_owned(),
+                    handler: Some("bootstrap.handler".to_owned()),
+                    memory_size: None,
+                    package_type: LambdaPackageType::Zip,
+                    publish: false,
+                    role: role_arn().to_owned(),
+                    runtime: Some("provided.al2".to_owned()),
+                    timeout: None,
+                },
+            )
+            .unwrap();
+        lambda
+            .create_event_source_mapping(
+                &scope(),
+                CreateEventSourceMappingInput {
+                    batch_size: Some(2),
+                    enabled: Some(true),
+                    event_source_arn: source_queue_arn,
+                    function_name: "expiry-demo".to_owned(),
+                    maximum_batching_window_in_seconds: Some(1),
+                },
+            )
+            .unwrap();
+
+        sqs.send_message(
+            &source_queue,
+            SendMessageInput {
+                body: r#"{"job":"first"}"#.to_owned(),
+                delay_seconds: None,
+                message_deduplication_id: None,
+                message_group_id: None,
+            },
+        )
+        .unwrap();
+
+        lambda.run_background_cycle().unwrap();
+        assert!(recover(executor.sync_invocations.lock()).is_empty());
+        assert_eq!(
+            recover(lambda.background_state.lock()).sqs_batches.len(),
+            1
+        );
+
+        clock.advance(Duration::from_secs(1));
+        lambda.run_background_cycle().unwrap();
+
+        let recorded = recover(executor.sync_invocations.lock());
+        assert_eq!(recorded.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_slice(recorded[0].payload()).unwrap();
+        assert_eq!(event["Records"].as_array().unwrap().len(), 1);
+        assert_eq!(event["Records"][0]["body"], r#"{"job":"first"}"#);
+        assert!(
+            recover(lambda.background_state.lock()).sqs_batches.is_empty()
+        );
+    }
+
+    #[test]
+    fn lambda_sqs_batching_window_does_not_block_other_mappings() {
+        let executor = Arc::new(RecordingExecutor::default());
+        executor.set_next_result(LambdaInvocationResult::new(
+            br#"{"ok":true}"#.to_vec(),
+            Option::<String>::None,
+        ));
+        let clock = ManualClock::new(60_000);
+        let (lambda, sqs) = service_with_sqs_and_clock(
+            executor.clone(),
+            Arc::new(MemoryBlobStore::default()),
+            Arc::new(clock),
+        );
+        let blocking_queue = create_queue(&sqs, "lambda-windowed-first");
+        let ready_queue = create_queue(&sqs, "lambda-ready-second");
+        let blocking_queue_arn = queue_arn(&sqs, &blocking_queue);
+        let ready_queue_arn = queue_arn(&sqs, &ready_queue);
+
+        for function_name in ["a-windowed-demo", "z-ready-demo"] {
+            lambda
+                .create_function(
+                    &scope(),
+                    CreateFunctionInput {
+                        code: inline_zip(),
+                        dead_letter_target_arn: None,
+                        description: None,
+                        environment: BTreeMap::new(),
+                        function_name: function_name.to_owned(),
+                        handler: Some("bootstrap.handler".to_owned()),
+                        memory_size: None,
+                        package_type: LambdaPackageType::Zip,
+                        publish: false,
+                        role: role_arn().to_owned(),
+                        runtime: Some("provided.al2".to_owned()),
+                        timeout: None,
+                    },
+                )
+                .unwrap();
+        }
+        lambda
+            .create_event_source_mapping(
+                &scope(),
+                CreateEventSourceMappingInput {
+                    batch_size: Some(2),
+                    enabled: Some(true),
+                    event_source_arn: blocking_queue_arn,
+                    function_name: "a-windowed-demo".to_owned(),
+                    maximum_batching_window_in_seconds: Some(1),
+                },
+            )
+            .unwrap();
+        lambda
+            .create_event_source_mapping(
+                &scope(),
+                CreateEventSourceMappingInput {
+                    batch_size: Some(1),
+                    enabled: Some(true),
+                    event_source_arn: ready_queue_arn,
+                    function_name: "z-ready-demo".to_owned(),
+                    maximum_batching_window_in_seconds: Some(0),
+                },
+            )
+            .unwrap();
+
+        for (queue, body) in [
+            (&blocking_queue, r#"{"job":"wait"}"#),
+            (&ready_queue, r#"{"job":"run"}"#),
+        ] {
+            sqs.send_message(
+                queue,
+                SendMessageInput {
+                    body: body.to_owned(),
+                    delay_seconds: None,
+                    message_deduplication_id: None,
+                    message_group_id: None,
+                },
+            )
+            .unwrap();
+        }
+
+        lambda.run_background_cycle().unwrap();
+
+        let recorded = recover(executor.sync_invocations.lock());
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].function_name(), "z-ready-demo");
+        let event: serde_json::Value =
+            serde_json::from_slice(recorded[0].payload()).unwrap();
+        assert_eq!(event["Records"][0]["body"], r#"{"job":"run"}"#);
+        assert_eq!(
+            recover(lambda.background_state.lock()).sqs_batches.len(),
+            1
+        );
     }
 
     #[test]

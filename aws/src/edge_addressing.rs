@@ -135,6 +135,10 @@ impl AdvertisedEdge {
         )
     }
 
+    pub fn sns_signing_cert_url(&self) -> String {
+        format!("{}/__aws/sns/signing-cert.pem", self.origin())
+    }
+
     pub fn sqs_queue_url(
         &self,
         account_id: &AccountId,

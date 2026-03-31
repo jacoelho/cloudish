@@ -4,6 +4,8 @@ mod fifo;
 mod messages;
 mod queues;
 mod redrive;
+#[doc(hidden)]
+pub mod request_runtime;
 mod scope;
 
 #[cfg(test)]

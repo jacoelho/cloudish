@@ -21,8 +21,8 @@ use crate::adapters::ProcessLambdaExecutor;
 #[cfg(feature = "rds")]
 use crate::adapters::ThreadRdsBackendRuntime;
 use crate::adapters::{
-    DirectoryBlobStore, FixedClock, ManagedBackgroundTasks, MemoryBlobStore,
-    OsRandomSource, SequenceRandomSource, SystemClock, TcpHttpForwarder,
+    DirectoryBlobStore, FixedClock, MemoryBlobStore, OsRandomSource,
+    SequenceRandomSource, SystemClock, TcpHttpForwarder,
     ThreadBackgroundScheduler, ThreadTcpProxyRuntime,
 };
 #[cfg(feature = "elasticache")]
@@ -35,8 +35,6 @@ use crate::adapters::{
 };
 #[cfg(feature = "apigateway")]
 use crate::composition::ApiGatewayIntegrationExecutor;
-#[cfg(feature = "eventbridge")]
-use crate::composition::EventBridgeDispatcherDependencies;
 #[cfg(feature = "step-functions")]
 use crate::composition::LambdaStepFunctionsTaskAdapter;
 #[cfg(feature = "s3")]
@@ -45,6 +43,10 @@ use crate::composition::S3NotificationDispatcher;
 use crate::composition::build_eventbridge_dispatcher;
 #[cfg(feature = "lambda")]
 use crate::composition::start_lambda_background_tasks;
+#[cfg(feature = "eventbridge")]
+use crate::composition::{
+    EventBridgeDispatcherAssembly, EventBridgeDispatcherDependencies,
+};
 #[cfg(feature = "sns")]
 use crate::composition::{SnsServiceDependencies, build_sns_service};
 #[cfg(feature = "apigateway")]
@@ -61,7 +63,10 @@ use crate::{
 };
 use crate::{EnabledServices, RuntimeServices, RuntimeServicesBuilder};
 #[cfg(feature = "eventbridge")]
-use crate::{EventBridgeError, EventBridgeServiceDependencies};
+use crate::{
+    EventBridgeDeliveryDispatcher, EventBridgeError,
+    EventBridgeServiceDependencies, NoopEventBridgeDeliveryDispatcher,
+};
 use crate::{IamScope, IamService};
 #[cfg(feature = "lambda")]
 use crate::{LambdaInitError, LambdaService, LambdaServiceDependencies};
@@ -87,7 +92,6 @@ use storage::{StorageConfig, StorageError, StorageFactory, StorageMode};
 use thiserror::Error;
 
 pub struct RuntimeAssembly {
-    background_tasks: ManagedBackgroundTasks,
     enabled_services: EnabledServices,
     runtime_services: RuntimeServices,
 }
@@ -96,9 +100,8 @@ impl RuntimeAssembly {
     pub fn new(
         enabled_services: EnabledServices,
         runtime_services: RuntimeServices,
-        background_tasks: ManagedBackgroundTasks,
     ) -> Self {
-        Self { background_tasks, enabled_services, runtime_services }
+        Self { enabled_services, runtime_services }
     }
 
     pub fn enabled_services(&self) -> &EnabledServices {
@@ -109,10 +112,8 @@ impl RuntimeAssembly {
         &self.runtime_services
     }
 
-    pub fn into_parts(
-        self,
-    ) -> (EnabledServices, RuntimeServices, ManagedBackgroundTasks) {
-        (self.enabled_services, self.runtime_services, self.background_tasks)
+    pub fn into_parts(self) -> (EnabledServices, RuntimeServices) {
+        (self.enabled_services, self.runtime_services)
     }
 }
 
@@ -126,6 +127,9 @@ pub enum RuntimeBuildError {
     #[cfg(feature = "eventbridge")]
     #[error("failed to restore EventBridge schedules: {0}")]
     EventBridgeRestore(#[source] EventBridgeError),
+    #[cfg(feature = "eventbridge")]
+    #[error("failed to start EventBridge delivery runtime: {0}")]
+    EventBridgeRuntime(#[source] InfrastructureError),
     #[cfg(feature = "elasticache")]
     #[error("failed to restore ElastiCache runtimes: {0}")]
     ElastiCacheRestore(#[source] ElastiCacheError),
@@ -143,6 +147,19 @@ pub enum RuntimeBuildError {
     RdsRestore(#[source] RdsError),
     #[error("failed to load persistent runtime state: {0}")]
     StorageLoad(#[source] StorageError),
+}
+
+#[cfg(feature = "eventbridge")]
+fn eventbridge_delivery_dispatcher(
+    assembly: Option<&EventBridgeDispatcherAssembly>,
+) -> Arc<dyn EventBridgeDeliveryDispatcher> {
+    assembly.map_or_else(
+        || {
+            Arc::new(NoopEventBridgeDeliveryDispatcher)
+                as Arc<dyn EventBridgeDeliveryDispatcher>
+        },
+        |assembly| assembly.dispatcher.clone(),
+    )
 }
 
 pub struct LocalRuntimeBuilder {
@@ -182,8 +199,7 @@ impl LocalRuntimeBuilder {
         self
     }
 
-    /// Builds the concrete runtime service graph and owned background tasks
-    /// for local execution.
+    /// Builds the concrete runtime service graph for local execution.
     ///
     /// # Errors
     ///
@@ -196,6 +212,32 @@ impl LocalRuntimeBuilder {
         let authenticator = self.authenticator;
         let iam = IamService::new();
         let sts = StsService::new(iam.clone());
+        #[cfg(feature = "dynamodb")]
+        let dynamodb_enabled =
+            enabled_services.is_enabled(ServiceName::DynamoDb);
+        #[cfg(feature = "elasticache")]
+        let elasticache_enabled =
+            enabled_services.is_enabled(ServiceName::ElastiCache);
+        #[cfg(feature = "eventbridge")]
+        let eventbridge_enabled =
+            enabled_services.is_enabled(ServiceName::EventBridge);
+        #[cfg(feature = "kms")]
+        let kms_enabled = enabled_services.is_enabled(ServiceName::Kms);
+        #[cfg(feature = "lambda")]
+        let lambda_enabled = enabled_services.is_enabled(ServiceName::Lambda);
+        #[cfg(feature = "rds")]
+        let rds_enabled = enabled_services.is_enabled(ServiceName::Rds);
+        #[cfg(feature = "s3")]
+        let s3_enabled = enabled_services.is_enabled(ServiceName::S3);
+        #[cfg(feature = "secrets-manager")]
+        let secrets_manager_enabled =
+            enabled_services.is_enabled(ServiceName::SecretsManager);
+        #[cfg(feature = "sns")]
+        let sns_enabled = enabled_services.is_enabled(ServiceName::Sns);
+        #[cfg(feature = "sqs")]
+        let sqs_enabled = enabled_services.is_enabled(ServiceName::Sqs);
+        #[cfg(feature = "ssm")]
+        let ssm_enabled = enabled_services.is_enabled(ServiceName::Ssm);
         let factory = Arc::new(StorageFactory::new(StorageConfig::new(
             defaults.state_directory().join("metadata"),
             StorageMode::Wal,
@@ -274,29 +316,40 @@ impl LocalRuntimeBuilder {
                 advertised_edge: advertised_edge.clone(),
                 http_forwarder: http_forwarder.clone(),
                 http_signer: None,
-                lambda: Some(lambda.clone()),
-                sqs: Some(sqs.clone()),
+                lambda: lambda_enabled.then_some(lambda.clone()),
+                sqs: sqs_enabled.then_some(sqs.clone()),
             },
         );
+        #[cfg(feature = "eventbridge")]
+        let eventbridge_dispatcher = if eventbridge_enabled {
+            Some(
+                build_eventbridge_dispatcher(
+                    EventBridgeDispatcherDependencies {
+                        lambda: lambda_enabled.then_some(lambda.clone()),
+                        sns: sns_enabled.then_some(sns.clone()),
+                        sqs: sqs_enabled.then_some(sqs.clone()),
+                    },
+                )
+                .map_err(RuntimeBuildError::EventBridgeRuntime)?,
+            )
+        } else {
+            None
+        };
         #[cfg(feature = "eventbridge")]
         let eventbridge = EventBridgeService::new(
             &factory,
             EventBridgeServiceDependencies {
                 clock: Arc::new(SystemClock),
-                dispatcher: build_eventbridge_dispatcher(
-                    EventBridgeDispatcherDependencies {
-                        lambda: Some(lambda.clone()),
-                        sns: Some(sns.clone()),
-                        sqs: Some(sqs.clone()),
-                    },
+                dispatcher: eventbridge_delivery_dispatcher(
+                    eventbridge_dispatcher.as_ref(),
                 ),
                 scheduler: Arc::new(ThreadBackgroundScheduler::new()),
             },
         );
         #[cfg(feature = "s3")]
         s3.set_notification_transport(Arc::new(S3NotificationDispatcher {
-            sns: Some(sns.clone()),
-            sqs: Some(sqs.clone()),
+            sns: sns_enabled.then_some(sns.clone()),
+            sqs: sqs_enabled.then_some(sqs.clone()),
         }));
         #[cfg(feature = "step-functions")]
         let step_functions = StepFunctionsService::new(
@@ -308,7 +361,7 @@ impl LocalRuntimeBuilder {
                 ),
                 sleeper: Arc::new(ThreadStepFunctionsSleeper),
                 task_adapter: Arc::new(LambdaStepFunctionsTaskAdapter::new(
-                    lambda.clone(),
+                    lambda_enabled.then_some(lambda.clone()),
                 )),
             },
         );
@@ -345,15 +398,19 @@ impl LocalRuntimeBuilder {
             Arc::new(SystemTime::now),
             CloudFormationDependencies {
                 advertised_edge,
-                dynamodb: Some(Arc::new(dynamodb.clone())),
-                iam: Some(Arc::new(iam.clone())),
-                kms: Some(Arc::new(kms.clone())),
-                lambda: Some(Arc::new(lambda.clone())),
-                s3: Some(Arc::new(s3.clone())),
-                secrets_manager: Some(Arc::new(secrets_manager.clone())),
-                sns: Some(Arc::new(sns.clone())),
-                sqs: Some(Arc::new(sqs.clone())),
-                ssm: Some(Arc::new(ssm.clone())),
+                dynamodb: dynamodb_enabled
+                    .then_some(Arc::new(dynamodb.clone())),
+                iam: enabled_services
+                    .is_enabled(ServiceName::Iam)
+                    .then_some(Arc::new(iam.clone())),
+                kms: kms_enabled.then_some(Arc::new(kms.clone())),
+                lambda: lambda_enabled.then_some(Arc::new(lambda.clone())),
+                s3: s3_enabled.then_some(Arc::new(s3.clone())),
+                secrets_manager: secrets_manager_enabled
+                    .then_some(Arc::new(secrets_manager.clone())),
+                sns: sns_enabled.then_some(Arc::new(sns.clone())),
+                sqs: sqs_enabled.then_some(Arc::new(sqs.clone())),
+                ssm: ssm_enabled.then_some(Arc::new(ssm.clone())),
             },
         );
         factory.load_all().map_err(RuntimeBuildError::StorageLoad)?;
@@ -362,28 +419,43 @@ impl LocalRuntimeBuilder {
             Some(Arc::new(move || storage_shutdown_factory.shutdown_all())
                 as Arc<dyn Fn() -> Result<(), StorageError> + Send + Sync>);
         #[cfg(feature = "lambda")]
-        let background_tasks = start_lambda_background_tasks(
-            lambda.clone(),
-            Arc::new(ThreadBackgroundScheduler::new()),
-        )
-        .map_err(RuntimeBuildError::LambdaRuntime)?;
-        #[cfg(not(feature = "lambda"))]
-        let background_tasks = ManagedBackgroundTasks::empty();
+        let lambda_background_shutdown = if lambda_enabled {
+            let background_tasks = Arc::new(
+                start_lambda_background_tasks(
+                    lambda.clone(),
+                    Arc::new(ThreadBackgroundScheduler::new()),
+                )
+                .map_err(RuntimeBuildError::LambdaRuntime)?,
+            );
+            Some(Arc::new(move || background_tasks.cancel()) as _)
+        } else {
+            None
+        };
         #[cfg(feature = "eventbridge")]
-        eventbridge
-            .restore_schedules()
-            .map_err(RuntimeBuildError::EventBridgeRestore)?;
+        if eventbridge_enabled {
+            eventbridge
+                .restore_schedules()
+                .map_err(RuntimeBuildError::EventBridgeRestore)?;
+        }
         #[cfg(feature = "rds")]
-        rds.restore_runtimes().map_err(RuntimeBuildError::RdsRestore)?;
+        if rds_enabled {
+            rds.restore_runtimes().map_err(RuntimeBuildError::RdsRestore)?;
+        }
         #[cfg(feature = "elasticache")]
-        elasticache
-            .restore_runtimes()
-            .map_err(RuntimeBuildError::ElastiCacheRestore)?;
+        if elasticache_enabled {
+            elasticache
+                .restore_runtimes()
+                .map_err(RuntimeBuildError::ElastiCacheRestore)?;
+        }
         #[cfg(feature = "apigateway")]
         let execute_api_executor: Arc<
             dyn ExecuteApiIntegrationExecutor + Send + Sync,
         > = Arc::new(ApiGatewayIntegrationExecutor::new(
-            lambda.clone(),
+            lambda_enabled.then(|| {
+                lambda::request_runtime::LambdaRequestRuntime::new(
+                    lambda.clone(),
+                )
+            }),
             http_forwarder.clone(),
         ));
 
@@ -406,6 +478,10 @@ impl LocalRuntimeBuilder {
                 elasticache,
                 #[cfg(feature = "eventbridge")]
                 eventbridge,
+                #[cfg(feature = "eventbridge")]
+                eventbridge_delivery_shutdown: eventbridge_dispatcher
+                    .as_ref()
+                    .map(|dispatcher| dispatcher.shutdown.clone()),
                 iam,
                 #[cfg(feature = "kinesis")]
                 kinesis,
@@ -413,6 +489,8 @@ impl LocalRuntimeBuilder {
                 kms,
                 #[cfg(feature = "lambda")]
                 lambda,
+                #[cfg(feature = "lambda")]
+                lambda_background_shutdown,
                 #[cfg(feature = "rds")]
                 rds,
                 #[cfg(feature = "s3")]
@@ -431,7 +509,6 @@ impl LocalRuntimeBuilder {
                 step_functions,
             }
             .build(),
-            background_tasks,
         ))
     }
 }
@@ -509,7 +586,28 @@ impl TestRuntimeBuilder {
         let enabled_services = self.enabled_services;
         #[cfg(any(feature = "apigateway", feature = "sns"))]
         let http_forwarder = self.http_forwarder;
-        let iam = IamService::new();
+        let iam = IamService::with_time_source(Arc::new(|| UNIX_EPOCH));
+        #[cfg(feature = "dynamodb")]
+        let dynamodb_enabled =
+            enabled_services.is_enabled(ServiceName::DynamoDb);
+        #[cfg(feature = "eventbridge")]
+        let eventbridge_enabled =
+            enabled_services.is_enabled(ServiceName::EventBridge);
+        #[cfg(feature = "kms")]
+        let kms_enabled = enabled_services.is_enabled(ServiceName::Kms);
+        #[cfg(feature = "lambda")]
+        let lambda_enabled = enabled_services.is_enabled(ServiceName::Lambda);
+        #[cfg(feature = "s3")]
+        let s3_enabled = enabled_services.is_enabled(ServiceName::S3);
+        #[cfg(feature = "secrets-manager")]
+        let secrets_manager_enabled =
+            enabled_services.is_enabled(ServiceName::SecretsManager);
+        #[cfg(feature = "sns")]
+        let sns_enabled = enabled_services.is_enabled(ServiceName::Sns);
+        #[cfg(feature = "sqs")]
+        let sqs_enabled = enabled_services.is_enabled(ServiceName::Sqs);
+        #[cfg(feature = "ssm")]
+        let ssm_enabled = enabled_services.is_enabled(ServiceName::Ssm);
         #[cfg(feature = "lambda")]
         seed_lambda_role(&iam)?;
         let sts = StsService::new(iam.clone());
@@ -594,29 +692,40 @@ impl TestRuntimeBuilder {
                 advertised_edge: advertised_edge.clone(),
                 http_forwarder: http_forwarder.clone(),
                 http_signer: None,
-                lambda: Some(lambda.clone()),
-                sqs: Some(sqs.clone()),
+                lambda: lambda_enabled.then_some(lambda.clone()),
+                sqs: sqs_enabled.then_some(sqs.clone()),
             },
         );
+        #[cfg(feature = "eventbridge")]
+        let eventbridge_dispatcher = if eventbridge_enabled {
+            Some(
+                build_eventbridge_dispatcher(
+                    EventBridgeDispatcherDependencies {
+                        lambda: lambda_enabled.then_some(lambda.clone()),
+                        sns: sns_enabled.then_some(sns.clone()),
+                        sqs: sqs_enabled.then_some(sqs.clone()),
+                    },
+                )
+                .map_err(RuntimeBuildError::EventBridgeRuntime)?,
+            )
+        } else {
+            None
+        };
         #[cfg(feature = "eventbridge")]
         let eventbridge = EventBridgeService::new(
             &memory_factory(&label, "eventbridge"),
             EventBridgeServiceDependencies {
                 clock: Arc::new(FixedClock::new(UNIX_EPOCH)),
-                dispatcher: build_eventbridge_dispatcher(
-                    EventBridgeDispatcherDependencies {
-                        lambda: Some(lambda.clone()),
-                        sns: Some(sns.clone()),
-                        sqs: Some(sqs.clone()),
-                    },
+                dispatcher: eventbridge_delivery_dispatcher(
+                    eventbridge_dispatcher.as_ref(),
                 ),
                 scheduler: Arc::new(crate::ManualBackgroundScheduler::new()),
             },
         );
         #[cfg(feature = "s3")]
         s3.set_notification_transport(Arc::new(S3NotificationDispatcher {
-            sns: Some(sns.clone()),
-            sqs: Some(sqs.clone()),
+            sns: sns_enabled.then_some(sns.clone()),
+            sqs: sqs_enabled.then_some(sqs.clone()),
         }));
         #[cfg(feature = "step-functions")]
         let step_functions = StepFunctionsService::new(
@@ -628,7 +737,7 @@ impl TestRuntimeBuilder {
                 ),
                 sleeper: Arc::new(ThreadStepFunctionsSleeper),
                 task_adapter: Arc::new(LambdaStepFunctionsTaskAdapter::new(
-                    lambda.clone(),
+                    lambda_enabled.then_some(lambda.clone()),
                 )),
             },
         );
@@ -661,22 +770,30 @@ impl TestRuntimeBuilder {
             Arc::new(|| UNIX_EPOCH),
             CloudFormationDependencies {
                 advertised_edge,
-                dynamodb: Some(Arc::new(dynamodb.clone())),
-                iam: Some(Arc::new(iam.clone())),
-                kms: Some(Arc::new(kms.clone())),
-                lambda: Some(Arc::new(lambda.clone())),
-                s3: Some(Arc::new(s3.clone())),
-                secrets_manager: Some(Arc::new(secrets_manager.clone())),
-                sns: Some(Arc::new(sns.clone())),
-                sqs: Some(Arc::new(sqs.clone())),
-                ssm: Some(Arc::new(ssm.clone())),
+                dynamodb: dynamodb_enabled
+                    .then_some(Arc::new(dynamodb.clone())),
+                iam: enabled_services
+                    .is_enabled(ServiceName::Iam)
+                    .then_some(Arc::new(iam.clone())),
+                kms: kms_enabled.then_some(Arc::new(kms.clone())),
+                lambda: lambda_enabled.then_some(Arc::new(lambda.clone())),
+                s3: s3_enabled.then_some(Arc::new(s3.clone())),
+                secrets_manager: secrets_manager_enabled
+                    .then_some(Arc::new(secrets_manager.clone())),
+                sns: sns_enabled.then_some(Arc::new(sns.clone())),
+                sqs: sqs_enabled.then_some(Arc::new(sqs.clone())),
+                ssm: ssm_enabled.then_some(Arc::new(ssm.clone())),
             },
         );
         #[cfg(feature = "apigateway")]
         let execute_api_executor: Arc<
             dyn ExecuteApiIntegrationExecutor + Send + Sync,
         > = Arc::new(ApiGatewayIntegrationExecutor::new(
-            lambda.clone(),
+            lambda_enabled.then(|| {
+                lambda::request_runtime::LambdaRequestRuntime::new(
+                    lambda.clone(),
+                )
+            }),
             http_forwarder.clone(),
         ));
 
@@ -699,6 +816,10 @@ impl TestRuntimeBuilder {
                 elasticache,
                 #[cfg(feature = "eventbridge")]
                 eventbridge,
+                #[cfg(feature = "eventbridge")]
+                eventbridge_delivery_shutdown: eventbridge_dispatcher
+                    .as_ref()
+                    .map(|dispatcher| dispatcher.shutdown.clone()),
                 iam,
                 #[cfg(feature = "kinesis")]
                 kinesis,
@@ -706,6 +827,8 @@ impl TestRuntimeBuilder {
                 kms,
                 #[cfg(feature = "lambda")]
                 lambda,
+                #[cfg(feature = "lambda")]
+                lambda_background_shutdown: None,
                 #[cfg(feature = "rds")]
                 rds,
                 #[cfg(feature = "s3")]
@@ -724,7 +847,6 @@ impl TestRuntimeBuilder {
                 step_functions,
             }
             .build(),
-            ManagedBackgroundTasks::empty(),
         ))
     }
 }
@@ -1121,7 +1243,7 @@ mod tests {
             .with_enabled_services([ServiceName::Lambda, ServiceName::S3])
             .build()
             .expect("test runtime should build");
-        let (enabled_services, runtime_services, _) = assembly.into_parts();
+        let (enabled_services, runtime_services) = assembly.into_parts();
         let s3_scope = S3Scope::new(
             "000000000000".parse().expect("account id should parse"),
             "eu-west-2".parse().expect("region should parse"),
@@ -1135,6 +1257,8 @@ mod tests {
         assert!(enabled_services.is_enabled(ServiceName::Lambda));
         assert!(enabled_services.is_enabled(ServiceName::S3));
         assert!(!enabled_services.is_enabled(ServiceName::Sqs));
+        #[cfg(feature = "eventbridge")]
+        assert!(!runtime_services.has_eventbridge_delivery_shutdown());
         assert!(
             runtime_services.s3().list_buckets(&s3_scope).buckets.is_empty()
         );
@@ -1154,6 +1278,19 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn test_runtime_builder_skips_lambda_background_shutdown_when_lambda_is_disabled()
+     {
+        let (_, runtime_services) =
+            TestRuntimeBuilder::new("test-runtime-builder-no-lambda")
+                .with_enabled_services([ServiceName::S3])
+                .build()
+                .expect("test runtime should build")
+                .into_parts();
+
+        assert!(!runtime_services.has_lambda_background_shutdown());
     }
 
     #[test]
@@ -1179,7 +1316,7 @@ mod tests {
             "eu-west-2".parse().expect("region should parse"),
         );
 
-        let (enabled_services, runtime_services, background_tasks) =
+        let (enabled_services, runtime_services) =
             LocalRuntimeBuilder::new(defaults, authenticator)
                 .with_enabled_services([ServiceName::Lambda, ServiceName::S3])
                 .build()
@@ -1189,6 +1326,10 @@ mod tests {
         assert_eq!(enabled_services.enabled_service_count(), 2);
         assert!(enabled_services.is_enabled(ServiceName::Lambda));
         assert!(enabled_services.is_enabled(ServiceName::S3));
+        #[cfg(feature = "eventbridge")]
+        assert!(!runtime_services.has_eventbridge_delivery_shutdown());
+        #[cfg(feature = "lambda")]
+        assert!(runtime_services.has_lambda_background_shutdown());
         assert!(
             runtime_services.s3().list_buckets(&s3_scope).buckets.is_empty()
         );
@@ -1210,9 +1351,10 @@ mod tests {
         );
 
         runtime_services.shutdown();
-        drop(background_tasks);
-        fs::remove_dir_all(&state_dir)
-            .expect("state directory should be removable");
+        if state_dir.exists() {
+            fs::remove_dir_all(&state_dir)
+                .expect("state directory should be removable");
+        }
     }
 
     #[test]
@@ -1233,15 +1375,14 @@ mod tests {
             "eu-west-2".parse().expect("region should parse"),
         );
         let bucket_name = "runtime-shutdown-bucket";
-        let (_, runtime_services, background_tasks) =
-            LocalRuntimeBuilder::new(
-                defaults.clone(),
-                Authenticator::new(defaults.clone()),
-            )
-            .with_enabled_services([ServiceName::S3])
-            .build()
-            .expect("local runtime should build")
-            .into_parts();
+        let (_, runtime_services) = LocalRuntimeBuilder::new(
+            defaults.clone(),
+            Authenticator::new(defaults.clone()),
+        )
+        .with_enabled_services([ServiceName::S3])
+        .build()
+        .expect("local runtime should build")
+        .into_parts();
 
         runtime_services
             .s3()
@@ -1255,17 +1396,15 @@ mod tests {
             )
             .expect("bucket should be created");
         runtime_services.shutdown();
-        drop(background_tasks);
 
-        let (_, reloaded_runtime, reloaded_background_tasks) =
-            LocalRuntimeBuilder::new(
-                defaults.clone(),
-                Authenticator::new(defaults),
-            )
-            .with_enabled_services([ServiceName::S3])
-            .build()
-            .expect("local runtime should rebuild")
-            .into_parts();
+        let (_, reloaded_runtime) = LocalRuntimeBuilder::new(
+            defaults.clone(),
+            Authenticator::new(defaults),
+        )
+        .with_enabled_services([ServiceName::S3])
+        .build()
+        .expect("local runtime should rebuild")
+        .into_parts();
 
         let buckets = reloaded_runtime.s3().list_buckets(&s3_scope).buckets;
         assert_eq!(buckets.len(), 1);
@@ -1274,9 +1413,10 @@ mod tests {
         assert_eq!(buckets[0].region, "eu-west-2");
 
         reloaded_runtime.shutdown();
-        drop(reloaded_background_tasks);
-        fs::remove_dir_all(&state_dir)
-            .expect("state directory should be removable");
+        if state_dir.exists() {
+            fs::remove_dir_all(&state_dir)
+                .expect("state directory should be removable");
+        }
     }
 
     fn unique_label(prefix: &str) -> String {
