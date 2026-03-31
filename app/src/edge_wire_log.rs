@@ -1,4 +1,3 @@
-use crate::EDGE_WIRE_LOG_ENV;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
@@ -14,11 +13,15 @@ use std::time::Duration;
 
 const EDGE_WIRE_LOG_TARGET: &str = "cloudish.edge_wire";
 
-pub(crate) fn try_init_tracing() -> Result<(), WireLogInitError> {
+pub(crate) fn try_init_tracing(
+    wire_log_enabled: bool,
+) -> Result<(), WireLogInitError> {
     static TRACING_INIT: OnceLock<Result<(), WireLogInitError>> =
         OnceLock::new();
 
-    ensure_dispatch_installed(&TRACING_INIT, install_global_dispatch)
+    ensure_dispatch_installed(&TRACING_INIT, || {
+        install_global_dispatch(edge_wire_dispatch(wire_log_enabled))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +34,7 @@ impl fmt::Display for WireLogInitError {
         match self {
             Self::GlobalSubscriberAlreadySet => write!(
                 formatter,
-                "wire logging requested by {EDGE_WIRE_LOG_ENV}, but Cloudish could not install its JSON tracing subscriber because a global tracing subscriber is already installed"
+                "tracing subscriber requested but Cloudish could not install its JSON tracing subscriber because a global tracing subscriber is already installed"
             ),
         }
     }
@@ -44,12 +47,17 @@ fn ensure_dispatch_installed<F>(
     install: F,
 ) -> Result<(), WireLogInitError>
 where
-    F: FnOnce(tracing::Dispatch) -> Result<(), WireLogInitError>,
+    F: FnOnce() -> Result<(), WireLogInitError>,
 {
-    init.get_or_init(|| install(edge_wire_dispatch())).clone()
+    init.get_or_init(install).clone()
 }
 
-fn edge_wire_dispatch() -> tracing::Dispatch {
+fn edge_wire_dispatch(wire_log_enabled: bool) -> tracing::Dispatch {
+    let max_level = if wire_log_enabled {
+        tracing::Level::INFO
+    } else {
+        tracing::Level::WARN
+    };
     let subscriber = tracing_subscriber::fmt()
         .json()
         .flatten_event(true)
@@ -57,7 +65,7 @@ fn edge_wire_dispatch() -> tracing::Dispatch {
         .with_span_list(false)
         .with_target(true)
         .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(max_level)
         .finish();
     tracing::Dispatch::new(subscriber)
 }
@@ -528,11 +536,11 @@ mod tests {
         let init = OnceLock::new();
         let calls = AtomicUsize::new(0);
 
-        let first = ensure_dispatch_installed(&init, |_| {
+        let first = ensure_dispatch_installed(&init, || {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
-        let second = ensure_dispatch_installed(&init, |_| {
+        let second = ensure_dispatch_installed(&init, || {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
@@ -547,11 +555,11 @@ mod tests {
         let init = OnceLock::new();
         let calls = AtomicUsize::new(0);
 
-        let first = ensure_dispatch_installed(&init, |_| {
+        let first = ensure_dispatch_installed(&init, || {
             calls.fetch_add(1, Ordering::SeqCst);
             Err(WireLogInitError::GlobalSubscriberAlreadySet)
         });
-        let second = ensure_dispatch_installed(&init, |_| {
+        let second = ensure_dispatch_installed(&init, || {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });

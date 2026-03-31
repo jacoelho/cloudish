@@ -547,8 +547,13 @@ impl EventBridgeService {
                 &validated,
                 &event,
             )?;
-            self.dispatcher.dispatch(deliveries);
-            entries.push(put_events_success(event_id));
+            match self.dispatcher.dispatch(deliveries) {
+                Ok(()) => entries.push(put_events_success(event_id)),
+                Err(error) => entries.push(put_events_failure(
+                    "InternalException",
+                    &error.to_string(),
+                )),
+            }
         }
 
         Ok(put_events_output(entries))
@@ -799,9 +804,7 @@ impl EventBridgeService {
             &key,
             &rule.targets,
             &event,
-        )?);
-
-        Ok(())
+        )?)
     }
 
     fn cancel_rule_schedule(
@@ -950,11 +953,15 @@ mod tests {
             Ok(())
         }
 
-        fn dispatch(&self, deliveries: Vec<EventBridgePlannedDelivery>) {
+        fn dispatch(
+            &self,
+            deliveries: Vec<EventBridgePlannedDelivery>,
+        ) -> Result<(), EventBridgeError> {
             self.deliveries
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .extend(deliveries);
+            Ok(())
         }
     }
 

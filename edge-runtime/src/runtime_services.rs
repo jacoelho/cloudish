@@ -2,10 +2,45 @@
 use crate::adapters::ThreadWorkQueueShutdownOutcome;
 use aws::{RuntimeDefaults, ServiceName};
 use std::collections::BTreeSet;
+use std::fmt;
 use std::sync::Arc;
 #[cfg(feature = "eventbridge")]
 use std::time::Duration;
 use storage::StorageError;
+
+pub struct ShutdownWarning {
+    service: &'static str,
+    error: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl ShutdownWarning {
+    fn new(
+        service: &'static str,
+        error: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self { service, error: Box::new(error) }
+    }
+
+    pub fn service(&self) -> &str {
+        self.service
+    }
+}
+
+impl fmt::Display for ShutdownWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.service, self.error)
+    }
+}
+
+impl fmt::Debug for ShutdownWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShutdownWarning")
+            .field("service", &self.service)
+            .field("error", &self.error.to_string())
+            .finish()
+    }
+}
 
 type StorageShutdownHook =
     Arc<dyn Fn() -> Result<(), StorageError> + Send + Sync>;
@@ -753,10 +788,13 @@ impl RuntimeServices {
         }
     }
 
-    pub fn shutdown(&self) {
+    pub fn shutdown(&self) -> Vec<ShutdownWarning> {
+        let mut warnings = Vec::new();
         self.begin_shutdown();
         #[cfg(feature = "eventbridge")]
-        let _ = self.eventbridge.shutdown();
+        if let Err(error) = self.eventbridge.shutdown() {
+            warnings.push(ShutdownWarning::new("eventbridge", error));
+        }
         #[cfg(feature = "eventbridge")]
         if let Some(eventbridge_delivery_shutdown) =
             &self.eventbridge_delivery_shutdown
@@ -768,23 +806,37 @@ impl RuntimeServices {
             );
             if !drained {
                 eventbridge_delivery_shutdown.request_hard_stop();
-                let _ = eventbridge_delivery_shutdown
-                    .finish(EVENTBRIDGE_DELIVERY_ABORT_TIMEOUT);
+                if let Err(error) = eventbridge_delivery_shutdown
+                    .finish(EVENTBRIDGE_DELIVERY_ABORT_TIMEOUT)
+                {
+                    warnings.push(ShutdownWarning::new(
+                        "eventbridge-delivery",
+                        error,
+                    ));
+                }
             }
         }
         #[cfg(feature = "lambda")]
         if let Some(lambda_background_shutdown) =
             &self.lambda_background_shutdown
+            && let Err(error) = lambda_background_shutdown()
         {
-            let _ = lambda_background_shutdown();
+            warnings.push(ShutdownWarning::new("lambda-background", error));
         }
         #[cfg(feature = "rds")]
-        let _ = self.rds.shutdown();
-        #[cfg(feature = "elasticache")]
-        let _ = self.elasticache.shutdown();
-        if let Some(storage_shutdown) = &self.storage_shutdown {
-            let _ = storage_shutdown();
+        if let Err(error) = self.rds.shutdown() {
+            warnings.push(ShutdownWarning::new("rds", error));
         }
+        #[cfg(feature = "elasticache")]
+        if let Err(error) = self.elasticache.shutdown() {
+            warnings.push(ShutdownWarning::new("elasticache", error));
+        }
+        if let Some(storage_shutdown) = &self.storage_shutdown
+            && let Err(error) = storage_shutdown()
+        {
+            warnings.push(ShutdownWarning::new("storage", error));
+        }
+        warnings
     }
 
     #[cfg(feature = "apigateway")]

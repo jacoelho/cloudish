@@ -634,8 +634,15 @@ impl EventBridgeDeliveryDispatcher for EventBridgeDispatcher {
         }
     }
 
-    fn dispatch(&self, deliveries: Vec<EventBridgePlannedDelivery>) {
-        let _ = self.delivery_worker.enqueue(deliveries);
+    fn dispatch(
+        &self,
+        deliveries: Vec<EventBridgePlannedDelivery>,
+    ) -> Result<(), EventBridgeError> {
+        self.delivery_worker.enqueue(deliveries).map_err(|error| {
+            EventBridgeError::InternalFailure {
+                message: error.to_string(),
+            }
+        })
     }
 }
 

@@ -228,14 +228,14 @@ impl CloudishApp {
     async fn serve_with_shutdown_with_wire_log_init<F, G>(
         &self,
         shutdown: F,
-        init_wire_log: G,
+        init_tracing: G,
     ) -> Result<(), StartupError>
     where
         F: Future<Output = ()>,
-        G: FnOnce() -> Result<(), WireLogInitError>,
+        G: FnOnce(bool) -> Result<(), WireLogInitError>,
     {
         let mut serve_guard = self.begin_serve()?;
-        if let Err(error) = self.prepare_for_serve_with(init_wire_log) {
+        if let Err(error) = self.prepare_for_serve_with(init_tracing) {
             serve_guard.release_to_ready();
             return Err(error);
         }
@@ -283,14 +283,14 @@ impl CloudishApp {
         &self,
         listener: TcpListener,
         shutdown: F,
-        init_wire_log: G,
+        init_tracing: G,
     ) -> Result<(), StartupError>
     where
         F: Future<Output = ()>,
-        G: FnOnce() -> Result<(), WireLogInitError>,
+        G: FnOnce(bool) -> Result<(), WireLogInitError>,
     {
         let mut serve_guard = self.begin_serve()?;
-        if let Err(error) = self.prepare_for_serve_with(init_wire_log) {
+        if let Err(error) = self.prepare_for_serve_with(init_tracing) {
             serve_guard.release_to_ready();
             return Err(error);
         }
@@ -329,16 +329,13 @@ impl CloudishApp {
 
     fn prepare_for_serve_with<F>(
         &self,
-        init_wire_log: F,
+        init_tracing: F,
     ) -> Result<(), StartupError>
     where
-        F: FnOnce() -> Result<(), WireLogInitError>,
+        F: FnOnce(bool) -> Result<(), WireLogInitError>,
     {
-        if !self.wire_log_enabled {
-            return Ok(());
-        }
-
-        init_wire_log().map_err(StartupError::WireLogInit)
+        init_tracing(self.wire_log_enabled)
+            .map_err(StartupError::WireLogInit)
     }
 
     fn begin_serve(&self) -> Result<ServeGuard, StartupError> {
@@ -396,7 +393,10 @@ where
 fn recover<T>(result: LockResult<MutexGuard<'_, T>>) -> MutexGuard<'_, T> {
     match result {
         Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        Err(poisoned) => {
+            tracing::warn!("recovered from poisoned mutex");
+            poisoned.into_inner()
+        }
     }
 }
 
@@ -651,7 +651,7 @@ mod tests {
     use std::io::Write;
     use std::net::Shutdown;
     use std::net::TcpListener as StdTcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
     use test_support::{
@@ -826,21 +826,32 @@ mod tests {
     }
 
     #[test]
-    fn prepare_for_serve_skips_wire_log_initialization_when_disabled() {
+    fn prepare_for_serve_always_initializes_tracing() {
         let server = CloudishApp::from_runtime_defaults(runtime_defaults(
             "wire-log-disabled",
         ))
         .expect("server bootstrap should succeed");
         let init_calls = AtomicUsize::new(0);
+        let received_wire_log_enabled = AtomicBool::new(true);
 
         server
-            .prepare_for_serve_with(|| {
+            .prepare_for_serve_with(|wire_log_enabled| {
                 init_calls.fetch_add(1, Ordering::SeqCst);
+                received_wire_log_enabled
+                    .store(wire_log_enabled, Ordering::SeqCst);
                 Ok(())
             })
-            .expect("disabled wire log should skip initialization");
+            .expect("tracing initialization should succeed");
 
-        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            init_calls.load(Ordering::SeqCst),
+            1,
+            "tracing init should be called even when wire log is disabled",
+        );
+        assert!(
+            !received_wire_log_enabled.load(Ordering::SeqCst),
+            "wire_log_enabled should be false when wire log is disabled",
+        );
     }
 
     #[test]
@@ -932,7 +943,7 @@ mod tests {
         );
         assert_eq!(
             wire_log_error.to_string(),
-            "failed to initialize edge wire logging: wire logging requested by CLOUDISH_EDGE_WIRE_LOG, but Cloudish could not install its JSON tracing subscriber because a global tracing subscriber is already installed"
+            "failed to initialize edge wire logging: tracing subscriber requested but Cloudish could not install its JSON tracing subscriber because a global tracing subscriber is already installed"
         );
         assert_eq!(
             Error::source(&state_directory_error)
@@ -943,7 +954,7 @@ mod tests {
         assert_eq!(
             Error::source(&wire_log_error).map(ToString::to_string).as_deref(),
             Some(
-                "wire logging requested by CLOUDISH_EDGE_WIRE_LOG, but Cloudish could not install its JSON tracing subscriber because a global tracing subscriber is already installed"
+                "tracing subscriber requested but Cloudish could not install its JSON tracing subscriber because a global tracing subscriber is already installed"
             )
         );
     }
@@ -1141,7 +1152,7 @@ mod tests {
         .expect("server bootstrap should succeed");
 
         let error = server
-            .serve_with_shutdown_with_wire_log_init(async {}, || {
+            .serve_with_shutdown_with_wire_log_init(async {}, |_| {
                 Err(WireLogInitError::GlobalSubscriberAlreadySet)
             })
             .await
@@ -1694,7 +1705,7 @@ mod tests {
             .serve_listener_with_shutdown_with_wire_log_init(
                 listener,
                 async {},
-                || Err(WireLogInitError::GlobalSubscriberAlreadySet),
+                |_| Err(WireLogInitError::GlobalSubscriberAlreadySet),
             )
             .await
             .expect_err("wire log init failure should surface");

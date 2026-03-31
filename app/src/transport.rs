@@ -47,14 +47,20 @@ where
                     wait_for_blocking_requests(blocking_requests.clone()).await;
                 drain_connection_tasks(&mut connections).await;
                 return finish_server_shutdown(shutdown_outcome, || {
-                    router.shutdown()
+                    let warnings = router.shutdown();
+                    for warning in &warnings {
+                        tracing::warn!(%warning, "service shutdown warning");
+                    }
                 });
             }
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(accepted) => accepted,
                     Err(source) => {
-                        router.shutdown();
+                        let warnings = router.shutdown();
+                        for warning in &warnings {
+                            tracing::warn!(%warning, "service shutdown warning");
+                        }
                         return Err(StartupError::Accept { source });
                     }
                 };
@@ -122,10 +128,13 @@ async fn serve_connection(
         }
     });
 
-    let _ = http1::Builder::new()
+    if let Err(error) = http1::Builder::new()
         .half_close(true)
         .serve_connection(io, service)
-        .await;
+        .await
+    {
+        tracing::warn!(%error, "http connection error");
+    }
 }
 
 async fn handle_request(
@@ -345,6 +354,11 @@ where
             Ok(())
         }
         BlockingRequestShutdownOutcome::TimedOut { active_requests } => {
+            tracing::warn!(
+                active_requests,
+                "blocking requests did not drain, proceeding with teardown"
+            );
+            shutdown_runtime();
             Err(StartupError::ShutdownTimeout { active_requests })
         }
     }
@@ -558,7 +572,13 @@ impl Drop for ActiveBlockingRequest {
 }
 
 fn recover<T>(result: LockResult<T>) -> T {
-    result.unwrap_or_else(std::sync::PoisonError::into_inner)
+    match result {
+        Ok(value) => value,
+        Err(poisoned) => {
+            tracing::warn!("recovered from poisoned mutex");
+            poisoned.into_inner()
+        }
+    }
 }
 
 fn json_response(
@@ -803,22 +823,22 @@ mod tests {
     }
 
     #[test]
-    fn finish_server_shutdown_skips_runtime_teardown_after_timeout() {
+    fn finish_server_shutdown_tears_down_and_returns_error_after_timeout() {
         let shutdown_called = AtomicBool::new(false);
 
         let error = finish_server_shutdown(
             BlockingRequestShutdownOutcome::TimedOut { active_requests: 1 },
             || shutdown_called.store(true, Ordering::SeqCst),
         )
-        .expect_err("shutdown timeout should skip runtime teardown");
+        .expect_err("shutdown timeout should return error");
 
         assert!(matches!(
             error,
             StartupError::ShutdownTimeout { active_requests: 1 }
         ));
         assert!(
-            !shutdown_called.load(Ordering::SeqCst),
-            "runtime teardown should not run while blocking work is still alive",
+            shutdown_called.load(Ordering::SeqCst),
+            "runtime teardown should run even after timeout",
         );
     }
 
