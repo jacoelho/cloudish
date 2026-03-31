@@ -338,7 +338,12 @@ impl CloudishApp {
         init_tracing(should_log_wire).map_err(StartupError::WireLogInit).or_else(
             |error| {
                 if !should_log_wire
-                    && matches!(error, WireLogInitError::GlobalSubscriberAlreadySet)
+                    && matches!(
+                        error,
+                        StartupError::WireLogInit(
+                            WireLogInitError::GlobalSubscriberAlreadySet
+                        )
+                    )
                 {
                     tracing::warn!("wire log initialization skipped because a global tracing subscriber is already installed");
                     Ok(())
