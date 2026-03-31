@@ -334,8 +334,19 @@ impl CloudishApp {
     where
         F: FnOnce(bool) -> Result<(), WireLogInitError>,
     {
-        init_tracing(self.wire_log_enabled)
-            .map_err(StartupError::WireLogInit)
+        let should_log_wire = self.wire_log_enabled;
+        init_tracing(should_log_wire).map_err(StartupError::WireLogInit).or_else(
+            |error| {
+                if !should_log_wire
+                    && matches!(error, WireLogInitError::GlobalSubscriberAlreadySet)
+                {
+                    tracing::warn!("wire log initialization skipped because a global tracing subscriber is already installed");
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            },
+        )
     }
 
     fn begin_serve(&self) -> Result<ServeGuard, StartupError> {
@@ -855,6 +866,37 @@ mod tests {
     }
 
     #[test]
+    fn prepare_for_serve_ignores_existing_tracing_subscriber_when_wire_log_disabled() {
+        let server = CloudishApp::from_runtime_defaults(runtime_defaults(
+            "wire-log-disabled-existing-subscriber",
+        ))
+        .expect("server bootstrap should succeed");
+        let init_calls = AtomicUsize::new(0);
+        let received_wire_log_enabled = AtomicBool::new(true);
+
+        server
+            .prepare_for_serve_with(|wire_log_enabled| {
+                init_calls.fetch_add(1, Ordering::SeqCst);
+                received_wire_log_enabled
+                    .store(wire_log_enabled, Ordering::SeqCst);
+                Err(WireLogInitError::GlobalSubscriberAlreadySet)
+            })
+            .expect(
+                "existing tracing subscriber should be tolerated when wire log is disabled",
+            );
+
+        assert_eq!(
+            init_calls.load(Ordering::SeqCst),
+            1,
+            "tracing init should be attempted even when wire log is disabled",
+        );
+        assert!(
+            !received_wire_log_enabled.load(Ordering::SeqCst),
+            "wire_log_enabled should be false when wire log is disabled",
+        );
+    }
+
+    #[test]
     fn bootstrap_server_exposes_the_default_edge_address() {
         let state_directory =
             temporary_directory("server-address").join("state");
@@ -1167,6 +1209,37 @@ mod tests {
         let listener = StdTcpListener::bind(("127.0.0.1", port))
             .expect("wire log init failure should happen before bind");
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn serve_listener_with_wire_log_disabled_ignores_existing_tracing_subscriber()
+    {
+        let server = CloudishApp::from_runtime_defaults(runtime_defaults(
+            "wire-log-disabled-existing-subscriber-serving",
+        ))
+        .expect("server bootstrap should succeed");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            server
+                .serve_listener_with_shutdown_with_wire_log_init(
+                    listener,
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                    |_| Err(WireLogInitError::GlobalSubscriberAlreadySet),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(()).expect("server should still be running");
+        let result = handle
+            .await
+            .expect("server task should complete");
+        result.expect("server should stop cleanly");
     }
 
     #[tokio::test]
