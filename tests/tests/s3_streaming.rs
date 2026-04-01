@@ -1,12 +1,11 @@
 #![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
     clippy::unreachable,
-    clippy::indexing_slicing,
     clippy::assertions_on_constants,
     clippy::missing_panics_doc,
-    clippy::missing_errors_doc
+    clippy::missing_errors_doc,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_arguments
 )]
 use auth::{BOOTSTRAP_ACCESS_KEY_ID, BOOTSTRAP_SECRET_ACCESS_KEY};
 use aws::BootstrapSignatureVerificationMode;
