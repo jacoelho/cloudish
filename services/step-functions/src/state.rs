@@ -1051,8 +1051,7 @@ impl StepFunctionsService {
         let mut suffix = count + 1;
         loop {
             let name = format!("execution-{suffix}");
-            let key =
-                ExecutionStorageKey::new(scope, &state_machine_name, &name);
+            let key = ExecutionStorageKey::new(scope, state_machine_name, &name);
             if self.execution_store.get(&key).is_none()
                 && !pending_executions.contains(&key)
             {
@@ -1157,7 +1156,7 @@ impl StepFunctionsService {
                 name: reservation.execution_name.clone(),
                 output: None,
                 start_date: reservation.start_date,
-                state_machine_arn: state_machine.state_machine_arn.clone(),
+                state_machine_arn: state_machine.state_machine_arn,
                 status: ExecutionStatus::Running,
                 stop_date: None,
             },
@@ -3714,7 +3713,7 @@ mod tests {
                 StartExecutionInput {
                     input: None,
                     name: Some("run-1".to_owned()),
-                    state_machine_arn: created.state_machine_arn.clone(),
+                    state_machine_arn: created.state_machine_arn,
                     trace_header: None,
                 },
             ),
@@ -3929,7 +3928,7 @@ mod tests {
             service.describe_execution(
                 &scope(),
                 DescribeExecutionInput {
-                    execution_arn: execution_arn.clone(),
+                    execution_arn,
                 },
             ),
             Err(StepFunctionsError::ExecutionDoesNotExist { .. })
@@ -4101,7 +4100,7 @@ mod tests {
             service.describe_execution(
                 &step_functions_scope,
                 DescribeExecutionInput {
-                    execution_arn: execution_arn.clone(),
+                    execution_arn,
                 },
             ),
             Err(StepFunctionsError::ExecutionDoesNotExist { .. })
@@ -4188,7 +4187,7 @@ mod tests {
                         "definition": definition,
                         "name": "legacy",
                         "role_arn": "arn:aws:iam::000000000000:role/demo",
-                        "state_machine_arn": state_machine_arn.clone(),
+                        "state_machine_arn": state_machine_arn,
                         "state_machine_type": "STANDARD",
                     }
                 }
@@ -4239,7 +4238,7 @@ mod tests {
                 StartExecutionInput {
                     input: None,
                     name: Some("legacy-run".to_owned()),
-                    state_machine_arn: state_machine_arn.clone(),
+                    state_machine_arn,
                     trace_header: None,
                 },
             )

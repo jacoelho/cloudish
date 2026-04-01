@@ -289,8 +289,8 @@ fn sanitize_path(path: &str) -> String {
 
 fn sanitize_query_pair(pair: &str) -> String {
     let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-    let decoded_key = urlencoding::decode(raw_key)
-        .map_or_else(|_| raw_key.into(), |key| key);
+    let decoded_key =
+        urlencoding::decode(raw_key).unwrap_or_else(|_| raw_key.into());
     if matches_ignore_ascii_case(
         decoded_key.as_ref(),
         &["X-Amz-Credential", "X-Amz-Security-Token", "X-Amz-Signature"],

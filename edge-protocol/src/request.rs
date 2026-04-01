@@ -30,6 +30,13 @@ impl EdgeRequest {
         }
     }
 
+    /// Parses a raw HTTP/1.x request into the edge request representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RequestParseError` when the request bytes are not valid UTF-8,
+    /// the request line is missing or malformed, or any header line does not
+    /// use the `name:value` form.
     pub fn parse(request: &[u8]) -> Result<Self, RequestParseError> {
         let header_end = request
             .windows(4)

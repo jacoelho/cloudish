@@ -6,9 +6,10 @@ use crate::aws_chunked::{
 };
 use aws::{
     AccountId, Arn, AwsError, AwsErrorFamily, AwsPrincipalType,
-    CallerCredentialKind, CallerIdentity, CredentialScope, IamAccessKeyLookup,
-    IamAccessKeyStatus, IamResourceTag, Partition, RuntimeDefaults,
-    ServiceName, SessionCredentialLookup, StableAwsPrincipal,
+    BootstrapSignatureVerificationMode, CallerCredentialKind, CallerIdentity,
+    CredentialScope, IamAccessKeyLookup, IamAccessKeyStatus, IamResourceTag,
+    Partition, RuntimeDefaults, ServiceName, SessionCredentialLookup,
+    StableAwsPrincipal,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
@@ -213,6 +214,15 @@ impl Authenticator {
         self.defaults.default_region()
     }
 
+    fn skip_bootstrap_signature_verification(
+        &self,
+        credential: &CredentialFields,
+    ) -> bool {
+        credential.access_key_id == BOOTSTRAP_ACCESS_KEY_ID
+            && self.defaults.bootstrap_signature_verification()
+                == BootstrapSignatureVerificationMode::Skip
+    }
+
     /// Verifies a SigV4-authenticated request using either header-based or
     /// presigned-query credentials.
     ///
@@ -300,7 +310,11 @@ impl Authenticator {
             &canonical_request,
         );
 
-        if expected_signature != authorization.signature {
+        if expected_signature != authorization.signature
+            && !self.skip_bootstrap_signature_verification(
+                &authorization.credential,
+            )
+        {
             return Err(signature_does_not_match_error(
                 "The request signature we calculated does not match the signature you provided.",
             ));
@@ -366,7 +380,11 @@ impl Authenticator {
             &canonical_request,
         );
 
-        if expected_signature != authorization.signature {
+        if expected_signature != authorization.signature
+            && !self.skip_bootstrap_signature_verification(
+                &authorization.credential,
+            )
+        {
             return Err(signature_does_not_match_error(
                 "The request signature we calculated does not match the signature you provided.",
             ));
@@ -378,6 +396,9 @@ impl Authenticator {
             &authorization.credential,
             request_timestamp.raw,
             &authorization.signature,
+            !self.skip_bootstrap_signature_verification(
+                &authorization.credential,
+            ),
         );
 
         Ok(Some(VerifiedSignature::new(
@@ -794,6 +815,7 @@ impl CanonicalPayloadMode<'_> {
         credential: &CredentialFields,
         amz_date: &str,
         seed_signature: &str,
+        verify_signatures: bool,
     ) -> VerifiedPayload {
         match self {
             Self::SignedBody => VerifiedPayload::SignedBody,
@@ -802,7 +824,7 @@ impl CanonicalPayloadMode<'_> {
             }
             Self::HeaderValue(_) => VerifiedPayload::SignedBody,
             Self::AwsChunked(mode) => {
-                VerifiedPayload::AwsChunked(AwsChunkedSigningContext::new(
+                let context = AwsChunkedSigningContext::new(
                     secret_access_key,
                     &credential.date,
                     credential.scope.region().as_str(),
@@ -810,7 +832,13 @@ impl CanonicalPayloadMode<'_> {
                     amz_date,
                     seed_signature,
                     mode,
-                ))
+                );
+
+                VerifiedPayload::AwsChunked(if verify_signatures {
+                    context
+                } else {
+                    context.without_signature_verification()
+                })
             }
         }
     }
@@ -1436,10 +1464,11 @@ mod tests {
         build_signature, canonical_query, decode_authorization_message,
     };
     use aws::{
-        AccountId, Arn, AwsPrincipalType, CallerCredentialKind,
-        IamAccessKeyLookup, IamAccessKeyRecord, IamAccessKeyStatus,
-        IamResourceTag, RuntimeDefaults, SessionCredentialLookup,
-        SessionCredentialRecord, StableAwsPrincipal, TemporaryCredentialKind,
+        AccountId, Arn, AwsPrincipalType, BootstrapSignatureVerificationMode,
+        CallerCredentialKind, IamAccessKeyLookup, IamAccessKeyRecord,
+        IamAccessKeyStatus, IamResourceTag, RuntimeDefaults,
+        SessionCredentialLookup, SessionCredentialRecord, StableAwsPrincipal,
+        TemporaryCredentialKind,
     };
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -1489,6 +1518,15 @@ mod tests {
     fn authenticator(now: u64) -> Authenticator {
         Authenticator::with_time_source(
             defaults(),
+            Arc::new(move || UNIX_EPOCH + Duration::from_secs(now)),
+        )
+    }
+
+    fn unsafe_bootstrap_authenticator(now: u64) -> Authenticator {
+        Authenticator::with_time_source(
+            defaults().with_bootstrap_signature_verification(
+                BootstrapSignatureVerificationMode::Skip,
+            ),
             Arc::new(move || UNIX_EPOCH + Duration::from_secs(now)),
         )
     }
@@ -1911,6 +1949,75 @@ mod tests {
     }
 
     #[test]
+    fn auth_can_skip_bootstrap_signature_mismatches() {
+        let request = RequestAuth::new(
+            "POST",
+            "/",
+            vec![
+                RequestHeader::new("Host", "localhost"),
+                RequestHeader::new(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded",
+                ),
+                RequestHeader::new("X-Amz-Date", "20260325T120000Z"),
+                RequestHeader::new(
+                    "Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260325/eu-west-2/sts/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+            ],
+            b"Action=GetCallerIdentity&Version=2011-06-15",
+        );
+
+        let verified =
+            unsafe_bootstrap_authenticator(REQUEST_TIME_EPOCH_SECONDS)
+                .verify(
+                    &request,
+                    &AccessKeyLookup::default(),
+                    &SessionLookup::default(),
+                )
+                .expect("bootstrap mismatch should be skipped")
+                .expect("signed request should authenticate");
+
+        assert_eq!(verified.account_id().as_str(), "000000000000");
+        assert_eq!(
+            verified.caller_identity().arn().to_string(),
+            "arn:aws:iam::000000000000:root"
+        );
+    }
+
+    #[test]
+    fn auth_still_rejects_bootstrap_security_tokens_when_bypass_is_enabled() {
+        let request = RequestAuth::new(
+            "POST",
+            "/",
+            vec![
+                RequestHeader::new("Host", "localhost"),
+                RequestHeader::new(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded",
+                ),
+                RequestHeader::new("X-Amz-Date", "20260325T120000Z"),
+                RequestHeader::new("X-Amz-Security-Token", "token-1"),
+                RequestHeader::new(
+                    "Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260325/eu-west-2/sts/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, Signature=0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+            ],
+            b"Action=GetCallerIdentity&Version=2011-06-15",
+        );
+
+        let error = unsafe_bootstrap_authenticator(REQUEST_TIME_EPOCH_SECONDS)
+            .verify(
+                &request,
+                &AccessKeyLookup::default(),
+                &SessionLookup::default(),
+            )
+            .expect_err("bootstrap security tokens must still fail");
+
+        assert_eq!(error.code(), "InvalidClientTokenId");
+    }
+
+    #[test]
     fn auth_rejects_signed_requests_when_header_hash_does_not_match_body() {
         let body = b"Action=GetCallerIdentity&Version=2011-06-15";
         let request_timestamp = "20260325T120000Z";
@@ -2323,6 +2430,74 @@ mod tests {
 
         assert_eq!(verified.account_id().as_str(), "000000000000");
         assert_eq!(verified.scope().service().as_str(), "s3");
+    }
+
+    #[test]
+    fn auth_can_skip_bootstrap_presigned_signature_mismatches() {
+        let request = RequestAuth::new(
+            "GET",
+            "/demo/object.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=test%2F20260325%2Feu-west-2%2Fs3%2Faws4_request&X-Amz-Date=20260325T120000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=0000000000000000000000000000000000000000000000000000000000000000",
+            vec![RequestHeader::new("Host", "localhost")],
+            b"",
+        );
+
+        let verified =
+            unsafe_bootstrap_authenticator(REQUEST_TIME_PLUS_150_SECONDS)
+                .verify(
+                    &request,
+                    &AccessKeyLookup::default(),
+                    &SessionLookup::default(),
+                )
+                .expect("bootstrap mismatch should be skipped")
+                .expect("pre-signed request should authenticate");
+
+        assert_eq!(verified.account_id().as_str(), "000000000000");
+        assert_eq!(verified.scope().service().as_str(), "s3");
+    }
+
+    #[test]
+    fn auth_still_rejects_iam_user_signature_mismatches_when_bootstrap_bypass_is_enabled()
+     {
+        let request = RequestAuth::new(
+            "POST",
+            "/",
+            vec![
+                RequestHeader::new("Host", "localhost"),
+                RequestHeader::new(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded",
+                ),
+                RequestHeader::new("X-Amz-Date", "20260325T120000Z"),
+                RequestHeader::new(
+                    "Authorization",
+                    "AWS4-HMAC-SHA256 Credential=AKIA0000000000000001/20260325/eu-west-2/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+            ],
+            b"Action=ListUsers",
+        );
+        let access_key_lookup = AccessKeyLookup {
+            record: Some(IamAccessKeyRecord {
+                access_key_id: "AKIA0000000000000001".to_owned(),
+                account_id: "123456789012"
+                    .parse::<AccountId>()
+                    .expect("account id should parse"),
+                create_date: "2026-03-25T12:00:00Z".to_owned(),
+                region: "eu-west-2".parse().expect("region should parse"),
+                secret_access_key: "user-secret-key".to_owned(),
+                status: IamAccessKeyStatus::Active,
+                user_arn: "arn:aws:iam::123456789012:user/alice"
+                    .parse::<Arn>()
+                    .expect("user ARN should parse"),
+                user_id: "AIDA1234567890EXAMPLE".to_owned(),
+                user_name: "alice".to_owned(),
+            }),
+        };
+
+        let error = unsafe_bootstrap_authenticator(REQUEST_TIME_EPOCH_SECONDS)
+            .verify(&request, &access_key_lookup, &SessionLookup::default())
+            .expect_err("non-bootstrap credentials must still verify");
+
+        assert_eq!(error.code(), "SignatureDoesNotMatch");
     }
 
     #[test]

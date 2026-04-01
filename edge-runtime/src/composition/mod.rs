@@ -139,7 +139,10 @@ mod tests {
             .decode(signer.sign(string_to_sign))
             .expect("signature should be base64");
         let digest = Sha1::digest(string_to_sign.as_bytes());
-        let public_key = cloudish_sns_signing_key().to_public_key();
+        let public_key = cloudish_sns_signing_key()
+            .as_ref()
+            .expect("embedded SNS signing key should parse")
+            .to_public_key();
 
         public_key
             .verify(Pkcs1v15Sign::new::<Sha1>(), &digest, &signature)
@@ -635,7 +638,7 @@ mod tests {
 
     #[test]
     fn api_gateway_integration_executor_rejects_missing_lambda_dependency()
-    -> TestResult<()> {
+    {
         let executor = ApiGatewayIntegrationExecutor::new(None, None);
         let invocation = ExecuteApiInvocation::new(
             "api-id".to_owned(),
@@ -643,13 +646,15 @@ mod tests {
                 ExecuteApiLambdaProxyPlan::new(
                     LambdaFunctionTarget::parse(
                         "arn:aws:lambda:eu-west-2:000000000000:function:demo",
-                    )?,
+                    )
+                    .expect("lambda target should parse"),
                     br#"{"path":"/pets"}"#.to_vec(),
                     ExecuteApiSourceArn::from_resource(
-                        &region_id()?,
-                        &account_id()?,
+                        &region_id().expect("region should parse"),
+                        &account_id().expect("account should parse"),
                         "api-id/dev/GET/pets",
-                    )?,
+                    )
+                    .expect("source ARN should build"),
                     false,
                 ),
             )),
@@ -661,7 +666,10 @@ mod tests {
 
         let error = executor
             .execute(
-                &ApiGatewayScope::new(account_id()?, region_id()?),
+                &ApiGatewayScope::new(
+                    account_id().expect("account should parse"),
+                    region_id().expect("region should parse"),
+                ),
                 &invocation,
             )
             .expect_err("missing Lambda dependency should fail");
@@ -673,8 +681,6 @@ mod tests {
                 status_code: 500,
             }
         );
-
-        Ok(())
     }
 
     #[test]

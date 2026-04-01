@@ -6,12 +6,45 @@ use thiserror::Error;
 pub const DEFAULT_ACCOUNT_ENV: &str = "CLOUDISH_DEFAULT_ACCOUNT";
 pub const DEFAULT_REGION_ENV: &str = "CLOUDISH_DEFAULT_REGION";
 pub const STATE_DIRECTORY_ENV: &str = "CLOUDISH_STATE_DIR";
+pub const UNSAFE_BOOTSTRAP_AUTH_ENV: &str = "CLOUDISH_UNSAFE_BOOTSTRAP_AUTH";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BootstrapSignatureVerificationMode {
+    Enforce,
+    Skip,
+}
+
+impl BootstrapSignatureVerificationMode {
+    /// Parses the `CLOUDISH_UNSAFE_BOOTSTRAP_AUTH` environment value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RuntimeDefaultsError` when the value is blank or not one of
+    /// the supported boolean spellings.
+    pub fn parse_env_value(
+        value: String,
+    ) -> Result<Self, RuntimeDefaultsError> {
+        let value = value.trim().to_owned();
+        if value.is_empty() {
+            return Err(RuntimeDefaultsError::BlankUnsafeBootstrapAuth);
+        }
+
+        match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(Self::Skip),
+            "0" | "false" | "no" | "off" => Ok(Self::Enforce),
+            _ => {
+                Err(RuntimeDefaultsError::InvalidUnsafeBootstrapAuth { value })
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeDefaults {
     default_account: AccountId,
     default_region: RegionId,
     state_directory: PathBuf,
+    bootstrap_signature_verification: BootstrapSignatureVerificationMode,
 }
 
 impl RuntimeDefaults {
@@ -66,6 +99,8 @@ impl RuntimeDefaults {
                 )
             })?,
             state_directory: PathBuf::from(state_directory),
+            bootstrap_signature_verification:
+                BootstrapSignatureVerificationMode::Enforce,
         })
     }
 
@@ -87,6 +122,21 @@ impl RuntimeDefaults {
 
     pub fn state_directory(&self) -> &Path {
         &self.state_directory
+    }
+
+    pub fn bootstrap_signature_verification(
+        &self,
+    ) -> BootstrapSignatureVerificationMode {
+        self.bootstrap_signature_verification
+    }
+
+    #[must_use]
+    pub fn with_bootstrap_signature_verification(
+        mut self,
+        mode: BootstrapSignatureVerificationMode,
+    ) -> Self {
+        self.bootstrap_signature_verification = mode;
+        self
     }
 }
 
@@ -120,6 +170,14 @@ pub enum RuntimeDefaultsError {
         #[source]
         source: RegionIdError,
     },
+    #[error(
+        "invalid bootstrap auth mode in {UNSAFE_BOOTSTRAP_AUTH_ENV}: value must not be blank"
+    )]
+    BlankUnsafeBootstrapAuth,
+    #[error(
+        "invalid bootstrap auth mode in {UNSAFE_BOOTSTRAP_AUTH_ENV}: unsupported value `{value}`"
+    )]
+    InvalidUnsafeBootstrapAuth { value: String },
 }
 
 impl RuntimeDefaultsError {
@@ -135,8 +193,9 @@ impl RuntimeDefaultsError {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_ACCOUNT_ENV, DEFAULT_REGION_ENV, RuntimeDefaults,
-        RuntimeDefaultsError, STATE_DIRECTORY_ENV,
+        BootstrapSignatureVerificationMode, DEFAULT_ACCOUNT_ENV,
+        DEFAULT_REGION_ENV, RuntimeDefaults, RuntimeDefaultsError,
+        STATE_DIRECTORY_ENV, UNSAFE_BOOTSTRAP_AUTH_ENV,
     };
     use crate::{AccountIdError, RegionIdError};
 
@@ -156,6 +215,10 @@ mod tests {
         assert_eq!(
             defaults.state_directory().to_string_lossy(),
             "/tmp/cloudish"
+        );
+        assert_eq!(
+            defaults.bootstrap_signature_verification(),
+            BootstrapSignatureVerificationMode::Enforce
         );
     }
 
@@ -218,6 +281,72 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "invalid default region in CLOUDISH_DEFAULT_REGION: region id must contain at least one '-' separator"
+        );
+    }
+
+    #[test]
+    fn runtime_defaults_can_override_bootstrap_signature_verification() {
+        let defaults = RuntimeDefaults::try_new(
+            Some("000000000000".to_owned()),
+            Some("eu-west-2".to_owned()),
+            Some("/tmp/cloudish".to_owned()),
+        )
+        .expect("required values should build defaults")
+        .with_bootstrap_signature_verification(
+            BootstrapSignatureVerificationMode::Skip,
+        );
+
+        assert_eq!(
+            defaults.bootstrap_signature_verification(),
+            BootstrapSignatureVerificationMode::Skip
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_signature_verification_env_values() {
+        assert_eq!(
+            BootstrapSignatureVerificationMode::parse_env_value(
+                "true".to_owned()
+            )
+            .expect("truthy values should parse"),
+            BootstrapSignatureVerificationMode::Skip
+        );
+        assert_eq!(
+            BootstrapSignatureVerificationMode::parse_env_value(
+                "off".to_owned()
+            )
+            .expect("falsey values should parse"),
+            BootstrapSignatureVerificationMode::Enforce
+        );
+    }
+
+    #[test]
+    fn reject_blank_bootstrap_signature_verification_env_value() {
+        let error = BootstrapSignatureVerificationMode::parse_env_value(
+            "   ".to_owned(),
+        )
+        .expect_err("blank values must fail");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid bootstrap auth mode in {UNSAFE_BOOTSTRAP_AUTH_ENV}: value must not be blank"
+            )
+        );
+    }
+
+    #[test]
+    fn reject_invalid_bootstrap_signature_verification_env_value() {
+        let error = BootstrapSignatureVerificationMode::parse_env_value(
+            "verbose".to_owned(),
+        )
+        .expect_err("unsupported values must fail");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid bootstrap auth mode in {UNSAFE_BOOTSTRAP_AUTH_ENV}: unsupported value `verbose`"
+            )
         );
     }
 }

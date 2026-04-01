@@ -4394,11 +4394,12 @@ mod tests {
             br#"{"ok":true}"#.to_vec(),
             Option::<String>::None,
         ));
-        let clock = SwitchableClock::new(UNIX_EPOCH + Duration::from_secs(60));
+        let clock =
+            Arc::new(SwitchableClock::new(UNIX_EPOCH + Duration::from_secs(60)));
         let (service, _sqs) = service_with_sqs_and_clock(
             executor.clone(),
             Arc::new(MemoryBlobStore::default()),
-            Arc::new(clock.clone()),
+            clock.clone(),
         );
 
         service
@@ -4476,11 +4477,11 @@ mod tests {
             br#"{"ok":true}"#.to_vec(),
             Option::<String>::None,
         ));
-        let clock = ManualClock::new(60_000);
+        let clock = Arc::new(ManualClock::new(60_000));
         let (lambda, sqs) = service_with_sqs_and_clock(
             executor.clone(),
             Arc::new(MemoryBlobStore::default()),
-            Arc::new(clock.clone()),
+            clock,
         );
         let source_queue = create_queue(&sqs, "lambda-batching-window");
         let source_queue_arn = queue_arn(&sqs, &source_queue);
@@ -4566,11 +4567,11 @@ mod tests {
             br#"{"ok":true}"#.to_vec(),
             Option::<String>::None,
         ));
-        let clock = ManualClock::new(60_000);
+        let clock = Arc::new(ManualClock::new(60_000));
         let (lambda, sqs) = service_with_sqs_and_clock(
             executor.clone(),
             Arc::new(MemoryBlobStore::default()),
-            Arc::new(clock.clone()),
+            clock.clone(),
         );
         let source_queue = create_queue(&sqs, "lambda-batching-window-expiry");
         let source_queue_arn = queue_arn(&sqs, &source_queue);

@@ -25,6 +25,7 @@ pub struct AwsChunkedSigningContext {
     signing_key: [u8; 32],
     seed_signature: String,
     mode: AwsChunkedMode,
+    verify_signatures: bool,
 }
 
 impl AwsChunkedSigningContext {
@@ -43,7 +44,14 @@ impl AwsChunkedSigningContext {
             signing_key: signing_key(secret_access_key, date, region, service),
             seed_signature: seed_signature.to_owned(),
             mode,
+            verify_signatures: true,
         }
+    }
+
+    #[must_use]
+    pub fn without_signature_verification(mut self) -> Self {
+        self.verify_signatures = false;
+        self
     }
 
     pub fn mode(&self) -> AwsChunkedMode {
@@ -115,7 +123,8 @@ impl AwsChunkedSigningContext {
 
             let expected_signature =
                 self.chunk_signature(&previous_signature, chunk_data);
-            if expected_signature != chunk_signature {
+            if self.verify_signatures && expected_signature != chunk_signature
+            {
                 return Err(signature_does_not_match_error(
                     "The aws-chunked payload signature did not match the provided chunk signature.",
                 ));
@@ -168,7 +177,9 @@ impl AwsChunkedSigningContext {
                     &previous_signature,
                     canonical_trailer.as_bytes(),
                 );
-                if expected_signature != provided_signature {
+                if self.verify_signatures
+                    && expected_signature != provided_signature
+                {
                     return Err(signature_does_not_match_error(
                         "The aws-chunked trailer signature did not match the provided trailer signature.",
                     ));
@@ -543,6 +554,34 @@ mod tests {
             .expect_err("invalid trailer signature must fail");
 
         assert_eq!(error.code(), "SignatureDoesNotMatch");
+    }
+
+    #[test]
+    fn decode_can_skip_signature_verification() {
+        let context = AwsChunkedSigningContext::new(
+            SECRET_ACCESS_KEY,
+            DATE,
+            REGION,
+            SERVICE,
+            AMZ_DATE,
+            "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
+            AwsChunkedMode::Payload,
+        )
+        .without_signature_verification();
+
+        let decoded = context
+            .decode(
+                &payload_body_with_signatures(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                ),
+                66_560,
+                &[],
+            )
+            .expect("signature verification can be disabled");
+
+        assert_eq!(decoded.decoded_body(), vec![b'a'; 66_560].as_slice());
     }
 
     fn payload_example_body() -> Vec<u8> {

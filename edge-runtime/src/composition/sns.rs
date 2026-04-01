@@ -95,12 +95,13 @@ pub fn cloudish_sns_signing_cert_pem() -> &'static [u8] {
     CLOUDISH_SNS_SIGNING_CERT_PEM.as_bytes()
 }
 
-pub(crate) fn cloudish_sns_signing_key() -> &'static RsaPrivateKey {
-    static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
+pub(crate) fn cloudish_sns_signing_key()
+-> &'static Result<RsaPrivateKey, rsa::pkcs8::Error> {
+    static KEY: OnceLock<Result<RsaPrivateKey, rsa::pkcs8::Error>> =
+        OnceLock::new();
 
     KEY.get_or_init(|| {
         RsaPrivateKey::from_pkcs8_pem(CLOUDISH_SNS_SIGNING_PRIVATE_KEY_PEM)
-            .expect("embedded SNS signing key should parse")
     })
 }
 
@@ -118,9 +119,13 @@ impl CloudishSnsHttpSigner {
 impl SnsHttpSigner for CloudishSnsHttpSigner {
     fn sign(&self, string_to_sign: &str) -> String {
         let digest = Sha1::digest(string_to_sign.as_bytes());
-        let signature = cloudish_sns_signing_key()
-            .sign(Pkcs1v15Sign::new::<Sha1>(), &digest)
-            .expect("embedded SNS signing key should sign");
+        let Ok(key) = cloudish_sns_signing_key().as_ref() else {
+            return String::new();
+        };
+        let Ok(signature) = key.sign(Pkcs1v15Sign::new::<Sha1>(), &digest)
+        else {
+            return String::new();
+        };
 
         STANDARD.encode(signature)
     }

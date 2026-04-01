@@ -1,11 +1,7 @@
 #![cfg_attr(
     test,
     allow(
-        clippy::expect_used,
-        clippy::unwrap_used,
-        clippy::panic,
         clippy::unreachable,
-        clippy::indexing_slicing,
         clippy::assertions_on_constants,
         clippy::missing_panics_doc,
         clippy::missing_errors_doc
@@ -79,8 +75,9 @@ pub use runtime::{
     StoredPayload, TcpProxyRuntime, TcpProxySpec,
 };
 pub use runtime_defaults::{
-    DEFAULT_ACCOUNT_ENV, DEFAULT_REGION_ENV, RuntimeDefaults,
-    RuntimeDefaultsError, STATE_DIRECTORY_ENV,
+    BootstrapSignatureVerificationMode, DEFAULT_ACCOUNT_ENV,
+    DEFAULT_REGION_ENV, RuntimeDefaults, RuntimeDefaultsError,
+    STATE_DIRECTORY_ENV, UNSAFE_BOOTSTRAP_AUTH_ENV,
 };
 pub use service_name::{ServiceName, ServiceNameError};
 pub use session_credentials::{
