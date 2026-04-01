@@ -38,7 +38,8 @@ ENV CLOUDISH_DEFAULT_ACCOUNT=000000000000 \
     CLOUDISH_DEFAULT_REGION=eu-west-2 \
     CLOUDISH_STATE_DIR=/var/lib/cloudish/state \
     CLOUDISH_EDGE_HOST=0.0.0.0 \
-    CLOUDISH_EDGE_PORT=4566
+    CLOUDISH_EDGE_PORT=4566 \
+    CLOUDISH_EDGE_WIRE_LOG=on
 
 COPY --from=build --chown=nonroot:nonroot /runtime-root/ /
 COPY --from=build --chown=nonroot:nonroot /cloudish /cloudish
