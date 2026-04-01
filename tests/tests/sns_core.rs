@@ -264,3 +264,146 @@ async fn sns_core_missing_topic_publish_surfaces_explicit_error() {
     assert!(error.message().is_some_and(|message| message.contains("Topic")));
     assert!(runtime.state_directory().exists());
 }
+
+#[tokio::test]
+async fn sns_core_missing_subscription_unsubscribe_surfaces_not_found() {
+    let runtime = shared_runtime().await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let client = Client::new(&config);
+
+    let error = client
+        .unsubscribe()
+        .subscription_arn(
+            "arn:aws:sns:eu-west-2:000000000000:orders:00000000-0000-0000-0000-000000000999",
+        )
+        .send()
+        .await
+        .expect_err("unsubscribing a missing subscription should fail");
+
+    assert_eq!(error.code(), Some("NotFound"));
+    assert!(
+        error
+            .message()
+            .is_some_and(|message| message.contains("Subscription"))
+    );
+}
+
+#[tokio::test]
+async fn sns_core_missing_topic_tag_operations_surface_resource_not_found() {
+    let runtime = shared_runtime().await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let client = Client::new(&config);
+    let missing_topic = "arn:aws:sns:eu-west-2:000000000000:missing";
+
+    let list_error = client
+        .list_tags_for_resource()
+        .resource_arn(missing_topic)
+        .send()
+        .await
+        .expect_err("listing tags for a missing topic should fail");
+    let tag_error = client
+        .tag_resource()
+        .resource_arn(missing_topic)
+        .tags(
+            Tag::builder()
+                .key("env")
+                .value("dev")
+                .build()
+                .expect("tag should build"),
+        )
+        .send()
+        .await
+        .expect_err("tagging a missing topic should fail");
+    let untag_error = client
+        .untag_resource()
+        .resource_arn(missing_topic)
+        .tag_keys("env")
+        .send()
+        .await
+        .expect_err("untagging a missing topic should fail");
+
+    assert_eq!(list_error.code(), Some("ResourceNotFound"));
+    assert_eq!(tag_error.code(), Some("ResourceNotFound"));
+    assert_eq!(untag_error.code(), Some("ResourceNotFound"));
+}
+
+#[tokio::test]
+async fn sns_core_list_topics_paginates_with_next_token() {
+    let runtime = shared_runtime().await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let client = Client::new(&config);
+
+    for index in 0..101 {
+        let _ = client
+            .create_topic()
+            .name(format!("orders-{index:03}"))
+            .send()
+            .await
+            .expect("topic should be created");
+    }
+
+    let first_page =
+        client.list_topics().send().await.expect("first page should succeed");
+    let next_token = first_page
+        .next_token()
+        .expect("first page should expose a token")
+        .to_owned();
+    let second_page = client
+        .list_topics()
+        .next_token(next_token)
+        .send()
+        .await
+        .expect("second page should succeed");
+
+    assert_eq!(first_page.topics().len(), 100);
+    assert_eq!(second_page.topics().len(), 1);
+    assert!(second_page.next_token().is_none());
+}
+
+#[tokio::test]
+async fn sns_core_http_protocol_rejects_https_endpoints() {
+    let runtime = shared_runtime().await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let client = Client::new(&config);
+    let topic_arn = client
+        .create_topic()
+        .name("orders-http-scheme")
+        .send()
+        .await
+        .expect("topic should be created")
+        .topic_arn()
+        .expect("topic arn should exist")
+        .to_owned();
+
+    let error = client
+        .subscribe()
+        .topic_arn(&topic_arn)
+        .protocol("http")
+        .endpoint("https://127.0.0.1:9443/subscription")
+        .send()
+        .await
+        .expect_err("http subscriptions should reject https endpoints");
+
+    assert_eq!(error.code(), Some("InvalidParameter"));
+    assert!(
+        error
+            .message()
+            .is_some_and(|message| message.contains("specified protocol"))
+    );
+}
