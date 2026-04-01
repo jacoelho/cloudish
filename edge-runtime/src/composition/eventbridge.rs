@@ -1,26 +1,16 @@
-#[cfg(feature = "eventbridge")]
 use crate::EventBridgeDeliveryShutdown;
-#[cfg(feature = "eventbridge")]
 use crate::adapters::{ThreadWorkQueue, ThreadWorkQueueStopToken};
-#[cfg(feature = "eventbridge")]
 use aws::{Arn, InfrastructureError, ServiceName};
-#[cfg(feature = "eventbridge")]
 use eventbridge::{
     EventBridgeDeliveryDispatcher, EventBridgeError,
     EventBridgePlannedDelivery, EventBridgeScope, EventBridgeTarget,
 };
-#[cfg(feature = "eventbridge")]
 use lambda::{LambdaScope, LambdaService};
-#[cfg(feature = "eventbridge")]
 use sns::{PublishInput, SnsService};
-#[cfg(feature = "eventbridge")]
 use sqs::{SendMessageInput, SqsService};
-#[cfg(feature = "eventbridge")]
 use std::collections::BTreeMap;
-#[cfg(feature = "eventbridge")]
 use std::sync::Arc;
 
-#[cfg(feature = "eventbridge")]
 #[derive(Clone, Default)]
 pub(crate) struct EventBridgeDispatcherDependencies {
     pub lambda: Option<LambdaService>,
@@ -28,13 +18,11 @@ pub(crate) struct EventBridgeDispatcherDependencies {
     pub sqs: Option<SqsService>,
 }
 
-#[cfg(feature = "eventbridge")]
 pub(crate) struct EventBridgeDispatcherAssembly {
     pub dispatcher: Arc<dyn EventBridgeDeliveryDispatcher>,
     pub shutdown: EventBridgeDeliveryShutdown,
 }
 
-#[cfg(feature = "eventbridge")]
 pub(crate) fn build_eventbridge_dispatcher(
     dependencies: EventBridgeDispatcherDependencies,
 ) -> Result<EventBridgeDispatcherAssembly, InfrastructureError> {
@@ -68,14 +56,12 @@ pub(crate) fn build_eventbridge_dispatcher(
     })
 }
 
-#[cfg(feature = "eventbridge")]
 #[derive(Clone)]
 struct EventBridgeDispatcher {
     dependencies: EventBridgeDispatcherDependencies,
     delivery_worker: Arc<ThreadWorkQueue<Vec<EventBridgePlannedDelivery>>>,
 }
 
-#[cfg(feature = "eventbridge")]
 impl EventBridgeDeliveryDispatcher for EventBridgeDispatcher {
     fn validate_target(
         &self,
@@ -131,7 +117,6 @@ impl EventBridgeDeliveryDispatcher for EventBridgeDispatcher {
     }
 }
 
-#[cfg(feature = "eventbridge")]
 fn dispatch_eventbridge_delivery(
     dependencies: &EventBridgeDispatcherDependencies,
     delivery: EventBridgePlannedDelivery,
@@ -191,7 +176,6 @@ fn dispatch_eventbridge_delivery(
     }
 }
 
-#[cfg(feature = "eventbridge")]
 fn dispatch_eventbridge_deliveries(
     dependencies: &EventBridgeDispatcherDependencies,
     deliveries: Vec<EventBridgePlannedDelivery>,
@@ -205,7 +189,6 @@ fn dispatch_eventbridge_deliveries(
     }
 }
 
-#[cfg(feature = "eventbridge")]
 fn target_scope(target_arn: &Arn) -> Result<LambdaScope, EventBridgeError> {
     let Some(account_id) = target_arn.account_id().cloned() else {
         return Err(missing_target_error(target_arn));
@@ -217,12 +200,10 @@ fn target_scope(target_arn: &Arn) -> Result<LambdaScope, EventBridgeError> {
     Ok(LambdaScope::new(account_id, region))
 }
 
-#[cfg(feature = "eventbridge")]
 fn target_sns_scope(target_arn: &Arn) -> Arn {
     target_arn.clone()
 }
 
-#[cfg(feature = "eventbridge")]
 fn missing_target_error(target_arn: &Arn) -> EventBridgeError {
     EventBridgeError::ResourceNotFound {
         message: format!("Target Arn {target_arn} does not exist."),

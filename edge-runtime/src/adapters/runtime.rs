@@ -4,13 +4,11 @@ use aws::{
 };
 use getrandom::getrandom;
 use std::io;
-#[cfg(any(feature = "eventbridge", test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, LockResult, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
-#[cfg(feature = "step-functions")]
 use step_functions::{
     StepFunctionsExecutionSpawner, StepFunctionsSleeper,
     StepFunctionsSpawnHandle,
@@ -57,20 +55,17 @@ impl Drop for ManagedBackgroundTasks {
     }
 }
 
-#[cfg(any(feature = "eventbridge", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadWorkQueueShutdownOutcome {
     Drained,
     TimedOut,
 }
 
-#[cfg(any(feature = "eventbridge", test))]
 #[derive(Debug, Default)]
 pub(crate) struct ThreadWorkQueueStopToken {
     stop_requested: AtomicBool,
 }
 
-#[cfg(any(feature = "eventbridge", test))]
 impl ThreadWorkQueueStopToken {
     pub(crate) fn is_stop_requested(&self) -> bool {
         self.stop_requested.load(Ordering::SeqCst)
@@ -81,7 +76,6 @@ impl ThreadWorkQueueStopToken {
     }
 }
 
-#[cfg(any(feature = "eventbridge", test))]
 pub(crate) struct ThreadWorkQueue<T: Send + 'static> {
     completion: Mutex<mpsc::Receiver<()>>,
     completed: AtomicBool,
@@ -91,7 +85,6 @@ pub(crate) struct ThreadWorkQueue<T: Send + 'static> {
     task_name: String,
 }
 
-#[cfg(any(feature = "eventbridge", test))]
 impl<T: Send + 'static> ThreadWorkQueue<T> {
     pub(crate) fn spawn(
         task_name: String,
@@ -221,7 +214,6 @@ impl<T: Send + 'static> ThreadWorkQueue<T> {
     }
 }
 
-#[cfg(any(feature = "eventbridge", test))]
 impl<T: Send + 'static> Drop for ThreadWorkQueue<T> {
     fn drop(&mut self) {
         self.begin_shutdown();
@@ -331,11 +323,9 @@ impl Drop for ThreadScheduledTask {
     }
 }
 
-#[cfg(feature = "step-functions")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ThreadStepFunctionsExecutionSpawner;
 
-#[cfg(feature = "step-functions")]
 impl StepFunctionsExecutionSpawner for ThreadStepFunctionsExecutionSpawner {
     fn spawn_paused(
         &self,
@@ -365,13 +355,11 @@ impl StepFunctionsExecutionSpawner for ThreadStepFunctionsExecutionSpawner {
     }
 }
 
-#[cfg(feature = "step-functions")]
 #[derive(Debug)]
 struct ThreadStepFunctionsSpawnHandle {
     start_tx: Option<mpsc::Sender<bool>>,
 }
 
-#[cfg(feature = "step-functions")]
 impl StepFunctionsSpawnHandle for ThreadStepFunctionsSpawnHandle {
     fn start(mut self: Box<Self>) {
         if let Some(start_tx) = self.start_tx.take() {
@@ -380,7 +368,6 @@ impl StepFunctionsSpawnHandle for ThreadStepFunctionsSpawnHandle {
     }
 }
 
-#[cfg(feature = "step-functions")]
 impl Drop for ThreadStepFunctionsSpawnHandle {
     fn drop(&mut self) {
         if let Some(start_tx) = self.start_tx.take() {
@@ -389,11 +376,9 @@ impl Drop for ThreadStepFunctionsSpawnHandle {
     }
 }
 
-#[cfg(feature = "step-functions")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ThreadStepFunctionsSleeper;
 
-#[cfg(feature = "step-functions")]
 impl StepFunctionsSleeper for ThreadStepFunctionsSleeper {
     fn sleep(&self, duration: Duration) -> Result<(), InfrastructureError> {
         thread::sleep(duration);

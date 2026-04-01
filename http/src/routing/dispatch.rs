@@ -1,36 +1,20 @@
-#[cfg(feature = "apigateway")]
 use crate::apigateway;
-#[cfg(feature = "cloudformation")]
 use crate::cloudformation;
-#[cfg(feature = "cloudwatch")]
 use crate::cloudwatch;
-#[cfg(feature = "cognito")]
 use crate::cognito;
-#[cfg(feature = "dynamodb")]
 use crate::dynamodb;
-#[cfg(feature = "elasticache")]
 use crate::elasticache;
-#[cfg(feature = "eventbridge")]
 use crate::eventbridge;
 use crate::iam_query;
-#[cfg(feature = "kinesis")]
 use crate::kinesis;
-#[cfg(feature = "kms")]
 use crate::kms;
-#[cfg(feature = "lambda")]
 use crate::lambda;
-#[cfg(feature = "rds")]
 use crate::rds;
 use crate::runtime::{EdgeResponse, EdgeRouter};
-#[cfg(feature = "secrets-manager")]
 use crate::secrets_manager;
-#[cfg(feature = "sns")]
 use crate::sns;
-#[cfg(feature = "sqs")]
 use crate::sqs;
-#[cfg(feature = "ssm")]
 use crate::ssm;
-#[cfg(feature = "step-functions")]
 use crate::step_functions;
 use crate::sts_query;
 use auth::VerifiedRequest;
@@ -78,23 +62,17 @@ struct RestJsonDispatch {
 const QUERY_DISPATCHES: &[QueryDispatch] = &[
     QueryDispatch { service: ServiceName::Iam, dispatch: dispatch_iam_query },
     QueryDispatch { service: ServiceName::Sts, dispatch: dispatch_sts_query },
-    #[cfg(feature = "sns")]
     QueryDispatch { service: ServiceName::Sns, dispatch: dispatch_sns_query },
-    #[cfg(feature = "sqs")]
     QueryDispatch { service: ServiceName::Sqs, dispatch: dispatch_sqs_query },
-    #[cfg(feature = "cloudformation")]
     QueryDispatch {
         service: ServiceName::CloudFormation,
         dispatch: dispatch_cloudformation_query,
     },
-    #[cfg(feature = "cloudwatch")]
     QueryDispatch {
         service: ServiceName::CloudWatch,
         dispatch: dispatch_cloudwatch_query,
     },
-    #[cfg(feature = "rds")]
     QueryDispatch { service: ServiceName::Rds, dispatch: dispatch_rds_query },
-    #[cfg(feature = "elasticache")]
     QueryDispatch {
         service: ServiceName::ElastiCache,
         dispatch: dispatch_elasticache_query,
@@ -102,71 +80,54 @@ const QUERY_DISPATCHES: &[QueryDispatch] = &[
 ];
 
 const JSON_DISPATCHES: &[JsonDispatch] = &[
-    #[cfg(feature = "dynamodb")]
     JsonDispatch {
         service: ServiceName::DynamoDb,
         dispatch: dispatch_dynamodb_json,
     },
-    #[cfg(feature = "sqs")]
     JsonDispatch { service: ServiceName::Sqs, dispatch: dispatch_sqs_json },
-    #[cfg(feature = "sns")]
     JsonDispatch { service: ServiceName::Sns, dispatch: dispatch_sns_json },
-    #[cfg(feature = "step-functions")]
     JsonDispatch {
         service: ServiceName::StepFunctions,
         dispatch: dispatch_step_functions_json,
     },
-    #[cfg(feature = "cloudwatch")]
     JsonDispatch {
         service: ServiceName::CloudWatch,
         dispatch: dispatch_cloudwatch_metrics_json,
     },
-    #[cfg(feature = "ssm")]
     JsonDispatch { service: ServiceName::Ssm, dispatch: dispatch_ssm_json },
-    #[cfg(feature = "eventbridge")]
     JsonDispatch {
         service: ServiceName::EventBridge,
         dispatch: dispatch_eventbridge_json,
     },
-    #[cfg(feature = "cloudwatch")]
     JsonDispatch {
         service: ServiceName::Logs,
         dispatch: dispatch_cloudwatch_logs_json,
     },
-    #[cfg(feature = "secrets-manager")]
     JsonDispatch {
         service: ServiceName::SecretsManager,
         dispatch: dispatch_secrets_manager_json,
     },
-    #[cfg(feature = "kinesis")]
     JsonDispatch {
         service: ServiceName::Kinesis,
         dispatch: dispatch_kinesis_json,
     },
-    #[cfg(feature = "kms")]
     JsonDispatch { service: ServiceName::Kms, dispatch: dispatch_kms_json },
-    #[cfg(feature = "cognito")]
     JsonDispatch {
         service: ServiceName::CognitoIdentityProvider,
         dispatch: dispatch_cognito_json,
     },
 ];
 
-const SMITHY_DISPATCHES: &[SmithyDispatch] = &[
-    #[cfg(feature = "cloudwatch")]
-    SmithyDispatch {
-        service: ServiceName::CloudWatch,
-        dispatch: dispatch_cloudwatch_cbor,
-    },
-];
+const SMITHY_DISPATCHES: &[SmithyDispatch] = &[SmithyDispatch {
+    service: ServiceName::CloudWatch,
+    dispatch: dispatch_cloudwatch_cbor,
+}];
 
 const REST_JSON_DISPATCHES: &[RestJsonDispatch] = &[
-    #[cfg(feature = "lambda")]
     RestJsonDispatch {
         service: ServiceName::Lambda,
         dispatch: dispatch_lambda_rest_json,
     },
-    #[cfg(feature = "apigateway")]
     RestJsonDispatch {
         service: ServiceName::ApiGateway,
         dispatch: dispatch_apigateway_rest_json,
@@ -241,19 +202,6 @@ fn query_ok(result: Result<String, AwsError>) -> EdgeResponse {
     }
 }
 
-#[cfg(any(
-    feature = "cloudwatch",
-    feature = "cognito",
-    feature = "dynamodb",
-    feature = "eventbridge",
-    feature = "kinesis",
-    feature = "kms",
-    feature = "secrets-manager",
-    feature = "sns",
-    feature = "sqs",
-    feature = "ssm",
-    feature = "step-functions"
-))]
 fn json_ok(
     protocol: ProtocolFamily,
     content_type: &str,
@@ -293,8 +241,6 @@ fn dispatch_sts_query(
         verified_request,
     ))
 }
-
-#[cfg(feature = "sns")]
 fn dispatch_sns_query(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -308,8 +254,6 @@ fn dispatch_sns_query(
         context,
     ))
 }
-
-#[cfg(feature = "sqs")]
 fn dispatch_sqs_query(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -328,8 +272,6 @@ fn dispatch_sqs_query(
         request_cancellation,
     ))
 }
-
-#[cfg(feature = "cloudformation")]
 fn dispatch_cloudformation_query(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -343,8 +285,6 @@ fn dispatch_cloudformation_query(
         context,
     ))
 }
-
-#[cfg(feature = "cloudwatch")]
 fn dispatch_cloudwatch_query(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -358,8 +298,6 @@ fn dispatch_cloudwatch_query(
         context,
     ))
 }
-
-#[cfg(feature = "rds")]
 fn dispatch_rds_query(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -373,8 +311,6 @@ fn dispatch_rds_query(
         context,
     ))
 }
-
-#[cfg(feature = "elasticache")]
 fn dispatch_elasticache_query(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -388,8 +324,6 @@ fn dispatch_elasticache_query(
         context,
     ))
 }
-
-#[cfg(feature = "sqs")]
 fn dispatch_sqs_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -411,8 +345,6 @@ fn dispatch_sqs_json(
         ),
     )
 }
-
-#[cfg(feature = "sns")]
 fn dispatch_sns_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -425,8 +357,6 @@ fn dispatch_sns_json(
         sns::handle_json(router.runtime_services().sns(), request, context),
     )
 }
-
-#[cfg(feature = "dynamodb")]
 fn dispatch_dynamodb_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -455,8 +385,6 @@ fn dispatch_dynamodb_json(
         }
     }
 }
-
-#[cfg(feature = "ssm")]
 fn dispatch_ssm_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -469,8 +397,6 @@ fn dispatch_ssm_json(
         ssm::handle_json(router.runtime_services().ssm(), request, context),
     )
 }
-
-#[cfg(feature = "cognito")]
 fn dispatch_cognito_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -487,8 +413,6 @@ fn dispatch_cognito_json(
         ),
     )
 }
-
-#[cfg(feature = "kinesis")]
 fn dispatch_kinesis_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -505,8 +429,6 @@ fn dispatch_kinesis_json(
         ),
     )
 }
-
-#[cfg(feature = "secrets-manager")]
 fn dispatch_secrets_manager_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -523,8 +445,6 @@ fn dispatch_secrets_manager_json(
         ),
     )
 }
-
-#[cfg(feature = "kms")]
 fn dispatch_kms_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -537,8 +457,6 @@ fn dispatch_kms_json(
         kms::handle_json(router.runtime_services().kms(), request, context),
     )
 }
-
-#[cfg(feature = "cloudwatch")]
 fn dispatch_cloudwatch_metrics_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -555,8 +473,6 @@ fn dispatch_cloudwatch_metrics_json(
         ),
     )
 }
-
-#[cfg(feature = "cloudwatch")]
 fn dispatch_cloudwatch_logs_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -573,8 +489,6 @@ fn dispatch_cloudwatch_logs_json(
         ),
     )
 }
-
-#[cfg(feature = "step-functions")]
 fn dispatch_step_functions_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -591,8 +505,6 @@ fn dispatch_step_functions_json(
         ),
     )
 }
-
-#[cfg(feature = "eventbridge")]
 fn dispatch_eventbridge_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -609,8 +521,6 @@ fn dispatch_eventbridge_json(
         ),
     )
 }
-
-#[cfg(feature = "cloudwatch")]
 fn dispatch_cloudwatch_cbor(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -628,8 +538,6 @@ fn dispatch_cloudwatch_cbor(
         }
     }
 }
-
-#[cfg(feature = "lambda")]
 fn dispatch_lambda_rest_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,
@@ -650,8 +558,6 @@ fn dispatch_lambda_rest_json(
         Err(error) => EdgeResponse::aws(ProtocolFamily::RestJson, &error),
     }
 }
-
-#[cfg(feature = "apigateway")]
 fn dispatch_apigateway_rest_json(
     router: &EdgeRouter,
     request: &HttpRequest<'_>,

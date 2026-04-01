@@ -1,38 +1,16 @@
-#[cfg(feature = "apigateway")]
 use crate::apigateway;
-#[cfg(feature = "cloudformation")]
 use crate::cloudformation;
-#[cfg(feature = "cloudwatch")]
 use crate::cloudwatch;
-#[cfg(feature = "elasticache")]
 use crate::elasticache;
 use crate::iam_query;
-#[cfg(feature = "lambda")]
 use crate::lambda;
-#[cfg(feature = "rds")]
 use crate::rds;
 use crate::request::HttpRequest;
-#[cfg(feature = "s3")]
 use crate::s3;
-#[cfg(feature = "sns")]
 use crate::sns;
-#[cfg(feature = "sqs")]
 use crate::sqs;
 use crate::sts_query;
 use aws::{AdvertisedEdge, ProtocolFamily, ServiceName};
-
-#[cfg(not(feature = "sns"))]
-const SNS_QUERY_VERSION: &str = "2010-03-31";
-#[cfg(not(feature = "sqs"))]
-const SQS_QUERY_VERSION: &str = "2012-11-05";
-#[cfg(not(feature = "cloudformation"))]
-const CLOUDFORMATION_QUERY_VERSION: &str = "2010-05-15";
-#[cfg(not(feature = "cloudwatch"))]
-const CLOUDWATCH_QUERY_VERSION: &str = "2010-08-01";
-#[cfg(not(feature = "rds"))]
-const RDS_QUERY_VERSION: &str = "2014-10-31";
-#[cfg(not(feature = "elasticache"))]
-const ELASTICACHE_QUERY_VERSION: &str = "2015-02-02";
 
 const JSON_TARGETS: &[JsonTarget] = &[
     JsonTarget {
@@ -117,17 +95,13 @@ pub(crate) fn detect_generic_protocol(
     request: &HttpRequest<'_>,
     advertised_edge: &AdvertisedEdge,
 ) -> Option<ProtocolFamily> {
-    #[cfg(not(feature = "s3"))]
-    let _ = advertised_edge;
     let content_type = request.header("content-type").unwrap_or_default();
     let smithy_protocol =
         request.header("smithy-protocol").unwrap_or_default();
     let target = request.header("x-amz-target");
     let path = request.path_without_query();
-    #[cfg(feature = "s3")]
     let s3_candidate = s3::is_rest_xml_request(request, advertised_edge);
-    #[cfg(not(feature = "s3"))]
-    let s3_candidate = false;
+    let s3_non_root_request = s3_candidate && path != "/";
 
     if smithy_path(path).is_some()
         || smithy_protocol.eq_ignore_ascii_case("rpc-v2-cbor")
@@ -136,25 +110,31 @@ pub(crate) fn detect_generic_protocol(
     }
 
     if content_type.eq_ignore_ascii_case("application/cbor") {
-        if s3_candidate && path != "/" {
+        if s3_non_root_request {
             return None;
         }
         return Some(ProtocolFamily::SmithyRpcV2Cbor);
     }
 
-    if rest_json_service(request).is_some() {
+    if enabled_rest_json_service(request).is_some() {
+        return Some(ProtocolFamily::RestJson);
+    }
+
+    if !s3_non_root_request
+        && compiled_out_rest_json_fallback(request).is_some()
+    {
         return Some(ProtocolFamily::RestJson);
     }
 
     if content_type.contains("application/x-amz-json-1.0") {
-        if s3_candidate && path != "/" {
+        if s3_non_root_request {
             return None;
         }
         return Some(ProtocolFamily::AwsJson10);
     }
 
     if content_type.contains("application/x-amz-json-1.1") {
-        if s3_candidate && path != "/" {
+        if s3_non_root_request {
             return None;
         }
         return Some(ProtocolFamily::AwsJson11);
@@ -173,7 +153,7 @@ pub(crate) fn detect_generic_protocol(
         return Some(ProtocolFamily::Query);
     }
 
-    if s3_candidate && path != "/" {
+    if s3_non_root_request {
         return None;
     }
 
@@ -226,11 +206,11 @@ pub(crate) fn supports_protocol(
     }
 }
 
-pub(crate) fn service_from_query_action(
+pub(crate) fn resolve_unsigned_query_service(
     action: &str,
     version: Option<&str>,
 ) -> Option<ServiceName> {
-    [
+    let query_services = [
         ServiceName::Iam,
         ServiceName::Sts,
         ServiceName::Sns,
@@ -239,19 +219,41 @@ pub(crate) fn service_from_query_action(
         ServiceName::CloudWatch,
         ServiceName::Rds,
         ServiceName::ElastiCache,
-    ]
-    .into_iter()
-    .find(|service| {
-        query_service_matches_action(*service, action)
-            && (*service != ServiceName::ElastiCache
-                || version.is_none_or(|value| {
-                    query_action_matches_version(
-                        ServiceName::ElastiCache,
-                        action,
-                        value,
-                    )
-                }))
-    })
+    ];
+    let mut exact_matches = query_services
+        .into_iter()
+        .filter(|service| query_action_matches(service, action, version));
+    if let Some(service) = exact_matches.next() {
+        return exact_matches.next().is_none().then_some(service);
+    }
+
+    let mut action_matches = query_services
+        .into_iter()
+        .filter(|service| query_service_matches_action(*service, action));
+    let service = action_matches.next()?;
+    action_matches.next().is_none().then_some(service)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopedQueryValidation {
+    Valid,
+    ActionOutsideService,
+    InvalidVersion,
+}
+
+pub(crate) fn validate_query_for_service(
+    service: ServiceName,
+    action: &str,
+    version: &str,
+) -> ScopedQueryValidation {
+    if !query_service_matches_action(service, action) {
+        return ScopedQueryValidation::ActionOutsideService;
+    }
+    if !query_action_matches_version(service, action, version) {
+        return ScopedQueryValidation::InvalidVersion;
+    }
+
+    ScopedQueryValidation::Valid
 }
 
 pub(crate) fn query_action_matches_version(
@@ -278,74 +280,22 @@ fn query_action_matches(
         ServiceName::Sts => {
             version.is_none_or(|value| value == sts_query::STS_QUERY_VERSION)
         }
-        ServiceName::Sns => version.is_none_or(|value| {
-            #[cfg(feature = "sns")]
-            {
-                value == sns::SNS_QUERY_VERSION
-            }
-            #[cfg(not(feature = "sns"))]
-            {
-                value == SNS_QUERY_VERSION
-            }
-        }),
-        ServiceName::Sqs => version.is_none_or(|value| {
-            #[cfg(feature = "sqs")]
-            {
-                value == sqs::SQS_QUERY_VERSION
-            }
-            #[cfg(not(feature = "sqs"))]
-            {
-                value == SQS_QUERY_VERSION
-            }
-        }),
+        ServiceName::Sns => {
+            version.is_none_or(|value| value == sns::SNS_QUERY_VERSION)
+        }
+        ServiceName::Sqs => {
+            version.is_none_or(|value| value == sqs::SQS_QUERY_VERSION)
+        }
         ServiceName::CloudFormation => version.is_none_or(|value| {
-            #[cfg(feature = "cloudformation")]
-            {
-                value == cloudformation::CLOUDFORMATION_QUERY_VERSION
-            }
-            #[cfg(not(feature = "cloudformation"))]
-            {
-                value == CLOUDFORMATION_QUERY_VERSION
-            }
+            value == cloudformation::CLOUDFORMATION_QUERY_VERSION
         }),
-        ServiceName::CloudWatch => version.is_none_or(|value| {
-            #[cfg(feature = "cloudwatch")]
-            {
-                value == cloudwatch::CLOUDWATCH_QUERY_VERSION
-            }
-            #[cfg(not(feature = "cloudwatch"))]
-            {
-                value == CLOUDWATCH_QUERY_VERSION
-            }
-        }),
-        ServiceName::Rds => version.is_none_or(|value| {
-            #[cfg(feature = "rds")]
-            {
-                value == rds::RDS_QUERY_VERSION
-            }
-            #[cfg(not(feature = "rds"))]
-            {
-                value == RDS_QUERY_VERSION
-            }
-        }),
+        ServiceName::CloudWatch => version
+            .is_none_or(|value| value == cloudwatch::CLOUDWATCH_QUERY_VERSION),
+        ServiceName::Rds => {
+            version.is_none_or(|value| value == rds::RDS_QUERY_VERSION)
+        }
         ServiceName::ElastiCache => version.is_none_or(|value| {
-            #[cfg(feature = "elasticache")]
-            {
-                elasticache::action_matches_version(action, Some(value))
-            }
-            #[cfg(not(feature = "elasticache"))]
-            {
-                matches!(
-                    action,
-                    "CreateReplicationGroup"
-                        | "DescribeReplicationGroups"
-                        | "DeleteReplicationGroup"
-                        | "ModifyReplicationGroup"
-                        | "DescribeUsers"
-                        | "ModifyUser"
-                        | "ValidateIamAuthToken"
-                ) || value == ELASTICACHE_QUERY_VERSION
-            }
+            elasticache::action_matches_version(action, Some(value))
         }),
 
         _ => false,
@@ -356,164 +306,14 @@ fn query_service_matches_action(service: ServiceName, action: &str) -> bool {
     match service {
         ServiceName::Iam => iam_query::is_iam_action(action),
         ServiceName::Sts => sts_query::is_sts_action(action),
-        ServiceName::Sns => {
-            #[cfg(feature = "sns")]
-            {
-                sns::is_sns_action(action)
-            }
-            #[cfg(not(feature = "sns"))]
-            {
-                matches!(
-                    action,
-                    "ConfirmSubscription"
-                        | "CreateTopic"
-                        | "DeleteTopic"
-                        | "GetSubscriptionAttributes"
-                        | "GetTopicAttributes"
-                        | "ListSubscriptions"
-                        | "ListSubscriptionsByTopic"
-                        | "ListTagsForResource"
-                        | "ListTopics"
-                        | "Publish"
-                        | "PublishBatch"
-                        | "SetSubscriptionAttributes"
-                        | "SetTopicAttributes"
-                        | "Subscribe"
-                        | "TagResource"
-                        | "Unsubscribe"
-                        | "UntagResource"
-                )
-            }
-        }
-        ServiceName::Sqs => {
-            #[cfg(feature = "sqs")]
-            {
-                sqs::is_sqs_action(action)
-            }
-            #[cfg(not(feature = "sqs"))]
-            {
-                matches!(
-                    action,
-                    "AddPermission"
-                        | "CancelMessageMoveTask"
-                        | "ChangeMessageVisibility"
-                        | "ChangeMessageVisibilityBatch"
-                        | "CreateQueue"
-                        | "DeleteMessage"
-                        | "DeleteMessageBatch"
-                        | "DeleteQueue"
-                        | "GetQueueAttributes"
-                        | "GetQueueUrl"
-                        | "ListDeadLetterSourceQueues"
-                        | "ListMessageMoveTasks"
-                        | "ListQueueTags"
-                        | "ListQueues"
-                        | "PurgeQueue"
-                        | "ReceiveMessage"
-                        | "RemovePermission"
-                        | "SendMessage"
-                        | "SendMessageBatch"
-                        | "SetQueueAttributes"
-                        | "StartMessageMoveTask"
-                        | "TagQueue"
-                        | "UntagQueue"
-                )
-            }
-        }
+        ServiceName::Sns => sns::is_sns_action(action),
+        ServiceName::Sqs => sqs::is_sqs_action(action),
         ServiceName::CloudFormation => {
-            #[cfg(feature = "cloudformation")]
-            {
-                cloudformation::is_cloudformation_action(action)
-            }
-            #[cfg(not(feature = "cloudformation"))]
-            {
-                matches!(
-                    action,
-                    "CreateChangeSet"
-                        | "CreateStack"
-                        | "DeleteStack"
-                        | "DescribeChangeSet"
-                        | "DescribeStackEvents"
-                        | "DescribeStackResource"
-                        | "DescribeStackResources"
-                        | "DescribeStacks"
-                        | "ExecuteChangeSet"
-                        | "GetTemplate"
-                        | "ListChangeSets"
-                        | "ListStackResources"
-                        | "ListStacks"
-                        | "UpdateStack"
-                        | "ValidateTemplate"
-                )
-            }
+            cloudformation::is_cloudformation_action(action)
         }
-        ServiceName::CloudWatch => {
-            #[cfg(feature = "cloudwatch")]
-            {
-                cloudwatch::is_metrics_query_action(action)
-            }
-            #[cfg(not(feature = "cloudwatch"))]
-            {
-                matches!(
-                    action,
-                    "DeleteAlarms"
-                        | "DescribeAlarms"
-                        | "GetMetricData"
-                        | "GetMetricStatistics"
-                        | "ListMetrics"
-                        | "PutMetricAlarm"
-                        | "PutMetricData"
-                        | "SetAlarmState"
-                )
-            }
-        }
-        ServiceName::Rds => {
-            #[cfg(feature = "rds")]
-            {
-                rds::is_rds_action(action)
-            }
-            #[cfg(not(feature = "rds"))]
-            {
-                matches!(
-                    action,
-                    "CreateDBInstance"
-                        | "CreateDBCluster"
-                        | "CreateDBParameterGroup"
-                        | "DeleteDBInstance"
-                        | "DeleteDBCluster"
-                        | "DeleteDBParameterGroup"
-                        | "DescribeDBClusters"
-                        | "DescribeDBInstances"
-                        | "DescribeDBParameterGroups"
-                        | "DescribeDBParameters"
-                        | "ModifyDBCluster"
-                        | "ModifyDBInstance"
-                        | "ModifyDBParameterGroup"
-                        | "RebootDBInstance"
-                )
-            }
-        }
-        ServiceName::ElastiCache => {
-            #[cfg(feature = "elasticache")]
-            {
-                elasticache::is_elasticache_action(action)
-            }
-            #[cfg(not(feature = "elasticache"))]
-            {
-                matches!(
-                    action,
-                    "CreateReplicationGroup"
-                        | "DescribeReplicationGroups"
-                        | "DeleteReplicationGroup"
-                        | "ModifyReplicationGroup"
-                        | "CreateUser"
-                        | "DescribeUsers"
-                        | "ModifyUser"
-                        | "DeleteUser"
-                        | "ValidateIamAuthToken"
-                )
-            }
-        }
+        ServiceName::CloudWatch => cloudwatch::is_metrics_query_action(action),
+        ServiceName::Rds => rds::is_rds_action(action),
+        ServiceName::ElastiCache => elasticache::is_elasticache_action(action),
         _ => false,
     }
 }
@@ -545,28 +345,38 @@ pub(crate) fn service_from_smithy_id(service_id: &str) -> Option<ServiceName> {
 pub(crate) fn rest_json_service(
     request: &HttpRequest<'_>,
 ) -> Option<ServiceName> {
-    #[cfg(feature = "lambda")]
+    enabled_rest_json_service(request)
+        .or_else(|| compiled_out_rest_json_fallback(request))
+}
+
+fn enabled_rest_json_service(
+    request: &HttpRequest<'_>,
+) -> Option<ServiceName> {
     if lambda::is_rest_json_request(request) {
         return Some(ServiceName::Lambda);
     }
-    #[cfg(not(feature = "lambda"))]
-    if is_lambda_rest_json_path(request.path_without_query()) {
-        return Some(ServiceName::Lambda);
-    }
-
-    #[cfg(feature = "apigateway")]
     if apigateway::is_rest_json_request(request) {
-        return Some(ServiceName::ApiGateway);
-    }
-    #[cfg(not(feature = "apigateway"))]
-    if is_apigateway_rest_json_path(request.path_without_query()) {
         return Some(ServiceName::ApiGateway);
     }
 
     None
 }
 
-#[cfg(not(feature = "lambda"))]
+fn compiled_out_rest_json_fallback(
+    request: &HttpRequest<'_>,
+) -> Option<ServiceName> {
+    let path = request.path_without_query();
+
+    if is_lambda_rest_json_path(path) {
+        return Some(ServiceName::Lambda);
+    }
+    if is_apigateway_rest_json_path(path) {
+        return Some(ServiceName::ApiGateway);
+    }
+
+    None
+}
+
 fn is_lambda_rest_json_path(path: &str) -> bool {
     [
         "/2015-03-31/functions",
@@ -578,7 +388,6 @@ fn is_lambda_rest_json_path(path: &str) -> bool {
     .any(|prefix| path.starts_with(prefix))
 }
 
-#[cfg(not(feature = "apigateway"))]
 fn is_apigateway_rest_json_path(path: &str) -> bool {
     path == "/v2/apis"
         || path.starts_with("/v2/apis/")
@@ -614,21 +423,26 @@ fn smithy_path(path: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_generic_protocol, json_target, query_action_matches_version,
-        rest_json_service, service_from_query_action, service_from_smithy_id,
-        supports_protocol,
+        ScopedQueryValidation, detect_generic_protocol, json_target,
+        query_action_matches_version, resolve_unsigned_query_service,
+        rest_json_service, service_from_smithy_id, supports_protocol,
+        validate_query_for_service,
     };
+    use crate::iam_query;
     use crate::request::HttpRequest;
     use aws::{AdvertisedEdge, ProtocolFamily, ServiceName};
 
     #[test]
     fn query_catalog_keeps_compiled_out_services_resolvable() {
         assert_eq!(
-            service_from_query_action("CreateQueue", Some("2012-11-05")),
+            resolve_unsigned_query_service("CreateQueue", Some("2012-11-05")),
             Some(ServiceName::Sqs)
         );
         assert_eq!(
-            service_from_query_action("PutMetricData", Some("2010-08-01")),
+            resolve_unsigned_query_service(
+                "PutMetricData",
+                Some("2010-08-01")
+            ),
             Some(ServiceName::CloudWatch)
         );
         assert!(query_action_matches_version(
@@ -641,6 +455,66 @@ mod tests {
             "CreateQueue",
             "2011-06-15"
         ));
+        assert_eq!(
+            resolve_unsigned_query_service("CreateUser", Some("2015-02-02")),
+            Some(ServiceName::ElastiCache)
+        );
+        assert_eq!(
+            resolve_unsigned_query_service("DeleteUser", Some("2015-02-02")),
+            Some(ServiceName::ElastiCache)
+        );
+        assert_eq!(
+            resolve_unsigned_query_service(
+                "CreateUser",
+                Some(iam_query::IAM_QUERY_VERSION)
+            ),
+            Some(ServiceName::Iam)
+        );
+        assert_eq!(
+            resolve_unsigned_query_service(
+                "DeleteUser",
+                Some(iam_query::IAM_QUERY_VERSION)
+            ),
+            Some(ServiceName::Iam)
+        );
+    }
+
+    #[test]
+    fn query_catalog_requires_matching_elasticache_version() {
+        assert!(!query_action_matches_version(
+            ServiceName::ElastiCache,
+            "CreateUser",
+            "2014-10-31"
+        ));
+    }
+
+    #[test]
+    fn scoped_query_validation_distinguishes_action_mismatch_from_version_mismatch()
+     {
+        assert_eq!(
+            validate_query_for_service(
+                ServiceName::Iam,
+                "CreateUser",
+                iam_query::IAM_QUERY_VERSION
+            ),
+            ScopedQueryValidation::Valid
+        );
+        assert_eq!(
+            validate_query_for_service(
+                ServiceName::Iam,
+                "CreateUser",
+                "2015-02-02"
+            ),
+            ScopedQueryValidation::InvalidVersion
+        );
+        assert_eq!(
+            validate_query_for_service(
+                ServiceName::Sts,
+                "CreateUser",
+                iam_query::IAM_QUERY_VERSION
+            ),
+            ScopedQueryValidation::ActionOutsideService
+        );
     }
 
     #[test]
@@ -688,6 +562,13 @@ mod tests {
         assert_eq!(
             rest_json_service(&apigateway_request),
             Some(ServiceName::ApiGateway)
+        );
+        assert_eq!(
+            detect_generic_protocol(
+                &lambda_request,
+                &AdvertisedEdge::default()
+            ),
+            Some(ProtocolFamily::RestJson)
         );
     }
 

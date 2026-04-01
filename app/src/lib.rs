@@ -21,23 +21,14 @@ use aws::{
     DEFAULT_ACCOUNT_ENV, DEFAULT_REGION_ENV, RuntimeDefaults,
     RuntimeDefaultsError, STATE_DIRECTORY_ENV, SharedAdvertisedEdge,
 };
-#[cfg(feature = "dynamodb")]
 use edge_runtime::DynamoDbInitError;
-#[cfg(feature = "elasticache")]
 use edge_runtime::ElastiCacheError;
-#[cfg(feature = "eventbridge")]
 use edge_runtime::EventBridgeError;
-#[cfg(any(feature = "eventbridge", feature = "lambda"))]
 use edge_runtime::InfrastructureError;
-#[cfg(feature = "lambda")]
 use edge_runtime::LambdaInitError;
-#[cfg(feature = "rds")]
 use edge_runtime::RdsError;
-#[cfg(feature = "s3")]
 use edge_runtime::S3InitError;
-use edge_runtime::{
-    LocalRuntimeBuilder, RuntimeBuildError, supported_services,
-};
+use edge_runtime::{LocalRuntimeBuilder, RuntimeBuildError};
 use hosting::HostingPlan;
 use http::EdgeRouter;
 use std::error::Error;
@@ -174,7 +165,7 @@ impl CloudishApp {
         let advertised_edge = SharedAdvertisedEdge::new(
             hosting.advertised_edge().resolve(hosting.edge_address().port()),
         );
-        let (services, runtime) =
+        let runtime =
             LocalRuntimeBuilder::new(defaults.clone(), authenticator.clone())
                 .with_advertised_edge(advertised_edge.clone())
                 .build()
@@ -184,7 +175,6 @@ impl CloudishApp {
             defaults,
             advertised_edge.clone(),
             authenticator,
-            services,
             runtime,
         );
 
@@ -359,10 +349,6 @@ impl CloudishApp {
     }
 }
 
-pub fn supported_service_count() -> usize {
-    supported_services().len()
-}
-
 /// Start Cloudish from process environment and wait for `ctrl-c`.
 ///
 /// # Errors
@@ -432,46 +418,26 @@ fn write_ready_file(
 
 #[derive(Debug)]
 pub enum StartupError {
-    Accept {
-        source: io::Error,
-    },
+    Accept { source: io::Error },
     AlreadyServed,
     AlreadyServing,
-    Bind {
-        address: SocketAddr,
-        source: io::Error,
-    },
+    Bind { address: SocketAddr, source: io::Error },
     BuildConfiguration(String),
     Config(RuntimeDefaultsError),
     HostingConfig(HostingPlanError),
-    ListenerAddress {
-        source: io::Error,
-    },
-    ShutdownTimeout {
-        active_requests: usize,
-    },
+    ListenerAddress { source: io::Error },
+    ShutdownTimeout { active_requests: usize },
     WireLogInit(WireLogInitError),
-    #[cfg(feature = "dynamodb")]
     DynamoDbState(DynamoDbInitError),
-    #[cfg(feature = "elasticache")]
     ElastiCacheRestore(ElastiCacheError),
-    #[cfg(feature = "eventbridge")]
     EventBridgeRuntime(InfrastructureError),
-    #[cfg(feature = "eventbridge")]
     EventBridgeRestore(EventBridgeError),
-    #[cfg(feature = "lambda")]
     LambdaRuntime(InfrastructureError),
-    #[cfg(feature = "lambda")]
     LambdaState(LambdaInitError),
-    #[cfg(feature = "rds")]
     RdsRestore(RdsError),
-    #[cfg(feature = "s3")]
     S3State(S3InitError),
     StorageLoad(StorageError),
-    StateDirectory {
-        path: PathBuf,
-        source: io::Error,
-    },
+    StateDirectory { path: PathBuf, source: io::Error },
 }
 
 impl fmt::Display for StartupError {
@@ -521,39 +487,31 @@ impl fmt::Display for StartupError {
                     "failed to initialize edge wire logging: {source}"
                 )
             }
-            #[cfg(feature = "dynamodb")]
             Self::DynamoDbState(source) => {
                 write!(formatter, "failed to load DynamoDB state: {source}")
             }
-            #[cfg(feature = "elasticache")]
             Self::ElastiCacheRestore(source) => write!(
                 formatter,
                 "failed to restore ElastiCache runtimes: {source}"
             ),
-            #[cfg(feature = "eventbridge")]
             Self::EventBridgeRuntime(source) => write!(
                 formatter,
                 "failed to start EventBridge delivery runtime: {source}"
             ),
-            #[cfg(feature = "eventbridge")]
             Self::EventBridgeRestore(source) => write!(
                 formatter,
                 "failed to restore EventBridge schedules: {source}"
             ),
-            #[cfg(feature = "lambda")]
             Self::LambdaRuntime(source) => write!(
                 formatter,
                 "failed to start Lambda background runtime: {source}"
             ),
-            #[cfg(feature = "lambda")]
             Self::LambdaState(source) => {
                 write!(formatter, "failed to load Lambda state: {source}")
             }
-            #[cfg(feature = "rds")]
             Self::RdsRestore(source) => {
                 write!(formatter, "failed to restore RDS runtimes: {source}")
             }
-            #[cfg(feature = "s3")]
             Self::S3State(source) => {
                 write!(formatter, "failed to load S3 state: {source}")
             }
@@ -578,21 +536,13 @@ impl Error for StartupError {
             | Self::ListenerAddress { source }
             | Self::StateDirectory { source, .. } => Some(source),
             Self::WireLogInit(source) => Some(source),
-            #[cfg(feature = "dynamodb")]
             Self::DynamoDbState(source) => Some(source),
-            #[cfg(feature = "eventbridge")]
             Self::EventBridgeRuntime(source) => Some(source),
-            #[cfg(feature = "eventbridge")]
             Self::EventBridgeRestore(source) => Some(source),
-            #[cfg(feature = "elasticache")]
             Self::ElastiCacheRestore(source) => Some(source),
-            #[cfg(feature = "lambda")]
             Self::LambdaRuntime(source) => Some(source),
-            #[cfg(feature = "lambda")]
             Self::LambdaState(source) => Some(source),
-            #[cfg(feature = "rds")]
             Self::RdsRestore(source) => Some(source),
-            #[cfg(feature = "s3")]
             Self::S3State(source) => Some(source),
             Self::StorageLoad(source) => Some(source),
             Self::AlreadyServed | Self::AlreadyServing => None,
@@ -610,33 +560,25 @@ impl From<RuntimeBuildError> for StartupError {
             RuntimeBuildError::Configuration(message) => {
                 Self::BuildConfiguration(message)
             }
-            #[cfg(feature = "dynamodb")]
             RuntimeBuildError::DynamoDbState(source) => {
                 Self::DynamoDbState(source)
             }
-            #[cfg(feature = "elasticache")]
             RuntimeBuildError::ElastiCacheRestore(source) => {
                 Self::ElastiCacheRestore(source)
             }
-            #[cfg(feature = "eventbridge")]
             RuntimeBuildError::EventBridgeRuntime(source) => {
                 Self::EventBridgeRuntime(source)
             }
-            #[cfg(feature = "eventbridge")]
             RuntimeBuildError::EventBridgeRestore(source) => {
                 Self::EventBridgeRestore(source)
             }
-            #[cfg(feature = "lambda")]
             RuntimeBuildError::LambdaRuntime(source) => {
                 Self::LambdaRuntime(source)
             }
-            #[cfg(feature = "lambda")]
             RuntimeBuildError::LambdaState(source) => {
                 Self::LambdaState(source)
             }
-            #[cfg(feature = "rds")]
             RuntimeBuildError::RdsRestore(source) => Self::RdsRestore(source),
-            #[cfg(feature = "s3")]
             RuntimeBuildError::S3State(source) => Self::S3State(source),
             RuntimeBuildError::StorageLoad(source) => {
                 Self::StorageLoad(source)
@@ -644,8 +586,7 @@ impl From<RuntimeBuildError> for StartupError {
         }
     }
 }
-
-#[cfg(all(test, feature = "all-services"))]
+#[cfg(test)]
 mod tests {
     use super::{
         CloudishApp, EDGE_HOST_ENV, EDGE_MAX_REQUEST_BYTES_ENV, EDGE_PORT_ENV,
@@ -708,8 +649,6 @@ mod tests {
             body.len()
         )
     }
-
-    #[cfg(feature = "lambda")]
     fn create_iam_role_request(role_name: &str) -> String {
         let trust_policy = urlencoding::encode(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#,
@@ -1863,31 +1802,37 @@ mod tests {
         parse_http_date(health_date)
             .expect("health Date header should use HTTP-date format");
         assert!(status_response.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(status_response.contains("\"ready\":true"));
         assert!(status_response.contains("\"stateDirectory\":\""));
+        assert!(!health_response.contains("\"defaultAccount\""));
+        assert!(!health_response.contains("\"defaultRegion\""));
+        assert!(!status_response.contains("\"status\":\"ok\""));
+        assert!(!status_response.contains("\"ready\":true"));
         let status_body = status_response
             .split("\r\n\r\n")
             .nth(1)
             .expect("status response should include a body");
         let status_json: Value = serde_json::from_str(status_body)
             .expect("status response body should be valid JSON");
-        let expected_service_count = crate::supported_service_count();
         assert_eq!(
-            status_json
-                .get("serviceCount")
-                .expect("serviceCount should exist")
-                .as_u64(),
-            Some(expected_service_count as u64)
+            status_json.as_object().map(|object| object.len()),
+            Some(3)
         );
-        assert_eq!(
+        assert!(
             status_json
-                .get("enabledServices")
-                .expect("enabledServices should exist")
-                .as_array()
-                .expect("enabledServices should be an array")
-                .len(),
-            expected_service_count
+                .get("defaultAccount")
+                .expect("defaultAccount should exist")
+                .is_string()
         );
+        assert!(
+            status_json
+                .get("defaultRegion")
+                .expect("defaultRegion should exist")
+                .is_string()
+        );
+        assert!(status_json.get("serviceCount").is_none());
+        assert!(status_json.get("enabledServices").is_none());
+        assert!(status_json.get("status").is_none());
+        assert!(status_json.get("ready").is_none());
 
         let root = state_directory
             .parent()

@@ -5,89 +5,40 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[features]
-default = ["all-services"]
-all-services = [
-    "apigateway",
-    "cloudformation",
-    "cloudwatch",
-    "cognito",
-    "dynamodb",
-    "elasticache",
-    "eventbridge",
-    "kinesis",
-    "kms",
-    "lambda",
-    "rds",
-    "s3",
-    "secrets-manager",
-    "sns",
-    "sqs",
-    "ssm",
-    "step-functions",
-]
-apigateway = ["dep:apigateway", "lambda"]
-cloudformation = [
-    "dep:cloudformation",
-    "dynamodb",
-    "kms",
-    "lambda",
-    "s3",
-    "secrets-manager",
-    "sns",
-    "sqs",
-    "ssm",
-]
-cloudwatch = ["dep:cloudwatch"]
-cognito = ["dep:cognito"]
-dynamodb = ["dep:dynamodb"]
-elasticache = ["dep:elasticache"]
-eventbridge = ["dep:eventbridge", "lambda", "sns", "sqs"]
-kinesis = ["dep:kinesis"]
-kms = ["dep:kms"]
-lambda = ["dep:lambda", "s3", "sqs"]
-rds = ["dep:rds"]
-s3 = ["dep:s3", "sns", "sqs"]
-secrets-manager = ["dep:secrets-manager"]
-sns = ["dep:sns", "lambda", "sqs"]
-sqs = ["dep:sqs"]
-ssm = ["dep:ssm"]
-step-functions = ["dep:step-functions", "lambda"]
-
 [lints]
 workspace = true
 
 [dependencies]
-apigateway = { path = "../services/apigateway", optional = true }
+apigateway = { path = "../services/apigateway" }
 async-trait = "0.1.89"
 auth = { path = "../auth" }
 aws = { path = "../aws" }
 base64 = "0.22.1"
-cloudformation = { path = "../services/cloudformation", optional = true }
-cloudwatch = { path = "../services/cloudwatch", optional = true }
-cognito = { path = "../services/cognito", optional = true }
-dynamodb = { path = "../services/dynamodb", optional = true }
-elasticache = { path = "../services/elasticache", optional = true }
-eventbridge = { path = "../services/eventbridge", optional = true }
+cloudformation = { path = "../services/cloudformation" }
+cloudwatch = { path = "../services/cloudwatch" }
+cognito = { path = "../services/cognito" }
+dynamodb = { path = "../services/dynamodb" }
+elasticache = { path = "../services/elasticache" }
+eventbridge = { path = "../services/eventbridge" }
 futures = "0.3.32"
 getrandom = "0.2"
 iam = { path = "../services/iam" }
-kinesis = { path = "../services/kinesis", optional = true }
-kms = { path = "../services/kms", optional = true }
-lambda = { path = "../services/lambda", optional = true }
+kinesis = { path = "../services/kinesis" }
+kms = { path = "../services/kms" }
+lambda = { path = "../services/lambda" }
 opensrv-mysql = { version = "0.7.0", default-features = false }
 pgwire = { version = "0.38.2", default-features = false, features = ["server-api"] }
-rds = { path = "../services/rds", optional = true }
+rds = { path = "../services/rds" }
 rsa = "0.9.8"
-s3 = { path = "../services/s3", optional = true }
-secrets-manager = { path = "../services/secrets-manager", optional = true }
+s3 = { path = "../services/s3" }
+secrets-manager = { path = "../services/secrets-manager" }
 serde.workspace = true
 serde_json.workspace = true
 sha1 = { version = "0.10.6", features = ["oid"] }
-sns = { path = "../services/sns", optional = true }
-sqs = { path = "../services/sqs", optional = true }
-ssm = { path = "../services/ssm", optional = true }
-step-functions = { path = "../services/step-functions", optional = true }
+sns = { path = "../services/sns" }
+sqs = { path = "../services/sqs" }
+ssm = { path = "../services/ssm" }
+step-functions = { path = "../services/step-functions" }
 storage = { path = "../storage" }
 sts = { path = "../services/sts" }
 thiserror.workspace = true

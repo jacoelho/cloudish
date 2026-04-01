@@ -1,27 +1,17 @@
-#[cfg(feature = "sns")]
 use aws::{HttpForwardRequest, HttpForwarder, SharedAdvertisedEdge};
-#[cfg(feature = "sns")]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-#[cfg(feature = "sns")]
 use lambda::{InvokeInput, LambdaInvocationType, LambdaScope, LambdaService};
-#[cfg(feature = "sns")]
 use rsa::{RsaPrivateKey, pkcs1v15::Pkcs1v15Sign, pkcs8::DecodePrivateKey};
-#[cfg(feature = "sns")]
 use sha1::{Digest, Sha1};
-#[cfg(feature = "sns")]
 use sns::{
     ConfirmationDelivery, DeliveryEndpoint, PlannedDelivery,
     SnsDeliveryTransport, SnsHttpRequest, SnsHttpSigner, SnsIdentifierSource,
     SnsService,
 };
-#[cfg(feature = "sns")]
 use sqs::{SendMessageInput, SqsService};
-#[cfg(feature = "sns")]
 use std::sync::{Arc, OnceLock};
-#[cfg(feature = "sns")]
 use std::time::SystemTime;
 
-#[cfg(feature = "sns")]
 #[derive(Clone, Default)]
 pub struct SnsServiceDependencies {
     pub advertised_edge: SharedAdvertisedEdge,
@@ -31,7 +21,6 @@ pub struct SnsServiceDependencies {
     pub sqs: Option<SqsService>,
 }
 
-#[cfg(feature = "sns")]
 pub fn build_sns_service(
     advertised_edge: SharedAdvertisedEdge,
     time_source: Arc<dyn Fn() -> SystemTime + Send + Sync>,
@@ -51,7 +40,6 @@ pub fn build_sns_service(
     )
 }
 
-#[cfg(feature = "sns")]
 const CLOUDISH_SNS_SIGNING_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCzlgpV4C+kMkWm
 fHDmvMVXB29yPqVC96A3pnUFGOwFnwqR4CLPtjTf5u8iFAc3UwQiHfK6LPBJN+Mg
@@ -82,7 +70,6 @@ u1wVSdLMaZ0bh9EzaTJKtVI=
 -----END PRIVATE KEY-----
 "#;
 
-#[cfg(feature = "sns")]
 const CLOUDISH_SNS_SIGNING_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
 MIIDGzCCAgOgAwIBAgIUY6l51sYMiDRC4gv5mXbgxtLw6YEwDQYJKoZIhvcNAQEL
 BQAwHTEbMBkGA1UEAwwSY2xvdWRpc2gtc25zLmxvY2FsMB4XDTI2MDMzMDEzMzA0
@@ -104,12 +91,10 @@ G/lNp5qXpLwhj+zMgs4QwyMmkLTyLy9hnwg0BS7XFg==
 -----END CERTIFICATE-----
 "#;
 
-#[cfg(feature = "sns")]
 pub fn cloudish_sns_signing_cert_pem() -> &'static [u8] {
     CLOUDISH_SNS_SIGNING_CERT_PEM.as_bytes()
 }
 
-#[cfg(feature = "sns")]
 pub(crate) fn cloudish_sns_signing_key() -> &'static RsaPrivateKey {
     static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
 
@@ -119,20 +104,17 @@ pub(crate) fn cloudish_sns_signing_key() -> &'static RsaPrivateKey {
     })
 }
 
-#[cfg(feature = "sns")]
 #[derive(Clone)]
 pub(crate) struct CloudishSnsHttpSigner {
     advertised_edge: SharedAdvertisedEdge,
 }
 
-#[cfg(feature = "sns")]
 impl CloudishSnsHttpSigner {
     pub(crate) fn new(advertised_edge: SharedAdvertisedEdge) -> Self {
         Self { advertised_edge }
     }
 }
 
-#[cfg(feature = "sns")]
 impl SnsHttpSigner for CloudishSnsHttpSigner {
     fn sign(&self, string_to_sign: &str) -> String {
         let digest = Sha1::digest(string_to_sign.as_bytes());
@@ -148,13 +130,11 @@ impl SnsHttpSigner for CloudishSnsHttpSigner {
     }
 }
 
-#[cfg(feature = "sns")]
 #[derive(Clone)]
 struct SnsDeliveryDispatcher {
     dependencies: SnsServiceDependencies,
 }
 
-#[cfg(feature = "sns")]
 impl SnsDeliveryTransport for SnsDeliveryDispatcher {
     fn deliver_confirmation(
         &self,
@@ -254,7 +234,6 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
     }
 }
 
-#[cfg(feature = "sns")]
 impl SnsDeliveryDispatcher {
     fn http_forward_request(
         &self,

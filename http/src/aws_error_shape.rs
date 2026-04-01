@@ -1,38 +1,21 @@
-#[cfg(feature = "apigateway")]
 use crate::ApiGatewayError;
-#[cfg(feature = "cloudformation")]
 use crate::CloudFormationError;
-#[cfg(feature = "cognito")]
 use crate::CognitoError;
-#[cfg(feature = "dynamodb")]
 use crate::DynamoDbError;
-#[cfg(feature = "elasticache")]
 use crate::ElastiCacheError;
-#[cfg(feature = "eventbridge")]
 use crate::EventBridgeError;
 use crate::IamError;
-#[cfg(feature = "kinesis")]
 use crate::KinesisError;
-#[cfg(feature = "kms")]
 use crate::KmsError;
-#[cfg(feature = "lambda")]
 use crate::LambdaError;
-#[cfg(feature = "rds")]
 use crate::RdsError;
-#[cfg(feature = "s3")]
 use crate::S3Error;
-#[cfg(feature = "secrets-manager")]
 use crate::SecretsManagerError;
-#[cfg(feature = "sns")]
 use crate::SnsError;
-#[cfg(feature = "sqs")]
 use crate::SqsError;
-#[cfg(feature = "ssm")]
 use crate::SsmError;
-#[cfg(feature = "step-functions")]
 use crate::StepFunctionsError;
 use crate::StsError;
-#[cfg(feature = "cloudwatch")]
 use crate::{CloudWatchLogsError, CloudWatchMetricsError};
 use aws::{AwsError, AwsErrorFamily};
 
@@ -49,13 +32,9 @@ pub(crate) fn trusted_aws_error(
 ) -> AwsError {
     AwsError::trusted_custom(family, code, message, status_code, sender_fault)
 }
-
-#[cfg(feature = "cloudwatch")]
 pub(crate) trait QueryModeAwsErrorShape {
     fn to_aws_error(&self, query_mode: bool) -> AwsError;
 }
-
-#[cfg(feature = "apigateway")]
 impl AwsErrorShape for ApiGatewayError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -99,8 +78,6 @@ impl AwsErrorShape for ApiGatewayError {
         }
     }
 }
-
-#[cfg(feature = "cloudformation")]
 impl AwsErrorShape for CloudFormationError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -149,8 +126,6 @@ impl AwsErrorShape for CloudFormationError {
         }
     }
 }
-
-#[cfg(feature = "eventbridge")]
 impl AwsErrorShape for EventBridgeError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -199,8 +174,6 @@ impl AwsErrorShape for EventBridgeError {
         }
     }
 }
-
-#[cfg(feature = "cloudwatch")]
 impl AwsErrorShape for CloudWatchLogsError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -244,8 +217,6 @@ impl AwsErrorShape for CloudWatchLogsError {
         }
     }
 }
-
-#[cfg(feature = "cloudwatch")]
 impl QueryModeAwsErrorShape for CloudWatchMetricsError {
     fn to_aws_error(&self, query_mode: bool) -> AwsError {
         match self {
@@ -310,8 +281,6 @@ impl QueryModeAwsErrorShape for CloudWatchMetricsError {
         }
     }
 }
-
-#[cfg(feature = "cognito")]
 impl AwsErrorShape for CognitoError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -381,8 +350,6 @@ impl AwsErrorShape for CognitoError {
         }
     }
 }
-
-#[cfg(feature = "dynamodb")]
 impl AwsErrorShape for DynamoDbError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -454,8 +421,6 @@ impl AwsErrorShape for DynamoDbError {
         }
     }
 }
-
-#[cfg(feature = "elasticache")]
 impl AwsErrorShape for ElastiCacheError {
     fn to_aws_error(&self) -> AwsError {
         let family = match self {
@@ -523,8 +488,6 @@ impl AwsErrorShape for IamError {
         }
     }
 }
-
-#[cfg(feature = "kinesis")]
 impl AwsErrorShape for KinesisError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -573,8 +536,6 @@ impl AwsErrorShape for KinesisError {
         }
     }
 }
-
-#[cfg(feature = "kms")]
 impl AwsErrorShape for KmsError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -665,8 +626,6 @@ impl AwsErrorShape for KmsError {
         }
     }
 }
-
-#[cfg(feature = "lambda")]
 impl AwsErrorShape for LambdaError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -766,8 +725,6 @@ impl AwsErrorShape for LambdaError {
         }
     }
 }
-
-#[cfg(feature = "rds")]
 impl AwsErrorShape for RdsError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -857,8 +814,6 @@ impl AwsErrorShape for RdsError {
         }
     }
 }
-
-#[cfg(feature = "s3")]
 impl AwsErrorShape for S3Error {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -1032,8 +987,6 @@ impl AwsErrorShape for S3Error {
         }
     }
 }
-
-#[cfg(feature = "secrets-manager")]
 impl AwsErrorShape for SecretsManagerError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -1089,8 +1042,6 @@ impl AwsErrorShape for SecretsManagerError {
         }
     }
 }
-
-#[cfg(feature = "sns")]
 impl AwsErrorShape for SnsError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -1125,8 +1076,6 @@ impl AwsErrorShape for SnsError {
         }
     }
 }
-
-#[cfg(feature = "sqs")]
 impl AwsErrorShape for SqsError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -1227,8 +1176,6 @@ impl AwsErrorShape for SqsError {
         }
     }
 }
-
-#[cfg(feature = "ssm")]
 impl AwsErrorShape for SsmError {
     fn to_aws_error(&self) -> AwsError {
         match self {
@@ -1305,8 +1252,6 @@ impl AwsErrorShape for SsmError {
         }
     }
 }
-
-#[cfg(feature = "step-functions")]
 impl AwsErrorShape for StepFunctionsError {
     fn to_aws_error(&self) -> AwsError {
         match self {

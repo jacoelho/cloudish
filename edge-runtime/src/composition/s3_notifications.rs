@@ -1,26 +1,17 @@
-#[cfg(feature = "s3")]
 use aws::{Arn, ServiceName};
-#[cfg(feature = "s3")]
 use s3::{S3Error, S3EventNotification, S3NotificationTransport, S3Scope};
-#[cfg(feature = "s3")]
 use sns::{PublishInput, SnsService};
-#[cfg(feature = "s3")]
 use sqs::{SendMessageInput, SqsService};
-#[cfg(feature = "s3")]
 use std::collections::BTreeMap;
-#[cfg(feature = "s3")]
 use time::OffsetDateTime;
-#[cfg(feature = "s3")]
 use time::format_description::well_known::Rfc3339;
 
-#[cfg(feature = "s3")]
 #[derive(Clone, Default)]
 pub struct S3NotificationDispatcher {
     pub sns: Option<SnsService>,
     pub sqs: Option<SqsService>,
 }
 
-#[cfg(feature = "s3")]
 impl S3NotificationTransport for S3NotificationDispatcher {
     fn publish(&self, notification: &S3EventNotification) {
         let body = s3_notification_message_body(notification);
@@ -97,7 +88,6 @@ impl S3NotificationTransport for S3NotificationDispatcher {
     }
 }
 
-#[cfg(feature = "s3")]
 fn invalid_destination(destination_arn: &Arn) -> S3Error {
     S3Error::InvalidArgument {
         code: "InvalidArgument",
@@ -106,7 +96,6 @@ fn invalid_destination(destination_arn: &Arn) -> S3Error {
     }
 }
 
-#[cfg(feature = "s3")]
 fn s3_notification_message_body(notification: &S3EventNotification) -> String {
     serde_json::json!({
         "Records": [{
@@ -148,7 +137,6 @@ fn s3_notification_message_body(notification: &S3EventNotification) -> String {
     .to_string()
 }
 
-#[cfg(feature = "s3")]
 fn format_epoch_rfc3339(epoch_seconds: u64) -> String {
     OffsetDateTime::from_unix_timestamp(epoch_seconds as i64)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)

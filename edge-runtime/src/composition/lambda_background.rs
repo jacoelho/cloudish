@@ -1,15 +1,9 @@
-#[cfg(feature = "lambda")]
 use crate::ManagedBackgroundTasks;
-#[cfg(feature = "lambda")]
 use aws::{BackgroundScheduler, InfrastructureError};
-#[cfg(feature = "lambda")]
 use lambda::LambdaService;
-#[cfg(feature = "lambda")]
 use std::sync::Arc;
-#[cfg(feature = "lambda")]
 use std::time::Duration;
 
-#[cfg(feature = "lambda")]
 pub(crate) fn start_lambda_background_tasks(
     lambda: LambdaService,
     scheduler: Arc<dyn BackgroundScheduler>,

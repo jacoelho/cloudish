@@ -1,39 +1,25 @@
-// Gate by capability ownership or the real transitive feature contract.
-// Do not narrow imports with guessed leaf-service lists in this module.
-#[cfg(feature = "apigateway")]
 mod apigateway;
-#[cfg(feature = "eventbridge")]
 mod eventbridge;
-#[cfg(feature = "lambda")]
 mod lambda_background;
-#[cfg(feature = "s3")]
 mod s3_notifications;
-#[cfg(feature = "sns")]
 mod sns;
-#[cfg(feature = "step-functions")]
 mod step_functions;
 
-#[cfg(feature = "apigateway")]
 pub use self::apigateway::ApiGatewayIntegrationExecutor;
-#[cfg(feature = "eventbridge")]
 pub(crate) use self::eventbridge::{
     EventBridgeDispatcherAssembly, EventBridgeDispatcherDependencies,
     build_eventbridge_dispatcher,
 };
-#[cfg(feature = "lambda")]
 pub(crate) use self::lambda_background::start_lambda_background_tasks;
-#[cfg(feature = "s3")]
 pub use self::s3_notifications::S3NotificationDispatcher;
-#[cfg(all(test, feature = "all-services"))]
+#[cfg(test)]
 pub(crate) use self::sns::{CloudishSnsHttpSigner, cloudish_sns_signing_key};
-#[cfg(feature = "sns")]
 pub use self::sns::{
     SnsServiceDependencies, build_sns_service, cloudish_sns_signing_cert_pem,
 };
-#[cfg(feature = "step-functions")]
 pub use self::step_functions::LambdaStepFunctionsTaskAdapter;
 
-#[cfg(all(test, feature = "all-services"))]
+#[cfg(test)]
 mod tests {
     use super::{
         ApiGatewayIntegrationExecutor, CloudishSnsHttpSigner,

@@ -1,25 +1,20 @@
-#[cfg(feature = "step-functions")]
 use lambda::{InvokeInput, LambdaInvocationType, LambdaScope, LambdaService};
-#[cfg(feature = "step-functions")]
 use step_functions::{
     StepFunctionsScope, StepFunctionsTaskAdapter, TaskInvocationFailure,
     TaskInvocationRequest, TaskInvocationResult,
 };
 
-#[cfg(feature = "step-functions")]
 #[derive(Clone)]
 pub struct LambdaStepFunctionsTaskAdapter {
     lambda: Option<LambdaService>,
 }
 
-#[cfg(feature = "step-functions")]
 impl LambdaStepFunctionsTaskAdapter {
     pub fn new(lambda: Option<LambdaService>) -> Self {
         Self { lambda }
     }
 }
 
-#[cfg(feature = "step-functions")]
 impl StepFunctionsTaskAdapter for LambdaStepFunctionsTaskAdapter {
     fn invoke(
         &self,
@@ -98,7 +93,6 @@ impl StepFunctionsTaskAdapter for LambdaStepFunctionsTaskAdapter {
     }
 }
 
-#[cfg(feature = "step-functions")]
 fn lambda_task_failure_details(
     error: &lambda::LambdaError,
 ) -> (&'static str, String) {

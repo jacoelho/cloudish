@@ -1,40 +1,32 @@
-#[cfg(feature = "lambda")]
 use crate::aws_error_shape::AwsErrorShape as _;
-#[cfg(feature = "cognito")]
 use crate::cognito;
 use crate::query::{
     missing_action_error, parse_request as parse_query_request,
 };
 use crate::request::{EdgeRequest, HttpRequest};
 use crate::routing;
-#[cfg(feature = "s3")]
 use crate::s3;
 use crate::xml::XmlBuilder;
 use auth::{
     Authenticator, RequestAuth, RequestHeader, VerifiedRequest,
     VerifiedSignature,
 };
-#[cfg(feature = "lambda")]
 use aws::RegionId;
-#[cfg(feature = "apigateway")]
 use aws::parse_reserved_execute_api_path;
-#[cfg(feature = "lambda")]
 use aws::parse_reserved_lambda_function_url_path;
 use aws::{
     AwsError, AwsErrorFamily, CredentialScope, ProtocolFamily, RequestContext,
     RuntimeDefaults, ServiceName, SharedAdvertisedEdge,
 };
 use ciborium::into_writer;
-use edge_runtime::{EnabledServices, RuntimeServices};
+use edge_protocol::http_reason_phrase;
+use edge_runtime::RuntimeServices;
 use httpdate::fmt_http_date;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-#[cfg(feature = "lambda")]
 use services::FunctionUrlInvocationInput;
-#[cfg(feature = "s3")]
 use services::S3Scope;
 use std::sync::atomic::AtomicBool;
-#[cfg(any(feature = "apigateway", feature = "lambda"))]
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
@@ -47,7 +39,6 @@ pub struct EdgeRouter {
     defaults: RuntimeDefaults,
     authenticator: Authenticator,
     runtime: RuntimeServices,
-    services: EnabledServices,
 }
 
 #[derive(Clone)]
@@ -70,10 +61,9 @@ impl EdgeRouter {
         defaults: RuntimeDefaults,
         advertised_edge: SharedAdvertisedEdge,
         authenticator: Authenticator,
-        services: EnabledServices,
         runtime: RuntimeServices,
     ) -> Self {
-        Self { advertised_edge, defaults, authenticator, runtime, services }
+        Self { advertised_edge, defaults, authenticator, runtime }
     }
 
     pub fn begin_shutdown(&self) {
@@ -103,7 +93,6 @@ impl EdgeRouter {
         EdgeRequestExecutor { router: self.clone() }
     }
 
-    #[cfg(any(feature = "lambda", feature = "sqs"))]
     pub(crate) fn advertised_edge(&self) -> &SharedAdvertisedEdge {
         &self.advertised_edge
     }
@@ -143,7 +132,6 @@ impl EdgeRouter {
         let Some(protocol) =
             routing::detect_generic_protocol(&request, &advertised_edge)
         else {
-            #[cfg(feature = "s3")]
             if s3::is_rest_xml_request(&request, &advertised_edge) {
                 let verified_signature =
                     match self.authenticate_details(&request) {
@@ -162,14 +150,7 @@ impl EdgeRouter {
             Ok(verified_signature) => verified_signature,
             Err(error) => {
                 return if protocol == ProtocolFamily::RestXml {
-                    #[cfg(feature = "s3")]
-                    {
-                        s3::s3_error_response(&error)
-                    }
-                    #[cfg(not(feature = "s3"))]
-                    {
-                        EdgeResponse::aws(protocol, &error)
-                    }
+                    s3::s3_error_response(&error)
                 } else {
                     EdgeResponse::aws(protocol, &error)
                 };
@@ -207,8 +188,6 @@ impl EdgeRouter {
 
         response
     }
-
-    #[cfg(feature = "lambda")]
     fn route_reserved_lambda_function_url(
         &self,
         request: &HttpRequest<'_>,
@@ -226,16 +205,6 @@ impl EdgeRouter {
         )
     }
 
-    #[cfg(not(feature = "lambda"))]
-    fn route_reserved_lambda_function_url(
-        &self,
-        _request: &HttpRequest<'_>,
-        _request_cancellation: &AtomicBool,
-    ) -> Option<EdgeResponse> {
-        None
-    }
-
-    #[cfg(feature = "lambda")]
     fn route_function_url(
         &self,
         request: &HttpRequest<'_>,
@@ -252,8 +221,6 @@ impl EdgeRouter {
             request_cancellation,
         )
     }
-
-    #[cfg(feature = "lambda")]
     fn route_lambda_function_url_request(
         &self,
         request: &HttpRequest<'_>,
@@ -262,13 +229,6 @@ impl EdgeRouter {
         request_path: &str,
         request_cancellation: &AtomicBool,
     ) -> Option<EdgeResponse> {
-        if !self.services.is_enabled(ServiceName::Lambda) {
-            return Some(EdgeResponse::json(
-                404,
-                json!({ "message": "not found" }),
-            ));
-        }
-
         let verified_request = match self.authenticate(request) {
             Ok(verified_request) => verified_request,
             Err(error) => return Some(function_url_error_response(&error)),
@@ -357,16 +317,6 @@ impl EdgeRouter {
         Some(response)
     }
 
-    #[cfg(not(feature = "lambda"))]
-    fn route_function_url(
-        &self,
-        _request: &HttpRequest<'_>,
-        _request_cancellation: &AtomicBool,
-    ) -> Option<EdgeResponse> {
-        None
-    }
-
-    #[cfg(feature = "apigateway")]
     fn route_reserved_execute_api(
         &self,
         request: &HttpRequest<'_>,
@@ -382,16 +332,6 @@ impl EdgeRouter {
         ))
     }
 
-    #[cfg(not(feature = "apigateway"))]
-    fn route_reserved_execute_api(
-        &self,
-        _request: &HttpRequest<'_>,
-        _request_cancellation: &AtomicBool,
-    ) -> Option<EdgeResponse> {
-        None
-    }
-
-    #[cfg(feature = "apigateway")]
     fn route_execute_api_request(
         &self,
         request: &HttpRequest<'_>,
@@ -400,10 +340,6 @@ impl EdgeRouter {
         request_cancellation: &AtomicBool,
     ) -> EdgeResponse {
         let execute_request = build_execute_api_request(request, request_path);
-
-        if !self.services.is_enabled(ServiceName::ApiGateway) {
-            return EdgeResponse::json(404, json!({ "message": "not found" }));
-        }
 
         let verified_request = match self.authenticate(request) {
             Ok(verified_request) => verified_request,
@@ -484,7 +420,6 @@ impl EdgeRouter {
         &self,
         request: &HttpRequest<'_>,
     ) -> Option<EdgeResponse> {
-        #[cfg(feature = "cognito")]
         if let Some((user_pool_id, document)) =
             cognito_well_known_route(request.path_without_query())
         {
@@ -497,14 +432,6 @@ impl EdgeRouter {
                     .with_header("Allow", "GET"),
                 );
             }
-            if !self.services.is_enabled(ServiceName::CognitoIdentityProvider)
-            {
-                return Some(EdgeResponse::json(
-                    404,
-                    json!({ "message": "not found" }),
-                ));
-            }
-
             let response = match document {
                 CognitoWellKnownDocument::OpenIdConfiguration => {
                     cognito::open_id_configuration(
@@ -529,8 +456,6 @@ impl EdgeRouter {
                 ),
             });
         }
-
-        #[cfg(feature = "sns")]
         if request.path_without_query() == "/__aws/sns/signing-cert.pem" {
             if request.method() != "GET" {
                 return Some(
@@ -541,13 +466,6 @@ impl EdgeRouter {
                     .with_header("Allow", "GET"),
                 );
             }
-            if !self.services.is_enabled(ServiceName::Sns) {
-                return Some(EdgeResponse::json(
-                    404,
-                    json!({ "message": "not found" }),
-                ));
-            }
-
             return Some(EdgeResponse::bytes(
                 200,
                 "application/x-pem-file",
@@ -616,21 +534,36 @@ impl EdgeRouter {
                     return EdgeResponse::aws(ProtocolFamily::Query, &error);
                 }
 
-                if let Some(expected_service) =
-                    routing::service_from_query_action(&action, Some(version))
-                    && expected_service != scope.service()
-                {
-                    let error = signature_scope_mismatch_error(format!(
-                        "Credential scope service {} does not match query action {}.",
-                        scope.service().as_str(),
-                        action,
-                    ));
-                    return EdgeResponse::aws(ProtocolFamily::Query, &error);
+                match routing::validate_query_for_service(
+                    scope.service(),
+                    &action,
+                    version,
+                ) {
+                    routing::ScopedQueryValidation::Valid => {}
+                    routing::ScopedQueryValidation::ActionOutsideService => {
+                        let error = signature_scope_mismatch_error(format!(
+                            "Credential scope service {} does not match query action {}.",
+                            scope.service().as_str(),
+                            action,
+                        ));
+                        return EdgeResponse::aws(
+                            ProtocolFamily::Query,
+                            &error,
+                        );
+                    }
+                    routing::ScopedQueryValidation::InvalidVersion => {
+                        let error =
+                            invalid_query_version_error(&action, version);
+                        return EdgeResponse::aws(
+                            ProtocolFamily::Query,
+                            &error,
+                        );
+                    }
                 }
 
                 scope.service()
             }
-            None => match routing::service_from_query_action(
+            None => match routing::resolve_unsigned_query_service(
                 &action,
                 Some(version),
             ) {
@@ -644,13 +577,6 @@ impl EdgeRouter {
         if !routing::query_action_matches_version(service, &action, version) {
             let error = invalid_query_version_error(&action, version);
             return EdgeResponse::aws(ProtocolFamily::Query, &error);
-        }
-
-        if !self.services.is_enabled(service) {
-            return EdgeResponse::aws(
-                ProtocolFamily::Query,
-                &service_not_available_error(service),
-            );
         }
 
         let context = self.request_context(
@@ -695,13 +621,6 @@ impl EdgeRouter {
             Ok(route) => route,
             Err(error) => return EdgeResponse::aws(protocol, &error),
         };
-
-        if !self.services.is_enabled(route.service) {
-            return EdgeResponse::aws(
-                protocol,
-                &service_not_available_error(route.service),
-            );
-        }
 
         let context = self.request_context(
             verified_request,
@@ -749,13 +668,6 @@ impl EdgeRouter {
                 );
             }
         };
-
-        if !self.services.is_enabled(route.service) {
-            return EdgeResponse::aws(
-                ProtocolFamily::SmithyRpcV2Cbor,
-                &service_not_available_error(route.service),
-            );
-        }
 
         let context = self.request_context(
             verified_request,
@@ -806,13 +718,6 @@ impl EdgeRouter {
             return EdgeResponse::aws(ProtocolFamily::RestJson, &error);
         }
 
-        if !self.services.is_enabled(service) {
-            return EdgeResponse::aws(
-                ProtocolFamily::RestJson,
-                &service_not_available_error(service),
-            );
-        }
-
         let context = self.request_context(
             verified_request,
             service,
@@ -830,12 +735,10 @@ impl EdgeRouter {
             Some(response) => response,
             None => EdgeResponse::aws(
                 ProtocolFamily::RestJson,
-                &service_not_available_error(service),
+                &unknown_rest_json_error(&context),
             ),
         }
     }
-
-    #[cfg(feature = "s3")]
     fn route_rest_xml(
         &self,
         mut request: EdgeRequest,
@@ -851,12 +754,6 @@ impl EdgeRouter {
                 verified_request.scope().service().as_str(),
             ));
             return s3::s3_error_response(&error);
-        }
-
-        if !self.services.is_enabled(ServiceName::S3) {
-            return s3::s3_error_response(&service_not_available_error(
-                ServiceName::S3,
-            ));
         }
 
         if let Err(error) =
@@ -887,18 +784,6 @@ impl EdgeRouter {
         }
     }
 
-    #[cfg(not(feature = "s3"))]
-    fn route_rest_xml(
-        &self,
-        _request: EdgeRequest,
-        _verified_signature: Option<&VerifiedSignature>,
-    ) -> EdgeResponse {
-        EdgeResponse::aws(
-            ProtocolFamily::RestXml,
-            &service_not_available_error(ServiceName::S3),
-        )
-    }
-
     fn request_context(
         &self,
         verified_request: Option<&VerifiedRequest>,
@@ -925,7 +810,6 @@ impl EdgeRouter {
         )
     }
 
-    #[cfg(any(feature = "apigateway", feature = "lambda"))]
     fn authenticate(
         &self,
         request: &HttpRequest<'_>,
@@ -965,35 +849,16 @@ impl EdgeRouter {
     }
 
     fn health_response(&self) -> EdgeResponse {
-        EdgeResponse::json(
-            200,
-            json!({
-                "status": "ok",
-                "defaultAccount": self.authenticator.fallback_account(),
-                "defaultRegion": self.authenticator.fallback_region(),
-                "enabledServices": self.services.enabled_service_count(),
-            }),
-        )
+        EdgeResponse::json(200, json!({ "status": "ok" }))
     }
 
     fn status_response(&self) -> EdgeResponse {
-        let enabled_services = self
-            .services
-            .enabled_services()
-            .into_iter()
-            .map(ServiceName::as_str)
-            .collect::<Vec<_>>();
-
         EdgeResponse::json(
             200,
             json!({
-                "status": "ok",
-                "ready": true,
                 "defaultAccount": self.defaults.default_account(),
                 "defaultRegion": self.defaults.default_region(),
                 "stateDirectory": self.defaults.state_directory().display().to_string(),
-                "enabledServices": enabled_services,
-                "serviceCount": self.services.enabled_service_count(),
             }),
         )
     }
@@ -1099,7 +964,7 @@ impl EdgeResponse {
         let mut response = format!(
             "HTTP/1.1 {} {}\r\n",
             self.status_code,
-            reason_phrase(self.status_code)
+            http_reason_phrase(self.status_code)
         )
         .into_bytes();
 
@@ -1127,22 +992,16 @@ struct JsonRoute<'a> {
     missing_target: bool,
     original_target: Option<&'a str>,
 }
-
-#[cfg(feature = "cognito")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CognitoWellKnownDocument {
     Jwks,
     OpenIdConfiguration,
 }
-
-#[cfg(feature = "lambda")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FunctionUrlHost {
     region: RegionId,
     url_id: String,
 }
-
-#[cfg(feature = "cognito")]
 fn cognito_well_known_route(
     path: &str,
 ) -> Option<(&str, CognitoWellKnownDocument)> {
@@ -1160,14 +1019,10 @@ fn cognito_well_known_route(
 
     None
 }
-
-#[cfg(feature = "cognito")]
 fn cognito_pool_id_segment(pool_path: &str) -> Option<&str> {
     let pool_id = pool_path.strip_prefix('/')?;
     (!pool_id.is_empty() && !pool_id.contains('/')).then_some(pool_id)
 }
-
-#[cfg(feature = "lambda")]
 fn parse_function_url_host(host: &str) -> Option<FunctionUrlHost> {
     let authority = host.trim().to_ascii_lowercase();
     let host = authority
@@ -1184,31 +1039,23 @@ fn parse_function_url_host(host: &str) -> Option<FunctionUrlHost> {
 
     Some(FunctionUrlHost { region, url_id: url_id.to_owned() })
 }
-
-#[cfg(feature = "lambda")]
 fn function_url_error_response(error: &AwsError) -> EdgeResponse {
     EdgeResponse::json(
         error.status_code(),
         json!({ "Message": error.message() }),
     )
 }
-
-#[cfg(feature = "lambda")]
 fn function_url_lambda_error_response(
     error: &services::LambdaError,
 ) -> EdgeResponse {
     function_url_error_response(&error.to_aws_error())
 }
-
-#[cfg(feature = "apigateway")]
 fn execute_api_auth_error_response(error: &AwsError) -> EdgeResponse {
     EdgeResponse::json(
         error.status_code(),
         json!({ "message": error.message() }),
     )
 }
-
-#[cfg(feature = "apigateway")]
 fn execute_api_error_response(
     error: &services::ExecuteApiError,
 ) -> EdgeResponse {
@@ -1217,15 +1064,11 @@ fn execute_api_error_response(
         json!({ "message": error.message() }),
     )
 }
-
-#[cfg(feature = "lambda")]
 fn should_skip_function_url_response_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("content-length")
         || name.eq_ignore_ascii_case("date")
 }
-
-#[cfg(feature = "apigateway")]
 fn build_execute_api_request(
     request: &HttpRequest<'_>,
     request_path: &str,
@@ -1484,21 +1327,25 @@ fn unknown_json_error(
     )
 }
 
-fn unknown_json_operation_without_context(detail: &str) -> AwsError {
+fn unknown_rest_json_error(context: &RequestContext) -> AwsError {
     AwsError::trusted_custom(
         AwsErrorFamily::UnsupportedOperation,
         "UnknownOperationException",
-        format!("Unknown operation: {detail}."),
+        format!(
+            "Unknown operation {} for service {}.",
+            context.operation(),
+            context.service().as_str()
+        ),
         400,
         true,
     )
 }
 
-fn service_not_available_error(service: ServiceName) -> AwsError {
+fn unknown_json_operation_without_context(detail: &str) -> AwsError {
     AwsError::trusted_custom(
-        AwsErrorFamily::Conflict,
-        "ServiceNotAvailableException",
-        format!("Service {} is not enabled.", service.as_str()),
+        AwsErrorFamily::UnsupportedOperation,
+        "UnknownOperationException",
+        format!("Unknown operation: {detail}."),
         400,
         true,
     )
@@ -1576,28 +1423,6 @@ impl From<&AwsError> for AwsJsonErrorBody {
     }
 }
 
-fn reason_phrase(status_code: u16) -> &'static str {
-    match status_code {
-        200 => "OK",
-        201 => "Created",
-        202 => "Accepted",
-        204 => "No Content",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        409 => "Conflict",
-        412 => "Precondition Failed",
-        413 => "Payload Too Large",
-        415 => "Unsupported Media Type",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        501 => "Not Implemented",
-        502 => "Bad Gateway",
-        _ => "Unknown",
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SmithyPath<'a> {
     service_id: &'a str,
@@ -1623,135 +1448,12 @@ fn smithy_path(path: &str) -> Option<SmithyPath<'_>> {
 }
 
 #[cfg(test)]
-mod reduced_feature_tests {
-    use super::{AwsJsonErrorBody, EdgeRouter};
-    use crate::test_runtime;
-    use aws::ServiceName;
-    use ciborium::from_reader;
-
-    fn router_with_services(
-        label: &str,
-        enabled_services: &[ServiceName],
-    ) -> EdgeRouter {
-        test_runtime::router_with_services(label, enabled_services)
-    }
-
-    fn split_response(response: &[u8]) -> (&str, Vec<(&str, &str)>, &[u8]) {
-        let body_start = response
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("response should contain header terminator");
-        let header_text = std::str::from_utf8(&response[..body_start])
-            .expect("headers should be UTF-8");
-        let mut lines = header_text.split("\r\n");
-        let status =
-            lines.next().expect("response should include status line");
-        let headers = lines
-            .map(|line| {
-                let (name, value) = line
-                    .split_once(": ")
-                    .expect("headers should include a separator");
-                (name, value)
-            })
-            .collect();
-
-        (status, headers, &response[body_start + 4..])
-    }
-
-    fn header_value<'a>(
-        headers: &'a [(&'a str, &'a str)],
-        name: &str,
-    ) -> Option<&'a str> {
-        headers
-            .iter()
-            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
-            .map(|(_, value)| *value)
-    }
-
-    #[test]
-    fn disabled_known_query_service_returns_service_not_available() {
-        let body = "Action=CreateQueue&Version=2012-11-05&QueueName=demo";
-        let response = router_with_services(
-            "disabled-known-query-service",
-            &[ServiceName::Iam],
-        )
-        .handle_bytes(
-            format!(
-                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            )
-            .as_bytes(),
-        );
-        let response_bytes = response.to_http_bytes();
-        let (status, headers, body) = split_response(&response_bytes);
-        let body =
-            std::str::from_utf8(body).expect("query body should be UTF-8");
-
-        assert_eq!(status, "HTTP/1.1 400 Bad Request");
-        assert_eq!(header_value(&headers, "content-type"), Some("text/xml"));
-        assert!(body.contains("<Code>ServiceNotAvailableException</Code>"));
-        assert!(body.contains("Service sqs is not enabled."));
-    }
-
-    #[test]
-    fn disabled_known_json_service_returns_service_not_available() {
-        let response = router_with_services(
-            "disabled-known-json-service",
-            &[ServiceName::Sqs],
-        )
-        .handle_bytes(
-            b"POST / HTTP/1.1\r\nHost: localhost\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nContent-Type: application/x-amz-json-1.1\r\nContent-Length: 2\r\n\r\n{}",
-        );
-        let response_bytes = response.to_http_bytes();
-        let (status, headers, body) = split_response(&response_bytes);
-        let body: AwsJsonErrorBody = serde_json::from_slice(body)
-            .expect("body should be a JSON AWS error");
-
-        assert_eq!(status, "HTTP/1.1 400 Bad Request");
-        assert_eq!(
-            header_value(&headers, "content-type"),
-            Some("application/x-amz-json-1.1")
-        );
-        assert_eq!(body.error_type, "ServiceNotAvailableException");
-        assert!(body.message.contains("ssm"));
-    }
-
-    #[test]
-    fn disabled_known_smithy_service_returns_service_not_available() {
-        let response = router_with_services(
-            "disabled-known-smithy-service",
-            &[ServiceName::Iam],
-        )
-        .handle_bytes(
-            b"POST /service/CloudWatch/operation/GetMetricData HTTP/1.1\r\nHost: localhost\r\nSmithy-Protocol: rpc-v2-cbor\r\nContent-Type: application/cbor\r\nContent-Length: 1\r\n\r\n\xa0",
-        );
-        let response_bytes = response.to_http_bytes();
-        let (status, headers, body) = split_response(&response_bytes);
-        let body: AwsJsonErrorBody =
-            from_reader(body).expect("body should be a CBOR AWS error");
-
-        assert_eq!(status, "HTTP/1.1 400 Bad Request");
-        assert_eq!(
-            header_value(&headers, "content-type"),
-            Some("application/cbor")
-        );
-        assert_eq!(
-            header_value(&headers, "smithy-protocol"),
-            Some("rpc-v2-cbor")
-        );
-        assert_eq!(body.error_type, "ServiceNotAvailableException");
-        assert!(body.message.contains("cloudwatch"));
-    }
-}
-
-#[cfg(all(test, feature = "all-services"))]
 mod tests {
     use super::{
         AwsJsonErrorBody, CognitoWellKnownDocument, EdgeRouter,
         cognito_well_known_route,
     };
     use crate::request::HttpRequest;
-    use crate::supported_services;
     use crate::test_runtime;
     use crate::{iam_query, sts_query};
     use auth::VerifiedRequest;
@@ -1804,10 +1506,6 @@ mod tests {
             edge_runtime::TestRuntimeBuilder::new("http-runtime"),
             "http-runtime",
         )
-    }
-
-    fn router_with_services(enabled: &[ServiceName]) -> EdgeRouter {
-        test_runtime::router_with_services("http-runtime-enabled", enabled)
     }
 
     fn router_with_runtime(label: &str) -> (EdgeRouter, RuntimeServices) {
@@ -3780,18 +3478,17 @@ mod tests {
         )
         .expect("Date header should use an HTTP-compatible format");
         assert_eq!(health_json["status"], "ok");
-        assert_eq!(status_json["ready"], true);
         assert_eq!(
-            status_json["serviceCount"].as_u64(),
-            Some(supported_services().len() as u64)
+            health_json.as_object().map(|object| object.len()),
+            Some(1)
         );
-        assert_eq!(
-            status_json["enabledServices"]
-                .as_array()
-                .expect("enabledServices should be an array")
-                .len(),
-            supported_services().len()
-        );
+        assert_eq!(status_json["defaultAccount"], "000000000000");
+        assert_eq!(status_json["defaultRegion"], "eu-west-2");
+        assert!(status_json["stateDirectory"].is_string());
+        assert!(status_json.get("status").is_none());
+        assert!(status_json.get("ready").is_none());
+        assert!(health_json.get("defaultAccount").is_none());
+        assert!(health_json.get("defaultRegion").is_none());
     }
 
     #[test]
@@ -4754,25 +4451,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_disabled_service_returns_protocol_specific_json_error() {
-        let response = router_with_services(&[ServiceName::Sqs]).handle_bytes(
-            b"POST / HTTP/1.1\r\nHost: localhost\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nContent-Type: application/x-amz-json-1.1\r\nContent-Length: 2\r\n\r\n{}",
-        );
-        let response_bytes = response.to_http_bytes();
-        let (status, headers, body) = split_response(&response_bytes);
-        let body: AwsJsonErrorBody = serde_json::from_slice(body)
-            .expect("body should be a JSON AWS error");
-
-        assert_eq!(status, "HTTP/1.1 400 Bad Request");
-        assert_eq!(
-            header_value(&headers, "content-type"),
-            Some("application/x-amz-json-1.1")
-        );
-        assert_eq!(body.error_type, "ServiceNotAvailableException");
-        assert!(body.message.contains("ssm"));
-    }
-
-    #[test]
     fn runtime_query_unknown_action_returns_xml_error() {
         let body = "Action=UnknownAction&Version=2011-06-15";
         let response = router().handle_bytes(
@@ -4810,8 +4488,6 @@ mod tests {
         assert!(body.contains("<Code>MissingAuthenticationToken</Code>"));
         assert!(!body.contains("<ListAllMyBucketsResult"));
     }
-
-    #[cfg(feature = "sqs")]
     #[test]
     fn runtime_query_requests_require_version_before_mutating_state() {
         let router = router();
@@ -4866,16 +4542,10 @@ mod tests {
 
     #[test]
     fn runtime_known_query_actions_reject_unsupported_versions() {
-        #[cfg(feature = "sqs")]
         let cases = [
             ("GetCallerIdentity", iam_query::IAM_QUERY_VERSION),
             ("ListUsers", sts_query::STS_QUERY_VERSION),
             ("ListQueues", sts_query::STS_QUERY_VERSION),
-        ];
-        #[cfg(not(feature = "sqs"))]
-        let cases = [
-            ("GetCallerIdentity", iam_query::IAM_QUERY_VERSION),
-            ("ListUsers", sts_query::STS_QUERY_VERSION),
         ];
 
         for (action, version) in cases {
@@ -4902,6 +4572,55 @@ mod tests {
                 "<Message>Could not find operation {action} for version {version}.</Message>"
             )));
         }
+    }
+    #[test]
+    fn runtime_query_overlaps_route_create_user_to_elasticache_version() {
+        let body = concat!(
+            "Action=CreateUser&Version=2015-02-02",
+            "&UserId=user-a&UserName=alice",
+            "&AuthenticationMode.Type=no-password-required"
+        );
+        let response = router().handle_bytes(
+            format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+        let body =
+            std::str::from_utf8(body).expect("query body should be UTF-8");
+
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(header_value(&headers, "content-type"), Some("text/xml"));
+        assert!(body.contains("<CreateUserResponse"));
+    }
+
+    #[test]
+    fn runtime_elasticache_known_action_with_wrong_version_is_invalid() {
+        let body = concat!(
+            "Action=CreateUser&Version=2014-10-31",
+            "&UserId=user-a&UserName=alice",
+            "&AuthenticationMode.Type=no-password-required"
+        );
+        let response = router().handle_bytes(
+            format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+        let body =
+            std::str::from_utf8(body).expect("query body should be UTF-8");
+
+        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        assert_eq!(header_value(&headers, "content-type"), Some("text/xml"));
+        assert!(body.contains("<Code>InvalidAction</Code>"));
+        assert!(body.contains("CreateUser"));
+        assert!(!body.contains("<CreateUserResponse"));
     }
 
     #[test]
@@ -5075,6 +4794,51 @@ mod tests {
         assert_eq!(status, "HTTP/1.1 403 Forbidden");
         assert_eq!(header_value(&headers, "content-type"), Some("text/xml"));
         assert!(body.contains("<Code>SignatureDoesNotMatch</Code>"));
+    }
+
+    #[test]
+    fn runtime_signed_query_overlap_with_wrong_version_returns_invalid_action()
+    {
+        let request = HttpRequest::parse(
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 87\r\n\r\nAction=CreateUser&Version=2015-02-02&UserName=alice&UserId=user-a&AuthenticationMode.Type=no-password-required",
+        )
+        .expect("request should parse");
+        let verified_request = VerifiedRequest::new(
+            "000000000000".parse().expect("account should parse"),
+            CallerCredentialKind::LongTerm(StableAwsPrincipal::new(
+                "arn:aws:iam::000000000000:root"
+                    .parse::<Arn>()
+                    .expect("root ARN should parse"),
+                AwsPrincipalType::Account,
+                None,
+            )),
+            CallerIdentity::try_new(
+                "arn:aws:iam::000000000000:root"
+                    .parse::<Arn>()
+                    .expect("root ARN should parse"),
+                "000000000000",
+            )
+            .expect("caller identity should build"),
+            CredentialScope::new(
+                "eu-west-2".parse().expect("region should parse"),
+                ServiceName::Iam,
+            ),
+            None,
+        );
+        let response = router().route_query(
+            &request,
+            Some(&verified_request),
+            &super::NEVER_CANCELLED,
+        );
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+        let body =
+            std::str::from_utf8(body).expect("query body should be UTF-8");
+
+        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        assert_eq!(header_value(&headers, "content-type"), Some("text/xml"));
+        assert!(body.contains("<Code>InvalidAction</Code>"));
+        assert!(!body.contains("<Code>SignatureDoesNotMatch</Code>"));
     }
 
     #[test]

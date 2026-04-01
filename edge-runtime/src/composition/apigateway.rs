@@ -1,27 +1,20 @@
-#[cfg(feature = "apigateway")]
 use apigateway::{
     ApiGatewayScope, ExecuteApiError, ExecuteApiIntegrationExecutor,
     ExecuteApiIntegrationPlan, ExecuteApiInvocation,
     ExecuteApiPreparedResponse, map_lambda_proxy_response,
     map_lambda_proxy_response_v2,
 };
-#[cfg(feature = "apigateway")]
 use aws::HttpForwarder;
-#[cfg(feature = "apigateway")]
 use lambda::request_runtime::LambdaRequestRuntime;
-#[cfg(feature = "apigateway")]
 use lambda::{ApiGatewayInvokeInput, LambdaScope};
-#[cfg(feature = "apigateway")]
 use std::sync::Arc;
 
-#[cfg(feature = "apigateway")]
 #[derive(Clone)]
 pub struct ApiGatewayIntegrationExecutor {
     http_forwarder: Option<Arc<dyn HttpForwarder + Send + Sync>>,
     lambda: Option<LambdaRequestRuntime>,
 }
 
-#[cfg(feature = "apigateway")]
 impl ApiGatewayIntegrationExecutor {
     pub fn new(
         lambda: Option<LambdaRequestRuntime>,
@@ -31,7 +24,6 @@ impl ApiGatewayIntegrationExecutor {
     }
 }
 
-#[cfg(feature = "apigateway")]
 impl ExecuteApiIntegrationExecutor for ApiGatewayIntegrationExecutor {
     fn execute(
         &self,

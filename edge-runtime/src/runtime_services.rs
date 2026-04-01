@@ -1,10 +1,6 @@
-#[cfg(feature = "eventbridge")]
 use crate::adapters::ThreadWorkQueueShutdownOutcome;
-use aws::{RuntimeDefaults, ServiceName};
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
-#[cfg(feature = "eventbridge")]
 use std::time::Duration;
 use storage::StorageError;
 
@@ -44,11 +40,9 @@ impl fmt::Debug for ShutdownWarning {
 
 type StorageShutdownHook =
     Arc<dyn Fn() -> Result<(), StorageError> + Send + Sync>;
-#[cfg(feature = "lambda")]
 type LambdaBackgroundShutdownHook =
     Arc<dyn Fn() -> Result<(), InfrastructureError> + Send + Sync>;
 
-#[cfg(feature = "apigateway")]
 pub use apigateway::{
     ApiGatewayError, ApiGatewayScope, ApiGatewayService, ApiKey, ApiMethod,
     ApiResource, Authorizer, CreateApiKeyInput, CreateAuthorizerInput,
@@ -82,7 +76,6 @@ pub use aws::{
     RunningContainer, RunningTcpProxy, ScheduledTaskHandle, StoredPayload,
     TcpProxyRuntime, TcpProxySpec,
 };
-#[cfg(feature = "cloudformation")]
 pub use cloudformation::{
     CloudFormationChangeSetDescription, CloudFormationChangeSetSummary,
     CloudFormationChangeSummary, CloudFormationCreateChangeSetInput,
@@ -96,7 +89,6 @@ pub use cloudformation::{
     CloudFormationStackResourceSummary, CloudFormationTemplateParameter,
     ValidateTemplateInput, ValidateTemplateOutput,
 };
-#[cfg(feature = "cloudwatch")]
 pub use cloudwatch::{
     AlarmStateValue, CloudWatchLogsError, CloudWatchMetricsError,
     CloudWatchScope, CloudWatchService, CreateLogGroupInput,
@@ -115,7 +107,6 @@ pub use cloudwatch::{
     PutRetentionPolicyInput, ScanBy, SearchedLogStream, SetAlarmStateInput,
     StatisticSet,
 };
-#[cfg(feature = "cognito")]
 pub use cognito::{
     AdminCreateUserInput as CognitoAdminCreateUserInput,
     AdminCreateUserOutput as CognitoAdminCreateUserOutput,
@@ -172,7 +163,6 @@ pub use cognito::{
     UpdateUserPoolInput as UpdateCognitoUserPoolInput,
     UpdateUserPoolOutput as UpdateCognitoUserPoolOutput,
 };
-#[cfg(feature = "dynamodb")]
 pub use dynamodb::{
     AttributeDefinition as DynamoDbAttributeDefinition,
     AttributeUpdate as DynamoDbAttributeUpdate,
@@ -246,7 +236,6 @@ pub use dynamodb::{
     UpdateTableInput as UpdateDynamoDbTableInput,
     UpdateTimeToLiveInput as DynamoDbUpdateTimeToLiveInput,
 };
-#[cfg(feature = "elasticache")]
 pub use elasticache::{
     AuthenticationModeInput as ElastiCacheAuthenticationModeInput,
     CreateReplicationGroupInput as CreateElastiCacheReplicationGroupInput,
@@ -262,7 +251,6 @@ pub use elasticache::{
     ReplicationGroupStatus, RunningElastiCacheNode, RunningElastiCacheProxy,
     UserAuthentication,
 };
-#[cfg(feature = "eventbridge")]
 pub use eventbridge::{
     CreateEventBusInput, DescribeRuleOutput, EventBridgeDeliveryDispatcher,
     EventBridgeError, EventBridgeInputTransformer, EventBridgePlannedDelivery,
@@ -284,7 +272,6 @@ pub use iam::{
     IamRole, IamScope, IamService, IamTag, IamUser, InlinePolicy,
     InlinePolicyInput,
 };
-#[cfg(feature = "kinesis")]
 pub use kinesis::{
     AddTagsToStreamInput as KinesisAddTagsToStreamInput, CreateStreamInput,
     DeleteStreamInput as DeleteKinesisStreamInput,
@@ -307,7 +294,6 @@ pub use kinesis::{
     RemoveTagsFromStreamInput, SplitShardInput, StartStreamEncryptionInput,
     StopStreamEncryptionInput,
 };
-#[cfg(feature = "kms")]
 pub use kms::{
     CancelKmsKeyDeletionInput, CancelKmsKeyDeletionOutput,
     CreateKmsAliasInput, CreateKmsKeyInput, CreateKmsKeyOutput,
@@ -321,9 +307,7 @@ pub use kms::{
     ListKmsAliasesOutput, ListKmsKeysOutput, ScheduleKmsKeyDeletionInput,
     ScheduleKmsKeyDeletionOutput,
 };
-#[cfg(feature = "lambda")]
 pub use lambda::request_runtime::LambdaRequestRuntime;
-#[cfg(feature = "lambda")]
 pub use lambda::{
     AddPermissionInput as AddLambdaPermissionInput,
     AddPermissionOutput as AddLambdaPermissionOutput,
@@ -348,7 +332,6 @@ pub use lambda::{
     UpdateEventSourceMappingInput, UpdateFunctionCodeInput,
     UpdateFunctionEventInvokeConfigInput, UpdateFunctionUrlConfigInput,
 };
-#[cfg(feature = "rds")]
 pub use rds::{
     CreateDbClusterInput, CreateDbInstanceInput, CreateDbParameterGroupInput,
     DbCluster, DbClusterMember, DbInstance, DbLifecycleStatus, DbParameter,
@@ -358,7 +341,6 @@ pub use rds::{
     RdsScope, RdsService, RdsServiceDependencies,
     RejectAllRdsIamTokenValidator, RunningRdsBackend,
 };
-#[cfg(feature = "s3")]
 pub use s3::{
     BucketNotificationConfiguration, BucketObjectLockConfiguration,
     BucketTaggingOutput, BucketVersioningOutput, BucketVersioningStatus,
@@ -383,7 +365,6 @@ pub use s3::{
     SelectObjectStats, StoredBucketAclInput, TaggingInput,
     TopicNotificationConfiguration, UploadPartInput, UploadPartOutput,
 };
-#[cfg(feature = "secrets-manager")]
 pub use secrets_manager::{
     CreateSecretInput as SecretsManagerCreateSecretInput,
     CreateSecretOutput as SecretsManagerCreateSecretOutput,
@@ -420,7 +401,6 @@ pub use secrets_manager::{
     UpdateSecretInput as SecretsManagerUpdateSecretInput,
     UpdateSecretOutput as SecretsManagerUpdateSecretOutput,
 };
-#[cfg(feature = "sns")]
 pub use sns::{
     ConfirmationDelivery, CreateTopicInput, DeliveryEndpoint,
     ListedSubscription, MessageAttributeValue, NotificationPayload,
@@ -430,9 +410,7 @@ pub use sns::{
     SnsDeliveryTransport, SnsError, SnsIdentifierSource, SnsScope, SnsService,
     SubscribeInput, SubscribeOutput, SubscriptionProtocol, SubscriptionState,
 };
-#[cfg(feature = "sqs")]
 pub use sqs::request_runtime::SqsRequestRuntime;
-#[cfg(feature = "sqs")]
 pub use sqs::{
     BatchFailure, ChangeMessageVisibilityBatchEntryInput,
     ChangeMessageVisibilityBatchOutput, ChangeMessageVisibilityBatchSuccess,
@@ -444,7 +422,6 @@ pub use sqs::{
     SqsQueueIdentity, SqsScope, SqsService, StartMessageMoveTaskInput,
     StartMessageMoveTaskOutput,
 };
-#[cfg(feature = "ssm")]
 pub use ssm::{
     ParameterName, ParameterPath, ParameterReference,
     SsmAddTagsToResourceInput, SsmAddTagsToResourceOutput,
@@ -462,7 +439,6 @@ pub use ssm::{
     SsmRemoveTagsFromResourceOutput, SsmResourceType, SsmScope, SsmService,
     SsmTag,
 };
-#[cfg(feature = "step-functions")]
 pub use step_functions::{
     CreateStateMachineInput, CreateStateMachineOutput, DescribeExecutionInput,
     DescribeExecutionOutput, DescribeStateMachineOutput, ExecutionListItem,
@@ -484,103 +460,11 @@ pub use sts::{
     GetSessionTokenInput, SessionCredentials, StsCaller, StsError, StsService,
 };
 
-const SUPPORTED_SERVICES: &[ServiceName] = &[
-    #[cfg(feature = "apigateway")]
-    ServiceName::ApiGateway,
-    #[cfg(feature = "cloudformation")]
-    ServiceName::CloudFormation,
-    #[cfg(feature = "cloudwatch")]
-    ServiceName::CloudWatch,
-    #[cfg(feature = "cognito")]
-    ServiceName::CognitoIdentityProvider,
-    #[cfg(feature = "dynamodb")]
-    ServiceName::DynamoDb,
-    #[cfg(feature = "elasticache")]
-    ServiceName::ElastiCache,
-    #[cfg(feature = "eventbridge")]
-    ServiceName::EventBridge,
-    ServiceName::Iam,
-    #[cfg(feature = "kinesis")]
-    ServiceName::Kinesis,
-    #[cfg(feature = "kms")]
-    ServiceName::Kms,
-    #[cfg(feature = "lambda")]
-    ServiceName::Lambda,
-    #[cfg(feature = "cloudwatch")]
-    ServiceName::Logs,
-    #[cfg(feature = "rds")]
-    ServiceName::Rds,
-    #[cfg(feature = "s3")]
-    ServiceName::S3,
-    #[cfg(feature = "secrets-manager")]
-    ServiceName::SecretsManager,
-    #[cfg(feature = "sns")]
-    ServiceName::Sns,
-    #[cfg(feature = "sqs")]
-    ServiceName::Sqs,
-    #[cfg(feature = "ssm")]
-    ServiceName::Ssm,
-    #[cfg(feature = "step-functions")]
-    ServiceName::StepFunctions,
-    ServiceName::Sts,
-];
-
-#[derive(Debug, Clone)]
-pub struct EnabledServices {
-    enabled_services: BTreeSet<ServiceName>,
-}
-
-impl EnabledServices {
-    pub fn all() -> Self {
-        Self::from_enabled_services(supported_services().iter().copied())
-    }
-
-    pub fn from_enabled_services<I>(enabled_services: I) -> Self
-    where
-        I: IntoIterator<Item = ServiceName>,
-    {
-        Self { enabled_services: enabled_services.into_iter().collect() }
-    }
-
-    pub fn bootstrap(_defaults: &RuntimeDefaults) -> Self {
-        Self::all()
-    }
-
-    pub fn with_enabled_services<I>(
-        _defaults: &RuntimeDefaults,
-        enabled_services: I,
-    ) -> Self
-    where
-        I: IntoIterator<Item = ServiceName>,
-    {
-        Self::from_enabled_services(enabled_services)
-    }
-
-    pub fn enabled_service_count(&self) -> usize {
-        self.enabled_services.len()
-    }
-
-    pub fn enabled_services(&self) -> Vec<ServiceName> {
-        self.enabled_services.iter().copied().collect()
-    }
-
-    pub fn is_enabled(&self, service: ServiceName) -> bool {
-        self.enabled_services.contains(&service)
-    }
-}
-
-pub fn supported_services() -> &'static [ServiceName] {
-    SUPPORTED_SERVICES
-}
-
-#[cfg(feature = "eventbridge")]
 const EVENTBRIDGE_DELIVERY_DRAIN_TIMEOUT: Duration =
     Duration::from_millis(250);
-#[cfg(feature = "eventbridge")]
 const EVENTBRIDGE_DELIVERY_ABORT_TIMEOUT: Duration =
     Duration::from_millis(250);
 
-#[cfg(feature = "eventbridge")]
 #[derive(Clone)]
 pub struct EventBridgeDeliveryShutdown {
     begin: Arc<dyn Fn() + Send + Sync>,
@@ -595,7 +479,6 @@ pub struct EventBridgeDeliveryShutdown {
     >,
 }
 
-#[cfg(feature = "eventbridge")]
 impl EventBridgeDeliveryShutdown {
     pub(crate) fn new(
         begin: Arc<dyn Fn() + Send + Sync>,
@@ -631,94 +514,54 @@ impl EventBridgeDeliveryShutdown {
 
 #[derive(Clone)]
 pub struct RuntimeServices {
-    #[cfg(feature = "apigateway")]
     apigateway: ApiGatewayService,
-    #[cfg(feature = "apigateway")]
     execute_api_executor: Arc<dyn ExecuteApiIntegrationExecutor>,
-    #[cfg(feature = "cloudformation")]
     cloudformation: CloudFormationService,
-    #[cfg(feature = "cloudwatch")]
     cloudwatch: CloudWatchService,
-    #[cfg(feature = "cognito")]
     cognito: CognitoService,
-    #[cfg(feature = "dynamodb")]
     dynamodb: DynamoDbService,
-    #[cfg(feature = "elasticache")]
     elasticache: ElastiCacheService,
-    #[cfg(feature = "eventbridge")]
     eventbridge: EventBridgeService,
-    #[cfg(feature = "eventbridge")]
     eventbridge_delivery_shutdown: Option<EventBridgeDeliveryShutdown>,
     iam: IamService,
-    #[cfg(feature = "kinesis")]
     kinesis: KinesisService,
-    #[cfg(feature = "kms")]
     kms: KmsService,
-    #[cfg(feature = "lambda")]
     lambda: LambdaService,
-    #[cfg(feature = "lambda")]
     lambda_background_shutdown: Option<LambdaBackgroundShutdownHook>,
-    #[cfg(feature = "rds")]
     rds: RdsService,
-    #[cfg(feature = "s3")]
     s3: S3Service,
-    #[cfg(feature = "secrets-manager")]
     secrets_manager: SecretsManagerService,
-    #[cfg(feature = "sns")]
     sns: SnsService,
-    #[cfg(feature = "sqs")]
     sqs: SqsService,
-    #[cfg(feature = "ssm")]
     ssm: SsmService,
     storage_shutdown: Option<StorageShutdownHook>,
     sts: StsService,
-    #[cfg(feature = "step-functions")]
     step_functions: StepFunctionsService,
 }
 
 pub struct RuntimeServicesBuilder {
-    #[cfg(feature = "apigateway")]
     pub apigateway: ApiGatewayService,
-    #[cfg(feature = "apigateway")]
     pub execute_api_executor: Arc<dyn ExecuteApiIntegrationExecutor>,
-    #[cfg(feature = "cloudformation")]
     pub cloudformation: CloudFormationService,
-    #[cfg(feature = "cloudwatch")]
     pub cloudwatch: CloudWatchService,
-    #[cfg(feature = "cognito")]
     pub cognito: CognitoService,
-    #[cfg(feature = "dynamodb")]
     pub dynamodb: DynamoDbService,
-    #[cfg(feature = "elasticache")]
     pub elasticache: ElastiCacheService,
-    #[cfg(feature = "eventbridge")]
     pub eventbridge: EventBridgeService,
-    #[cfg(feature = "eventbridge")]
     pub eventbridge_delivery_shutdown: Option<EventBridgeDeliveryShutdown>,
     pub iam: IamService,
-    #[cfg(feature = "kinesis")]
     pub kinesis: KinesisService,
-    #[cfg(feature = "kms")]
     pub kms: KmsService,
-    #[cfg(feature = "lambda")]
     pub lambda: LambdaService,
-    #[cfg(feature = "lambda")]
     pub lambda_background_shutdown: Option<LambdaBackgroundShutdownHook>,
-    #[cfg(feature = "rds")]
     pub rds: RdsService,
-    #[cfg(feature = "s3")]
     pub s3: S3Service,
-    #[cfg(feature = "secrets-manager")]
     pub secrets_manager: SecretsManagerService,
-    #[cfg(feature = "sns")]
     pub sns: SnsService,
-    #[cfg(feature = "sqs")]
     pub sqs: SqsService,
-    #[cfg(feature = "ssm")]
     pub ssm: SsmService,
     pub storage_shutdown: Option<StorageShutdownHook>,
     pub sts: StsService,
-    #[cfg(feature = "step-functions")]
     pub step_functions: StepFunctionsService,
 }
 
@@ -731,56 +574,35 @@ impl RuntimeServicesBuilder {
 impl RuntimeServices {
     pub fn new(dependencies: RuntimeServicesBuilder) -> Self {
         Self {
-            #[cfg(feature = "apigateway")]
             apigateway: dependencies.apigateway,
-            #[cfg(feature = "apigateway")]
             execute_api_executor: dependencies.execute_api_executor,
-            #[cfg(feature = "cloudformation")]
             cloudformation: dependencies.cloudformation,
-            #[cfg(feature = "cloudwatch")]
             cloudwatch: dependencies.cloudwatch,
-            #[cfg(feature = "cognito")]
             cognito: dependencies.cognito,
-            #[cfg(feature = "dynamodb")]
             dynamodb: dependencies.dynamodb,
-            #[cfg(feature = "elasticache")]
             elasticache: dependencies.elasticache,
-            #[cfg(feature = "eventbridge")]
             eventbridge: dependencies.eventbridge,
-            #[cfg(feature = "eventbridge")]
             eventbridge_delivery_shutdown: dependencies
                 .eventbridge_delivery_shutdown,
             iam: dependencies.iam,
-            #[cfg(feature = "kinesis")]
             kinesis: dependencies.kinesis,
-            #[cfg(feature = "kms")]
             kms: dependencies.kms,
-            #[cfg(feature = "lambda")]
             lambda: dependencies.lambda,
-            #[cfg(feature = "lambda")]
             lambda_background_shutdown: dependencies
                 .lambda_background_shutdown,
-            #[cfg(feature = "rds")]
             rds: dependencies.rds,
-            #[cfg(feature = "s3")]
             s3: dependencies.s3,
-            #[cfg(feature = "secrets-manager")]
             secrets_manager: dependencies.secrets_manager,
-            #[cfg(feature = "sns")]
             sns: dependencies.sns,
-            #[cfg(feature = "sqs")]
             sqs: dependencies.sqs,
-            #[cfg(feature = "ssm")]
             ssm: dependencies.ssm,
             storage_shutdown: dependencies.storage_shutdown,
             sts: dependencies.sts,
-            #[cfg(feature = "step-functions")]
             step_functions: dependencies.step_functions,
         }
     }
 
     pub fn begin_shutdown(&self) {
-        #[cfg(feature = "eventbridge")]
         if let Some(eventbridge_delivery_shutdown) =
             &self.eventbridge_delivery_shutdown
         {
@@ -791,11 +613,9 @@ impl RuntimeServices {
     pub fn shutdown(&self) -> Vec<ShutdownWarning> {
         let mut warnings = Vec::new();
         self.begin_shutdown();
-        #[cfg(feature = "eventbridge")]
         if let Err(error) = self.eventbridge.shutdown() {
             warnings.push(ShutdownWarning::new("eventbridge", error));
         }
-        #[cfg(feature = "eventbridge")]
         if let Some(eventbridge_delivery_shutdown) =
             &self.eventbridge_delivery_shutdown
         {
@@ -816,18 +636,15 @@ impl RuntimeServices {
                 }
             }
         }
-        #[cfg(feature = "lambda")]
         if let Some(lambda_background_shutdown) =
             &self.lambda_background_shutdown
             && let Err(error) = lambda_background_shutdown()
         {
             warnings.push(ShutdownWarning::new("lambda-background", error));
         }
-        #[cfg(feature = "rds")]
         if let Err(error) = self.rds.shutdown() {
             warnings.push(ShutdownWarning::new("rds", error));
         }
-        #[cfg(feature = "elasticache")]
         if let Err(error) = self.elasticache.shutdown() {
             warnings.push(ShutdownWarning::new("elasticache", error));
         }
@@ -838,50 +655,33 @@ impl RuntimeServices {
         }
         warnings
     }
-
-    #[cfg(feature = "apigateway")]
     pub fn apigateway(&self) -> &ApiGatewayService {
         &self.apigateway
     }
-
-    #[cfg(feature = "apigateway")]
     pub fn execute_api_executor(
         &self,
     ) -> &(dyn ExecuteApiIntegrationExecutor + Send + Sync) {
         self.execute_api_executor.as_ref()
     }
-
-    #[cfg(feature = "cloudformation")]
     pub fn cloudformation(&self) -> &CloudFormationService {
         &self.cloudformation
     }
-
-    #[cfg(feature = "cloudwatch")]
     pub fn cloudwatch(&self) -> &CloudWatchService {
         &self.cloudwatch
     }
-
-    #[cfg(feature = "cognito")]
     pub fn cognito(&self) -> &CognitoService {
         &self.cognito
     }
-
-    #[cfg(feature = "dynamodb")]
     pub fn dynamodb(&self) -> &DynamoDbService {
         &self.dynamodb
     }
-
-    #[cfg(feature = "elasticache")]
     pub fn elasticache(&self) -> &ElastiCacheService {
         &self.elasticache
     }
-
-    #[cfg(feature = "eventbridge")]
     pub fn eventbridge(&self) -> &EventBridgeService {
         &self.eventbridge
     }
-
-    #[cfg(all(test, feature = "eventbridge"))]
+    #[cfg(test)]
     pub(crate) fn has_eventbridge_delivery_shutdown(&self) -> bool {
         self.eventbridge_delivery_shutdown.is_some()
     }
@@ -889,68 +689,43 @@ impl RuntimeServices {
     pub fn iam(&self) -> &IamService {
         &self.iam
     }
-
-    #[cfg(feature = "kinesis")]
     pub fn kinesis(&self) -> &KinesisService {
         &self.kinesis
     }
-
-    #[cfg(feature = "kms")]
     pub fn kms(&self) -> &KmsService {
         &self.kms
     }
-
-    #[cfg(feature = "lambda")]
     pub fn lambda(&self) -> &LambdaService {
         &self.lambda
     }
-
-    #[cfg(all(test, feature = "lambda"))]
+    #[cfg(test)]
     pub(crate) fn has_lambda_background_shutdown(&self) -> bool {
         self.lambda_background_shutdown.is_some()
     }
-
-    #[cfg(feature = "lambda")]
     pub fn lambda_requests(&self) -> LambdaRequestRuntime {
         LambdaRequestRuntime::new(self.lambda.clone())
     }
-
-    #[cfg(feature = "rds")]
     pub fn rds(&self) -> &RdsService {
         &self.rds
     }
-
-    #[cfg(feature = "s3")]
     pub fn s3(&self) -> &S3Service {
         &self.s3
     }
-
-    #[cfg(feature = "secrets-manager")]
     pub fn secrets_manager(&self) -> &SecretsManagerService {
         &self.secrets_manager
     }
-
-    #[cfg(feature = "sns")]
     pub fn sns(&self) -> &SnsService {
         &self.sns
     }
-
-    #[cfg(feature = "sqs")]
     pub fn sqs(&self) -> &SqsService {
         &self.sqs
     }
-
-    #[cfg(feature = "sqs")]
     pub fn sqs_requests(&self) -> SqsRequestRuntime {
         SqsRequestRuntime::new(self.sqs.clone())
     }
-
-    #[cfg(feature = "ssm")]
     pub fn ssm(&self) -> &SsmService {
         &self.ssm
     }
-
-    #[cfg(feature = "step-functions")]
     pub fn step_functions(&self) -> &StepFunctionsService {
         &self.step_functions
     }
@@ -960,52 +735,26 @@ impl RuntimeServices {
     }
 }
 
-#[cfg(all(test, feature = "all-services"))]
+#[cfg(test)]
 mod tests {
     use super::{
-        EnabledServices, EventBridgeDeliveryShutdown, RuntimeServicesBuilder,
-        ThreadWorkQueueShutdownOutcome, supported_services,
+        EventBridgeDeliveryShutdown, RuntimeServicesBuilder,
+        ThreadWorkQueueShutdownOutcome,
     };
     use crate::{
         ApiGatewayIntegrationExecutor, CreateQueueInput, EventBridgeScope,
         IamScope, PutEventsInput, PutEventsRequestEntry, S3Scope, SqsScope,
         TestRuntimeBuilder,
     };
-    use aws::{InfrastructureError, ServiceName};
+    use aws::InfrastructureError;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     #[test]
-    fn enabled_services_all_matches_supported_services() {
-        let enabled = EnabledServices::all();
-
-        assert_eq!(
-            enabled.enabled_service_count(),
-            supported_services().len()
-        );
-        for service in supported_services() {
-            assert!(enabled.is_enabled(*service));
-        }
-    }
-
-    #[test]
-    fn enabled_services_filters_requested_membership() {
-        let enabled = EnabledServices::from_enabled_services([
-            ServiceName::Lambda,
-            ServiceName::S3,
-        ]);
-
-        assert_eq!(enabled.enabled_service_count(), 2);
-        assert!(enabled.is_enabled(ServiceName::Lambda));
-        assert!(enabled.is_enabled(ServiceName::S3));
-        assert!(!enabled.is_enabled(ServiceName::Sqs));
-    }
-
-    #[test]
     fn runtime_services_builder_exposes_typed_service_accessors() {
-        let (_, runtime) = TestRuntimeBuilder::new("runtime-services-builder")
+        let runtime = TestRuntimeBuilder::new("runtime-services-builder")
             .build()
             .expect("test runtime should build")
             .into_parts();
@@ -1096,7 +845,7 @@ mod tests {
 
     #[test]
     fn runtime_services_shutdown_runs_storage_hook_once() {
-        let (_, runtime) =
+        let runtime =
             TestRuntimeBuilder::new("runtime-services-storage-shutdown")
                 .build()
                 .expect("test runtime should build")
@@ -1145,7 +894,7 @@ mod tests {
 
     #[test]
     fn runtime_services_shutdown_runs_eventbridge_delivery_hook_once() {
-        let (_, runtime) =
+        let runtime =
             TestRuntimeBuilder::new("runtime-services-eventbridge-shutdown")
                 .build()
                 .expect("test runtime should build")
@@ -1220,7 +969,7 @@ mod tests {
 
     #[test]
     fn runtime_services_shutdown_requests_hard_stop_after_timeout() {
-        let (_, runtime) =
+        let runtime =
             TestRuntimeBuilder::new("runtime-services-eventbridge-hard-stop")
                 .build()
                 .expect("test runtime should build")
