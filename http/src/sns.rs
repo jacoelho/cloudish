@@ -81,16 +81,17 @@ pub(crate) fn handle_query(
             Ok(response_without_result(action))
         }
         "ListTopics" => {
-            let topics = sns.list_topics(&scope);
-            let mut xml = XmlBuilder::new().start("Topics", None);
-            for topic_arn in topics {
-                xml = xml
-                    .start("member", None)
-                    .elem("TopicArn", &topic_arn.to_string())
-                    .end("member");
-            }
+            let topics = sns
+                .list_topics_page(&scope, params.optional("NextToken"))
+                .map_err(|error| error.to_aws_error())?;
 
-            Ok(response_with_result(action, &xml.end("Topics").build()))
+            Ok(response_with_result(
+                action,
+                &query_topics_result(
+                    &topics.items,
+                    topics.next_token.as_deref(),
+                ),
+            ))
         }
         "GetTopicAttributes" => {
             let attributes = sns
@@ -166,20 +167,29 @@ pub(crate) fn handle_query(
                     .build(),
             ))
         }
-        "ListSubscriptions" => Ok(response_with_result(
-            action,
-            &query_subscriptions_result(&sns.list_subscriptions(&scope)),
-        )),
+        "ListSubscriptions" => Ok(response_with_result(action, &{
+            let subscriptions = sns
+                .list_subscriptions_page(&scope, params.optional("NextToken"))
+                .map_err(|error| error.to_aws_error())?;
+            query_subscriptions_result(
+                &subscriptions.items,
+                subscriptions.next_token.as_deref(),
+            )
+        })),
         "ListSubscriptionsByTopic" => {
             let subscriptions = sns
-                .list_subscriptions_by_topic(&required_sns_arn_query(
-                    &params, "TopicArn",
-                )?)
+                .list_subscriptions_by_topic_page(
+                    &required_sns_arn_query(&params, "TopicArn")?,
+                    params.optional("NextToken"),
+                )
                 .map_err(|error| error.to_aws_error())?;
 
             Ok(response_with_result(
                 action,
-                &query_subscriptions_result(&subscriptions),
+                &query_subscriptions_result(
+                    &subscriptions.items,
+                    subscriptions.next_token.as_deref(),
+                ),
             ))
         }
         "GetSubscriptionAttributes" => {
@@ -327,12 +337,23 @@ pub(crate) fn handle_json(
         }
         "ListTopics" => {
             let topics = sns
-                .list_topics(&scope)
+                .list_topics_page(
+                    &scope,
+                    optional_string_json(&body, "NextToken"),
+                )
+                .map_err(|error| error.to_aws_error())?;
+            let mut response = json!({
+                "Topics": topics
+                .items
                 .into_iter()
                 .map(|topic_arn| json!({ "TopicArn": topic_arn }))
-                .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+            });
+            if let Some(next_token) = topics.next_token {
+                response["NextToken"] = json!(next_token);
+            }
 
-            json!({ "Topics": topics })
+            response
         }
         "GetTopicAttributes" => {
             let attributes = sns
@@ -377,16 +398,33 @@ pub(crate) fn handle_json(
             json!({})
         }
         "ListSubscriptions" => {
-            json!({ "Subscriptions": json_subscriptions(&sns.list_subscriptions(&scope)) })
+            let subscriptions = sns
+                .list_subscriptions_page(
+                    &scope,
+                    optional_string_json(&body, "NextToken"),
+                )
+                .map_err(|error| error.to_aws_error())?;
+            let mut response = json!({ "Subscriptions": json_subscriptions(&subscriptions.items) });
+            if let Some(next_token) = subscriptions.next_token {
+                response["NextToken"] = json!(next_token);
+            }
+
+            response
         }
         "ListSubscriptionsByTopic" => {
             let subscriptions = sns
-                .list_subscriptions_by_topic(&required_sns_arn_json(
-                    &body, "TopicArn",
-                )?)
+                .list_subscriptions_by_topic_page(
+                    &required_sns_arn_json(&body, "TopicArn")?,
+                    optional_string_json(&body, "NextToken"),
+                )
                 .map_err(|error| error.to_aws_error())?;
 
-            json!({ "Subscriptions": json_subscriptions(&subscriptions) })
+            let mut response = json!({ "Subscriptions": json_subscriptions(&subscriptions.items) });
+            if let Some(next_token) = subscriptions.next_token {
+                response["NextToken"] = json!(next_token);
+            }
+
+            response
         }
         "Publish" => {
             let published = sns
@@ -839,7 +877,26 @@ fn query_publish_batch_result(output: &PublishBatchOutput) -> String {
     xml.end("Failed").build()
 }
 
-fn query_subscriptions_result(subscriptions: &[ListedSubscription]) -> String {
+fn query_topics_result(topics: &[Arn], next_token: Option<&str>) -> String {
+    let mut xml = XmlBuilder::new().start("Topics", None);
+    for topic_arn in topics {
+        xml = xml
+            .start("member", None)
+            .elem("TopicArn", &topic_arn.to_string())
+            .end("member");
+    }
+    xml = xml.end("Topics");
+    if let Some(next_token) = next_token {
+        xml = xml.elem("NextToken", next_token);
+    }
+
+    xml.build()
+}
+
+fn query_subscriptions_result(
+    subscriptions: &[ListedSubscription],
+    next_token: Option<&str>,
+) -> String {
     let mut xml = XmlBuilder::new().start("Subscriptions", None);
     for subscription in subscriptions {
         let topic_arn = subscription.topic_arn.to_string();
@@ -855,8 +912,12 @@ fn query_subscriptions_result(subscriptions: &[ListedSubscription]) -> String {
             .elem("Endpoint", &subscription.endpoint)
             .end("member");
     }
+    xml = xml.end("Subscriptions");
+    if let Some(next_token) = next_token {
+        xml = xml.elem("NextToken", next_token);
+    }
 
-    xml.end("Subscriptions").build()
+    xml.build()
 }
 
 fn query_tags_result(tags: &BTreeMap<String, String>) -> String {
@@ -1050,6 +1111,15 @@ mod tests {
         .into_bytes()
     }
 
+    fn xml_value(body: &str, tag: &str) -> Option<String> {
+        let start_tag = format!("<{tag}>");
+        let end_tag = format!("</{tag}>");
+        let start = body.find(&start_tag)? + start_tag.len();
+        let end = body[start..].find(&end_tag)? + start;
+
+        Some(body[start..end].to_owned())
+    }
+
     #[test]
     fn sns_core_query_topic_lifecycle_and_tags_round_trip() {
         let router = router(None);
@@ -1104,6 +1174,61 @@ mod tests {
         assert!(publish_body.contains(
             "<MessageId>00000000-0000-0000-0000-000000000001</MessageId>"
         ));
+    }
+
+    #[test]
+    fn sns_core_query_list_topics_paginates_with_next_token() {
+        let router = router(None);
+        for index in 0..101 {
+            let _ = router.handle_bytes(&query_request(
+                "/",
+                &format!("Action=CreateTopic&Name=orders-{index:03}"),
+            ));
+        }
+
+        let first_page =
+            router.handle_bytes(&query_request("/", "Action=ListTopics"));
+        let (_, _, first_body) = split_response(&first_page.to_http_bytes());
+        let next_token = xml_value(&first_body, "NextToken")
+            .expect("next token should exist");
+        let first_count = first_body.matches("<member>").count();
+
+        let second_page = router.handle_bytes(&query_request(
+            "/",
+            &format!("Action=ListTopics&NextToken={next_token}"),
+        ));
+        let (_, _, second_body) = split_response(&second_page.to_http_bytes());
+
+        assert_eq!(first_count, 100);
+        assert_eq!(second_body.matches("<member>").count(), 1);
+        assert!(!second_body.contains("<NextToken>"));
+    }
+
+    #[test]
+    fn sns_core_query_missing_tag_resource_uses_resource_not_found() {
+        let router = router(None);
+        let response = router.handle_bytes(&query_request(
+            "/",
+            "Action=ListTagsForResource&ResourceArn=arn%3Aaws%3Asns%3Aeu-west-2%3A000000000000%3Amissing",
+        ));
+        let (status, _, body) = split_response(&response.to_http_bytes());
+
+        assert_eq!(status, "HTTP/1.1 404 Not Found");
+        assert!(body.contains("<Code>ResourceNotFound</Code>"));
+    }
+
+    #[test]
+    fn sns_core_query_unsubscribe_missing_subscription_uses_not_found() {
+        let router = router(None);
+        let response = router.handle_bytes(&query_request(
+            "/",
+            "Action=Unsubscribe&SubscriptionArn=arn%3Aaws%3Asns%3Aeu-west-2%3A000000000000%3Aorders%3A00000000-0000-0000-0000-000000000999",
+        ));
+        let (status, _, body) = split_response(&response.to_http_bytes());
+
+        assert_eq!(status, "HTTP/1.1 404 Not Found");
+        assert!(body.contains("<Code>NotFound</Code>"));
+        assert!(body.contains("Subscription"));
     }
 
     #[test]
@@ -1307,6 +1432,58 @@ mod tests {
         assert!(
             unsupported_body.contains("\"__type\":\"UnsupportedOperation\"")
         );
+    }
+
+    #[test]
+    fn sns_core_json_list_topics_paginates_with_next_token() {
+        let router = router(None);
+        for index in 0..101 {
+            let _ = router.handle_bytes(&json_request(
+                "SNS_20100331.CreateTopic",
+                &format!(r#"{{"Name":"orders-{index:03}"}}"#),
+            ));
+        }
+
+        let first_page = router
+            .handle_bytes(&json_request("SNS_20100331.ListTopics", "{}"));
+        let (_, _, first_body) = split_response(&first_page.to_http_bytes());
+        let first_page_json: serde_json::Value =
+            serde_json::from_str(&first_body).expect("body should be JSON");
+        let next_token = first_page_json["NextToken"]
+            .as_str()
+            .expect("next token should be returned")
+            .to_owned();
+
+        let second_page = router.handle_bytes(&json_request(
+            "SNS_20100331.ListTopics",
+            &format!(r#"{{"NextToken":"{next_token}"}}"#),
+        ));
+        let (_, _, second_body) = split_response(&second_page.to_http_bytes());
+        let second_page_json: serde_json::Value =
+            serde_json::from_str(&second_body).expect("body should be JSON");
+
+        assert_eq!(
+            first_page_json["Topics"].as_array().map(Vec::len),
+            Some(100)
+        );
+        assert_eq!(
+            second_page_json["Topics"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert!(second_page_json.get("NextToken").is_none());
+    }
+
+    #[test]
+    fn sns_core_json_missing_tag_resource_uses_resource_not_found() {
+        let router = router(None);
+        let response = router.handle_bytes(&json_request(
+            "SNS_20100331.ListTagsForResource",
+            r#"{"ResourceArn":"arn:aws:sns:eu-west-2:000000000000:missing"}"#,
+        ));
+        let (status, _, body) = split_response(&response.to_http_bytes());
+
+        assert_eq!(status, "HTTP/1.1 404 Not Found");
+        assert!(body.contains("\"__type\":\"ResourceNotFound\""));
     }
 
     #[test]

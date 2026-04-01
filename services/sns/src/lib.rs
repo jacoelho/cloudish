@@ -1,5 +1,6 @@
 mod delivery;
 mod errors;
+mod pagination;
 mod scope;
 mod subscriptions;
 mod topics;
@@ -11,6 +12,7 @@ pub use delivery::{
     SnsDeliveryTransport, SnsHttpRequest, SnsHttpSigner,
 };
 pub use errors::SnsError;
+pub use pagination::PaginatedList;
 pub use scope::SnsScope;
 pub use subscriptions::{
     ConfirmationDelivery, ListedSubscription, ParsedHttpEndpoint,
@@ -137,6 +139,17 @@ impl SnsService {
         state.list_topics(scope)
     }
 
+    pub fn list_topics_page(
+        &self,
+        scope: &SnsScope,
+        next_token: Option<&str>,
+    ) -> Result<PaginatedList<Arn>, SnsError> {
+        let state =
+            self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        state.list_topics_page(scope, next_token)
+    }
+
     /// Returns the stored attribute map for a topic.
     ///
     /// # Errors
@@ -252,6 +265,17 @@ impl SnsService {
         state.list_subscriptions(scope)
     }
 
+    pub fn list_subscriptions_page(
+        &self,
+        scope: &SnsScope,
+        next_token: Option<&str>,
+    ) -> Result<PaginatedList<ListedSubscription>, SnsError> {
+        let state =
+            self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        state.list_subscriptions_page(scope, next_token)
+    }
+
     /// Lists every subscription currently attached to a topic.
     ///
     /// # Errors
@@ -266,6 +290,17 @@ impl SnsService {
             self.state.lock().unwrap_or_else(|poison| poison.into_inner());
 
         state.list_subscriptions_by_topic(topic_arn)
+    }
+
+    pub fn list_subscriptions_by_topic_page(
+        &self,
+        topic_arn: &Arn,
+        next_token: Option<&str>,
+    ) -> Result<PaginatedList<ListedSubscription>, SnsError> {
+        let state =
+            self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        state.list_subscriptions_by_topic_page(topic_arn, next_token)
     }
 
     /// Returns the stored attribute map for a subscription.
@@ -1346,9 +1381,10 @@ mod tests {
 
         assert_eq!(recreated, topic_arn);
         assert!(listed.is_empty());
-        service
+        let error = service
             .unsubscribe(&subscribed.subscription_arn)
-            .expect("unsubscribe should remain idempotent");
+            .expect_err("missing subscription should fail");
+        assert_eq!(error.code(), "NotFound");
     }
 
     #[test]
@@ -1421,12 +1457,93 @@ mod tests {
         assert!(encoded.contains("%3A"));
         assert_eq!(transport.confirmations().len(), 1);
         assert_eq!(bad_topic.code(), "InvalidParameter");
-        assert_eq!(missing_topic.code(), "NotFound");
+        assert_eq!(missing_topic.code(), "ResourceNotFound");
         assert_eq!(ServiceName::Sns.as_str(), "sns");
         assert_eq!(
             "000000000000".parse::<AccountId>().expect("account should parse"),
             scope().account_id().clone()
         );
+    }
+
+    #[test]
+    fn sns_core_tag_operations_use_resource_not_found() {
+        let service = SnsService::new();
+        let topic_arn: Arn =
+            "arn:aws:sns:eu-west-2:000000000000:missing-topic"
+                .parse()
+                .expect("topic ARN should parse");
+
+        let tag_error = service
+            .tag_resource(
+                &topic_arn,
+                BTreeMap::from([("env".to_owned(), "dev".to_owned())]),
+            )
+            .expect_err("tagging a missing topic should fail");
+        let untag_error = service
+            .untag_resource(&topic_arn, &["env".to_owned()])
+            .expect_err("untagging a missing topic should fail");
+        let list_error = service
+            .list_tags_for_resource(&topic_arn)
+            .expect_err("listing tags for a missing topic should fail");
+
+        assert_eq!(tag_error.code(), "ResourceNotFound");
+        assert_eq!(untag_error.code(), "ResourceNotFound");
+        assert_eq!(list_error.code(), "ResourceNotFound");
+    }
+
+    #[test]
+    fn sns_core_list_operations_paginate_and_validate_context() {
+        let service = SnsService::new();
+        for index in 0..101 {
+            let _ = create_topic(&service, &format!("orders-{index:03}"));
+        }
+
+        let first_page = service
+            .list_topics_page(&scope(), None)
+            .expect("first page should succeed");
+        let next_token = first_page
+            .next_token
+            .clone()
+            .expect("first page should expose a token");
+        let second_page = service
+            .list_topics_page(&scope(), Some(&next_token))
+            .expect("second page should succeed");
+        let wrong_context_error = service
+            .list_subscriptions_page(&scope(), Some(&next_token))
+            .expect_err("reusing a token across operations should fail");
+
+        assert_eq!(first_page.items.len(), 100);
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.next_token, None);
+        assert_eq!(wrong_context_error.code(), "InvalidParameter");
+    }
+
+    #[test]
+    fn sns_core_http_subscription_requires_matching_scheme() {
+        let service = SnsService::new();
+        let topic_arn = create_topic(&service, "orders");
+
+        let http_error = service
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: "https://127.0.0.1:9010/subscription".to_owned(),
+                protocol: "http".to_owned(),
+                return_subscription_arn: false,
+                topic_arn: topic_arn.clone(),
+            })
+            .expect_err("http subscriptions should reject https endpoints");
+        let https_error = service
+            .subscribe(super::SubscribeInput {
+                attributes: BTreeMap::new(),
+                endpoint: "http://127.0.0.1:9010/subscription".to_owned(),
+                protocol: "https".to_owned(),
+                return_subscription_arn: false,
+                topic_arn,
+            })
+            .expect_err("https subscriptions should reject http endpoints");
+
+        assert_eq!(http_error.code(), "InvalidParameter");
+        assert_eq!(https_error.code(), "InvalidParameter");
     }
 
     #[test]

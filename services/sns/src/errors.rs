@@ -11,6 +11,8 @@ pub enum SnsError {
     #[error("{message}")]
     NotFound { message: String },
     #[error("{message}")]
+    ResourceNotFound { message: String },
+    #[error("{message}")]
     UnsupportedOperation { message: String },
 }
 
@@ -20,6 +22,7 @@ impl SnsError {
             Self::InvalidParameter { .. } => "InvalidParameter",
             Self::MissingParameter { .. } => "MissingParameter",
             Self::NotFound { .. } => "NotFound",
+            Self::ResourceNotFound { .. } => "ResourceNotFound",
             Self::UnsupportedOperation { .. } => "UnsupportedOperation",
         }
     }
@@ -29,6 +32,7 @@ impl SnsError {
             Self::InvalidParameter { message }
             | Self::MissingParameter { message }
             | Self::NotFound { message }
+            | Self::ResourceNotFound { message }
             | Self::UnsupportedOperation { message } => message,
         }
     }
@@ -60,6 +64,14 @@ impl SnsError {
                 true,
             )
             .expect("SNS NotFound must build"),
+            Self::ResourceNotFound { message } => AwsError::custom(
+                AwsErrorFamily::NotFound,
+                self.code(),
+                message,
+                404,
+                true,
+            )
+            .expect("SNS ResourceNotFound must build"),
             Self::UnsupportedOperation { message } => AwsError::custom(
                 AwsErrorFamily::UnsupportedOperation,
                 self.code(),

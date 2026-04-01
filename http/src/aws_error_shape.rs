@@ -1066,6 +1066,13 @@ impl AwsErrorShape for SnsError {
                 404,
                 true,
             ),
+            Self::ResourceNotFound { message } => trusted_aws_error(
+                AwsErrorFamily::NotFound,
+                self.code(),
+                message,
+                404,
+                true,
+            ),
             Self::UnsupportedOperation { message } => trusted_aws_error(
                 AwsErrorFamily::UnsupportedOperation,
                 self.code(),

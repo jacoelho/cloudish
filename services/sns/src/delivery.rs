@@ -203,6 +203,7 @@ impl NotificationPayload {
             &self.message_id,
             &self.topic_arn,
             Some(&self.subscription_arn),
+            raw_message_delivery,
         );
         let body = if raw_message_delivery {
             self.message.as_bytes().to_vec()
@@ -274,6 +275,7 @@ impl ConfirmationDelivery {
             message_id,
             &self.topic_arn,
             None,
+            false,
         );
         let subscribe_url = advertised_edge
             .sns_confirm_subscription_url(&self.topic_arn, &self.token);
@@ -457,6 +459,7 @@ fn http_headers(
     message_id: &str,
     topic_arn: &Arn,
     subscription_arn: Option<&Arn>,
+    raw_message_delivery: bool,
 ) -> Vec<(String, String)> {
     let mut headers = vec![
         ("x-amz-sns-message-type".to_owned(), message_type.to_owned()),
@@ -464,6 +467,9 @@ fn http_headers(
         ("x-amz-sns-topic-arn".to_owned(), topic_arn.to_string()),
         ("Content-Type".to_owned(), "text/plain; charset=UTF-8".to_owned()),
     ];
+    if raw_message_delivery {
+        headers.push(("x-amz-sns-rawdelivery".to_owned(), "true".to_owned()));
+    }
     if let Some(subscription_arn) = subscription_arn {
         headers.push((
             "x-amz-sns-subscription-arn".to_owned(),

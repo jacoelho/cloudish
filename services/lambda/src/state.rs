@@ -4394,8 +4394,9 @@ mod tests {
             br#"{"ok":true}"#.to_vec(),
             Option::<String>::None,
         ));
-        let clock =
-            Arc::new(SwitchableClock::new(UNIX_EPOCH + Duration::from_secs(60)));
+        let clock = Arc::new(SwitchableClock::new(
+            UNIX_EPOCH + Duration::from_secs(60),
+        ));
         let (service, _sqs) = service_with_sqs_and_clock(
             executor.clone(),
             Arc::new(MemoryBlobStore::default()),

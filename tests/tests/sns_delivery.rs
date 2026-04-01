@@ -522,6 +522,80 @@ async fn sns_delivery_non_raw_sqs_envelope_uses_signed_fields() {
     );
 }
 
+#[tokio::test]
+async fn sns_delivery_raw_http_notifications_include_raw_delivery_header() {
+    let runtime = shared_runtime().await;
+    let callback = CaptureHttpServer::spawn(2);
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let sns = SnsClient::new(&config);
+
+    let topic_arn = sns
+        .create_topic()
+        .name(lambda_fixture::unique_name("sns-http-raw"))
+        .send()
+        .await
+        .expect("topic should be created")
+        .topic_arn()
+        .expect("topic arn should exist")
+        .to_owned();
+
+    let subscribed = sns
+        .subscribe()
+        .topic_arn(&topic_arn)
+        .protocol("http")
+        .endpoint(callback.endpoint_url())
+        .return_subscription_arn(true)
+        .attributes("RawMessageDelivery", "true")
+        .send()
+        .await
+        .expect("http subscription should be created");
+    let pending_subscription_arn = subscribed
+        .subscription_arn()
+        .expect("subscription arn should be returned")
+        .to_owned();
+    let confirmation_request =
+        callback.next_request("subscription confirmation");
+    let confirmation: serde_json::Value =
+        serde_json::from_str(&confirmation_request.body)
+            .expect("confirmation should be JSON");
+    let token = confirmation["Token"]
+        .as_str()
+        .expect("confirmation token should exist");
+    let confirmed = sns
+        .confirm_subscription()
+        .topic_arn(&topic_arn)
+        .token(token)
+        .send()
+        .await
+        .expect("subscription should confirm");
+    assert_eq!(
+        confirmed.subscription_arn(),
+        Some(pending_subscription_arn.as_str())
+    );
+    assert!(!confirmation_request.headers.iter().any(|(name, _)| {
+        name.eq_ignore_ascii_case("x-amz-sns-rawdelivery")
+    }));
+
+    sns.publish()
+        .topic_arn(&topic_arn)
+        .message("payload")
+        .send()
+        .await
+        .expect("publish should succeed");
+
+    let notification_request = callback.next_request("notification request");
+    assert_eq!(notification_request.body, "payload");
+    assert!(notification_request.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("x-amz-sns-rawdelivery") && value == "true"
+    }));
+
+    callback.join();
+}
+
 async fn wait_for_message(
     sqs: &SqsClient,
     queue_url: &str,

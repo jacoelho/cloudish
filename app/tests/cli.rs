@@ -64,8 +64,10 @@ fn app_binary_reports_missing_required_configuration() {
         .output();
 
     let output = require_ok(output, "app binary should run");
-    let stderr =
-        require_ok(String::from_utf8(output.stderr), "stderr should be valid UTF-8");
+    let stderr = require_ok(
+        String::from_utf8(output.stderr),
+        "stderr should be valid UTF-8",
+    );
 
     assert!(!output.status.success());
     assert!(stderr.contains(
@@ -120,8 +122,10 @@ fn app_binary_serves_other_clients_while_one_connection_is_stalled() {
     let ready_response = wait_for_health_response(app.address);
     assert!(ready_response.starts_with("HTTP/1.1 200 OK\r\n"));
 
-    let mut stalled_client =
-        require_ok(TcpStream::connect(app.address), "stalled client should connect");
+    let mut stalled_client = require_ok(
+        TcpStream::connect(app.address),
+        "stalled client should connect",
+    );
     stalled_client
         .write_all(
             b"PUT /sdk-stall/object.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nabc",
@@ -132,11 +136,9 @@ fn app_binary_serves_other_clients_while_one_connection_is_stalled() {
 
     let concurrent_response = wait_for_health_response(app.address);
 
-    stalled_client
-        .shutdown(Shutdown::Both)
-        .unwrap_or_else(|error| {
-            fail_test(format!("stalled client should close: {error}"))
-        });
+    stalled_client.shutdown(Shutdown::Both).unwrap_or_else(|error| {
+        fail_test(format!("stalled client should close: {error}"))
+    });
     let status = app.stop();
 
     assert!(concurrent_response.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -188,8 +190,7 @@ fn wait_for_ready_address(
         if let Some(status) = require_ok(
             child.try_wait(),
             "app binary status should be available",
-        )
-        {
+        ) {
             fail_test(format!(
                 "app binary exited before reporting a ready address: {status}"
             ));
@@ -209,10 +210,8 @@ fn wait_for_ready_address(
 }
 
 fn connectable_address(value: &str) -> SocketAddr {
-    let address = require_ok(
-        value.parse::<SocketAddr>(),
-        "ready address should parse",
-    );
+    let address =
+        require_ok(value.parse::<SocketAddr>(), "ready address should parse");
     match address.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port())
