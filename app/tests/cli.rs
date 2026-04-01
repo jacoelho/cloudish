@@ -43,8 +43,8 @@ impl RunningApp {
         if let Some(edge_host) = edge_host {
             command.env(EDGE_HOST_ENV, edge_host);
         }
-        let child = command.spawn().expect("app binary should start");
-        let address = wait_for_ready_address(&ready_file);
+        let mut child = command.spawn().expect("app binary should start");
+        let address = wait_for_ready_address(&mut child, &ready_file);
 
         Self { address, child, root, state_directory }
     }
@@ -82,12 +82,17 @@ CLOUDISH_DEFAULT_ACCOUNT, CLOUDISH_DEFAULT_REGION, CLOUDISH_STATE_DIR"
 fn app_binary_serves_the_health_endpoint() {
     let mut app = RunningApp::start("app-binary", None);
     let response = wait_for_health_response(app.address);
+    let status_response = wait_for_status_response(app.address);
     let state_directory = app.state_directory.clone();
     let status = app.stop();
 
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(response.contains("\"status\":\"ok\""));
-    assert!(response.contains("\"defaultRegion\":\"eu-west-2\""));
+    assert!(!response.contains("\"defaultRegion\""));
+    assert!(status_response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(status_response.contains("\"defaultAccount\":\"000000000000\""));
+    assert!(status_response.contains("\"defaultRegion\":\"eu-west-2\""));
+    assert!(status_response.contains("\"stateDirectory\":\""));
     assert!(status.success());
     assert!(state_directory.exists());
     app.cleanup();
@@ -97,12 +102,17 @@ fn app_binary_serves_the_health_endpoint() {
 fn app_binary_serves_the_health_endpoint_on_a_custom_edge_address() {
     let mut app = RunningApp::start("app-binary-custom-edge", Some("0.0.0.0"));
     let response = wait_for_health_response(app.address);
+    let status_response = wait_for_status_response(app.address);
     let state_directory = app.state_directory.clone();
     let status = app.stop();
 
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(response.contains("\"status\":\"ok\""));
-    assert!(response.contains("\"defaultRegion\":\"eu-west-2\""));
+    assert!(!response.contains("\"defaultRegion\""));
+    assert!(status_response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(status_response.contains("\"defaultAccount\":\"000000000000\""));
+    assert!(status_response.contains("\"defaultRegion\":\"eu-west-2\""));
+    assert!(status_response.contains("\"stateDirectory\":\""));
     assert!(status.success());
     assert!(state_directory.exists());
     app.cleanup();
@@ -135,14 +145,25 @@ fn app_binary_serves_other_clients_while_one_connection_is_stalled() {
 }
 
 fn wait_for_health_response(address: SocketAddr) -> String {
+    wait_for_internal_response(
+        address,
+        "GET /__cloudish/health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+}
+
+fn wait_for_status_response(address: SocketAddr) -> String {
+    wait_for_internal_response(
+        address,
+        "GET /__cloudish/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+}
+
+fn wait_for_internal_response(address: SocketAddr, request: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last_error = None;
 
     while Instant::now() < deadline {
-        match send_http_request(
-            address,
-            "GET /__cloudish/health HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        ) {
+        match send_http_request(address, request) {
             Ok(response) => return response,
             Err(error) => {
                 last_error = Some(error);
@@ -152,15 +173,25 @@ fn wait_for_health_response(address: SocketAddr) -> String {
     }
 
     panic!(
-        "app binary did not expose the health endpoint in time: {last_error:?}"
+        "app binary did not expose the internal endpoint in time: {last_error:?}"
     );
 }
 
-fn wait_for_ready_address(path: &Path) -> SocketAddr {
-    let deadline = Instant::now() + Duration::from_secs(5);
+fn wait_for_ready_address(
+    child: &mut std::process::Child,
+    path: &Path,
+) -> SocketAddr {
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut last_error = None;
 
     while Instant::now() < deadline {
+        if let Some(status) =
+            child.try_wait().expect("app binary status should be available")
+        {
+            panic!(
+                "app binary exited before reporting a ready address: {status}"
+            );
+        }
         match std::fs::read_to_string(path) {
             Ok(value) => return connectable_address(value.trim()),
             Err(error) => {
