@@ -60,7 +60,7 @@ use crate::adapters::ProcessLambdaExecutor;
 use crate::adapters::SystemClock;
 #[cfg(any(feature = "apigateway", feature = "sns"))]
 use crate::adapters::TcpHttpForwarder;
-#[cfg(feature = "eventbridge")]
+#[cfg(any(feature = "eventbridge", feature = "lambda"))]
 use crate::adapters::ThreadBackgroundScheduler;
 #[cfg(feature = "rds")]
 use crate::adapters::ThreadRdsBackendRuntime;
@@ -138,6 +138,8 @@ use std::time::UNIX_EPOCH;
 use storage::{StorageConfig, StorageError, StorageFactory, StorageMode};
 use thiserror::Error;
 
+// Gate by capability ownership or the real transitive feature contract.
+// Keep feature-local imports and flags close to the code that consumes them.
 pub struct RuntimeAssembly {
     enabled_services: EnabledServices,
     runtime_services: RuntimeServices,
@@ -284,8 +286,6 @@ impl LocalRuntimeBuilder {
         let lambda_enabled = enabled_services.is_enabled(ServiceName::Lambda);
         #[cfg(feature = "rds")]
         let rds_enabled = enabled_services.is_enabled(ServiceName::Rds);
-        #[cfg(feature = "s3")]
-        let s3_enabled = enabled_services.is_enabled(ServiceName::S3);
         #[cfg(feature = "secrets-manager")]
         let secrets_manager_enabled =
             enabled_services.is_enabled(ServiceName::SecretsManager);
@@ -446,6 +446,8 @@ impl LocalRuntimeBuilder {
                 proxy_runtime: Arc::new(ThreadElastiCacheProxyRuntime::new()),
             },
         );
+        #[cfg(feature = "cloudformation")]
+        let s3_enabled = enabled_services.is_enabled(ServiceName::S3);
         #[cfg(feature = "cloudformation")]
         let cloudformation = CloudFormationService::with_dependencies(
             Arc::new(SystemTime::now),
@@ -668,8 +670,6 @@ impl TestRuntimeBuilder {
         let kms_enabled = enabled_services.is_enabled(ServiceName::Kms);
         #[cfg(feature = "lambda")]
         let lambda_enabled = enabled_services.is_enabled(ServiceName::Lambda);
-        #[cfg(feature = "s3")]
-        let s3_enabled = enabled_services.is_enabled(ServiceName::S3);
         #[cfg(feature = "secrets-manager")]
         let secrets_manager_enabled =
             enabled_services.is_enabled(ServiceName::SecretsManager);
@@ -832,6 +832,8 @@ impl TestRuntimeBuilder {
                 proxy_runtime: Arc::new(ThreadTcpProxyRuntime::new()),
             },
         );
+        #[cfg(feature = "cloudformation")]
+        let s3_enabled = enabled_services.is_enabled(ServiceName::S3);
         #[cfg(feature = "cloudformation")]
         let cloudformation = CloudFormationService::with_dependencies(
             Arc::new(|| UNIX_EPOCH),
