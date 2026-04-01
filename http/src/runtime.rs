@@ -14,6 +14,8 @@ use auth::{
     Authenticator, RequestAuth, RequestHeader, VerifiedRequest,
     VerifiedSignature,
 };
+#[cfg(feature = "lambda")]
+use aws::RegionId;
 #[cfg(feature = "apigateway")]
 use aws::parse_reserved_execute_api_path;
 #[cfg(feature = "lambda")]
@@ -22,8 +24,6 @@ use aws::{
     AwsError, AwsErrorFamily, CredentialScope, ProtocolFamily, RequestContext,
     RuntimeDefaults, ServiceName, SharedAdvertisedEdge,
 };
-#[cfg(feature = "lambda")]
-use aws::RegionId;
 use ciborium::into_writer;
 use edge_runtime::{EnabledServices, RuntimeServices};
 use httpdate::fmt_http_date;
