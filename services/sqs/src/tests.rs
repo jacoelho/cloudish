@@ -1239,14 +1239,13 @@ fn sqs_receive_message_cancellation_is_scoped_to_the_current_receive() {
     let queue = service
         .create_queue(&scope, queue_input("orders"))
         .expect("queue should be created");
-    let receiver = request_runtime.clone();
     let receive_queue = queue.clone();
     let cancelled = Arc::new(AtomicBool::new(false));
     let receive_cancelled = Arc::clone(&cancelled);
     let receive = std::thread::spawn(move || {
         let started_at = Instant::now();
         let is_cancelled = move || receive_cancelled.load(Ordering::SeqCst);
-        let received = receiver
+        let received = request_runtime
             .receive_message(
                 &receive_queue,
                 ReceiveMessageInput {

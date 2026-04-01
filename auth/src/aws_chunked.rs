@@ -37,7 +37,6 @@ impl AwsChunkedSigningContext {
         amz_date: &str,
         seed_signature: &str,
         mode: AwsChunkedMode,
-        verify_signatures: bool,
     ) -> Self {
         Self {
             amz_date: amz_date.to_owned(),
@@ -45,8 +44,14 @@ impl AwsChunkedSigningContext {
             signing_key: signing_key(secret_access_key, date, region, service),
             seed_signature: seed_signature.to_owned(),
             mode,
-            verify_signatures,
+            verify_signatures: true,
         }
+    }
+
+    #[must_use]
+    pub fn without_signature_verification(mut self) -> Self {
+        self.verify_signatures = false;
+        self
     }
 
     pub fn mode(&self) -> AwsChunkedMode {
@@ -408,7 +413,6 @@ mod tests {
             AMZ_DATE,
             "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
             AwsChunkedMode::Payload,
-            true,
         );
 
         let decoded =
@@ -434,7 +438,6 @@ mod tests {
             AMZ_DATE,
             "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
             AwsChunkedMode::Payload,
-            true,
         );
 
         let error = context
@@ -462,7 +465,6 @@ mod tests {
             AMZ_DATE,
             "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
             AwsChunkedMode::Payload,
-            true,
         );
         let mut malformed = payload_example_body();
         malformed.truncate(malformed.len().saturating_sub(2));
@@ -484,7 +486,6 @@ mod tests {
             AMZ_DATE,
             "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
             AwsChunkedMode::Payload,
-            true,
         );
 
         let error = context
@@ -504,7 +505,6 @@ mod tests {
             AMZ_DATE,
             "106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e",
             AwsChunkedMode::PayloadTrailer,
-            true,
         );
 
         let decoded = context
@@ -541,7 +541,6 @@ mod tests {
             AMZ_DATE,
             "106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e",
             AwsChunkedMode::PayloadTrailer,
-            true,
         );
 
         let error = context
@@ -567,8 +566,8 @@ mod tests {
             AMZ_DATE,
             "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
             AwsChunkedMode::Payload,
-            false,
-        );
+        )
+        .without_signature_verification();
 
         let decoded = context
             .decode(

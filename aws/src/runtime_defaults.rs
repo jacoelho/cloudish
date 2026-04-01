@@ -15,6 +15,12 @@ pub enum BootstrapSignatureVerificationMode {
 }
 
 impl BootstrapSignatureVerificationMode {
+    /// Parses the `CLOUDISH_UNSAFE_BOOTSTRAP_AUTH` environment value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RuntimeDefaultsError` when the value is blank or not one of
+    /// the supported boolean spellings.
     pub fn parse_env_value(
         value: String,
     ) -> Result<Self, RuntimeDefaultsError> {

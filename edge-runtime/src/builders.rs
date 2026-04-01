@@ -114,13 +114,12 @@ pub enum RuntimeBuildError {
 fn eventbridge_delivery_dispatcher(
     assembly: Option<&EventBridgeDispatcherAssembly>,
 ) -> Arc<dyn EventBridgeDeliveryDispatcher> {
-    assembly.map_or_else(
-        || {
+    assembly
+        .map(|assembly| assembly.dispatcher.clone())
+        .unwrap_or_else(|| {
             Arc::new(NoopEventBridgeDeliveryDispatcher)
                 as Arc<dyn EventBridgeDeliveryDispatcher>
-        },
-        |assembly| assembly.dispatcher.clone(),
-    )
+        })
 }
 
 pub struct LocalRuntimeBuilder {

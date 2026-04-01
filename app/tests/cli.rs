@@ -1,9 +1,5 @@
 #![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
     clippy::unreachable,
-    clippy::indexing_slicing,
     clippy::assertions_on_constants,
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
@@ -43,7 +39,7 @@ impl RunningApp {
         if let Some(edge_host) = edge_host {
             command.env(EDGE_HOST_ENV, edge_host);
         }
-        let mut child = command.spawn().expect("app binary should start");
+        let mut child = require_ok(command.spawn(), "app binary should start");
         let address = wait_for_ready_address(&mut child, &ready_file);
 
         Self { address, child, root, state_directory }
@@ -51,7 +47,7 @@ impl RunningApp {
 
     fn stop(&mut self) -> std::process::ExitStatus {
         signal_interrupt(self.child.id());
-        self.child.wait().expect("app binary should exit cleanly")
+        require_ok(self.child.wait(), "app binary should exit cleanly")
     }
 
     fn cleanup(&self) {
@@ -67,9 +63,9 @@ fn app_binary_reports_missing_required_configuration() {
         .env_remove(STATE_DIRECTORY_ENV)
         .output();
 
-    let output = output.expect("app binary should run");
-    let stderr = String::from_utf8(output.stderr)
-        .expect("stderr should be valid UTF-8");
+    let output = require_ok(output, "app binary should run");
+    let stderr =
+        require_ok(String::from_utf8(output.stderr), "stderr should be valid UTF-8");
 
     assert!(!output.status.success());
     assert!(stderr.contains(
@@ -124,19 +120,23 @@ fn app_binary_serves_other_clients_while_one_connection_is_stalled() {
     let ready_response = wait_for_health_response(app.address);
     assert!(ready_response.starts_with("HTTP/1.1 200 OK\r\n"));
 
-    let mut stalled_client = TcpStream::connect(app.address)
-        .expect("stalled client should connect");
+    let mut stalled_client =
+        require_ok(TcpStream::connect(app.address), "stalled client should connect");
     stalled_client
         .write_all(
             b"PUT /sdk-stall/object.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nabc",
         )
-        .expect("stalled request should be written");
+        .unwrap_or_else(|error| fail_test(format!(
+            "stalled request should be written: {error}"
+        )));
 
     let concurrent_response = wait_for_health_response(app.address);
 
     stalled_client
         .shutdown(Shutdown::Both)
-        .expect("stalled client should close");
+        .unwrap_or_else(|error| {
+            fail_test(format!("stalled client should close: {error}"))
+        });
     let status = app.stop();
 
     assert!(concurrent_response.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -172,9 +172,9 @@ fn wait_for_internal_response(address: SocketAddr, request: &str) -> String {
         }
     }
 
-    panic!(
+    fail_test(format!(
         "app binary did not expose the internal endpoint in time: {last_error:?}"
-    );
+    ));
 }
 
 fn wait_for_ready_address(
@@ -185,12 +185,14 @@ fn wait_for_ready_address(
     let mut last_error = None;
 
     while Instant::now() < deadline {
-        if let Some(status) =
-            child.try_wait().expect("app binary status should be available")
+        if let Some(status) = require_ok(
+            child.try_wait(),
+            "app binary status should be available",
+        )
         {
-            panic!(
+            fail_test(format!(
                 "app binary exited before reporting a ready address: {status}"
-            );
+            ));
         }
         match std::fs::read_to_string(path) {
             Ok(value) => return connectable_address(value.trim()),
@@ -201,14 +203,16 @@ fn wait_for_ready_address(
         }
     }
 
-    panic!(
+    fail_test(format!(
         "app binary did not report a ready address in time: {last_error:?}"
-    );
+    ));
 }
 
 fn connectable_address(value: &str) -> SocketAddr {
-    let address =
-        value.parse::<SocketAddr>().expect("ready address should parse");
+    let address = require_ok(
+        value.parse::<SocketAddr>(),
+        "ready address should parse",
+    );
     match address.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port())
@@ -222,6 +226,20 @@ fn signal_interrupt(process_id: u32) {
         .arg("-INT")
         .arg(process_id.to_string())
         .status()
-        .expect("app binary should receive SIGINT");
+        .unwrap_or_else(|error| {
+            fail_test(format!("app binary should receive SIGINT: {error}"))
+        });
     assert!(status.success());
+}
+
+fn require_ok<T, E>(result: Result<T, E>, context: &str) -> T
+where
+    E: std::fmt::Display,
+{
+    result.unwrap_or_else(|error| fail_test(format!("{context}: {error}")))
+}
+
+fn fail_test(message: String) -> ! {
+    assert!(false, "{message}");
+    std::process::abort();
 }

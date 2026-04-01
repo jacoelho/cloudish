@@ -2422,7 +2422,7 @@ impl ScopedIamState {
     fn next_timestamp(&mut self) -> String {
         OffsetDateTime::from((self.time_source)())
             .replace_nanosecond(0)
-            .unwrap_or_else(|_| OffsetDateTime::UNIX_EPOCH)
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH)
             .format(&Rfc3339)
             .unwrap_or_else(|_| {
                 OffsetDateTime::UNIX_EPOCH

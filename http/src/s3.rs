@@ -2593,7 +2593,6 @@ mod tests {
                 "20130524T000000Z",
                 seed_signature,
                 mode,
-                true,
             )),
         )
     }

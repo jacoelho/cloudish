@@ -270,11 +270,21 @@ fn write_with_cancellation(
     let mut idle_deadline = Instant::now() + HTTP_FORWARD_IDLE_TIMEOUT;
     let mut written = 0;
     while written < bytes.len() {
+        let remaining = bytes.get(written..).ok_or_else(|| {
+            InfrastructureError::http_forward(
+                "write",
+                endpoint,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP forward write offset exceeded request length",
+                ),
+            )
+        })?;
         if is_cancelled() {
             cancel_stream(stream);
             return Err(cancelled_forward_error(endpoint));
         }
-        match stream.write(&bytes[written..]) {
+        match stream.write(remaining) {
             Ok(0) => {
                 return Err(InfrastructureError::http_forward(
                     "write",
@@ -328,7 +338,17 @@ fn read_response(
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => {
-                response.extend_from_slice(&chunk[..count]);
+                let bytes = chunk.get(..count).ok_or_else(|| {
+                    InfrastructureError::http_forward(
+                        "read",
+                        endpoint,
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "HTTP forward read exceeded buffer length",
+                        ),
+                    )
+                })?;
+                response.extend_from_slice(bytes);
                 idle_deadline = Instant::now() + HTTP_FORWARD_IDLE_TIMEOUT;
             }
             Err(source) if is_retryable_forward_error(&source) => {

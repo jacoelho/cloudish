@@ -222,7 +222,7 @@ pub(crate) fn resolve_unsigned_query_service(
     ];
     let mut exact_matches = query_services
         .into_iter()
-        .filter(|service| query_action_matches(service, action, version));
+        .filter(|service| query_action_matches(*service, action, version));
     if let Some(service) = exact_matches.next() {
         return exact_matches.next().is_none().then_some(service);
     }
@@ -261,15 +261,15 @@ pub(crate) fn query_action_matches_version(
     action: &str,
     version: &str,
 ) -> bool {
-    query_action_matches(&service, action, Some(version))
+    query_action_matches(service, action, Some(version))
 }
 
 fn query_action_matches(
-    service: &ServiceName,
+    service: ServiceName,
     action: &str,
     version: Option<&str>,
 ) -> bool {
-    if !query_service_matches_action(*service, action) {
+    if !query_service_matches_action(service, action) {
         return false;
     }
 

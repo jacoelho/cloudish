@@ -457,8 +457,7 @@ fn wait_for_child_output(
                         InfrastructureError::container(
                             "wait",
                             function_name,
-                            io::Error::new(
-                                io::ErrorKind::Other,
+                            io::Error::other(
                                 "lambda stdout reader thread panicked",
                             ),
                         )
@@ -476,8 +475,7 @@ fn wait_for_child_output(
                         InfrastructureError::container(
                             "wait",
                             function_name,
-                            io::Error::new(
-                                io::ErrorKind::Other,
+                            io::Error::other(
                                 "lambda stderr reader thread panicked",
                             ),
                         )

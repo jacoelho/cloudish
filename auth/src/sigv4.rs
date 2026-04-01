@@ -824,7 +824,7 @@ impl CanonicalPayloadMode<'_> {
             }
             Self::HeaderValue(_) => VerifiedPayload::SignedBody,
             Self::AwsChunked(mode) => {
-                VerifiedPayload::AwsChunked(AwsChunkedSigningContext::new(
+                let context = AwsChunkedSigningContext::new(
                     secret_access_key,
                     &credential.date,
                     credential.scope.region().as_str(),
@@ -832,8 +832,13 @@ impl CanonicalPayloadMode<'_> {
                     amz_date,
                     seed_signature,
                     mode,
-                    verify_signatures,
-                ))
+                );
+
+                VerifiedPayload::AwsChunked(if verify_signatures {
+                    context
+                } else {
+                    context.without_signature_verification()
+                })
             }
         }
     }

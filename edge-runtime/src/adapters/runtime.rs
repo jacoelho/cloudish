@@ -483,7 +483,7 @@ mod tests {
         let queue = ThreadWorkQueue::spawn(
             "thread-work-queue-drain".to_owned(),
             move |item, _stop_token| {
-                recover(processed_items.lock()).push(item)
+                recover(processed_items.lock()).push(item);
             },
         )
         .expect("work queue should spawn");

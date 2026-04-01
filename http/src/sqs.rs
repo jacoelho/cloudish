@@ -1666,12 +1666,11 @@ mod tests {
             "Action=ReceiveMessage",
         ));
         let sender = sqs.clone();
-        let delayed_queue = queue.clone();
         let delayed_send = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
             sender
                 .send_message(
-                    &delayed_queue,
+                    &queue,
                     SendMessageInput {
                         body: "payload".to_owned(),
                         delay_seconds: None,
@@ -1720,12 +1719,11 @@ mod tests {
             r#"{"QueueUrl":"http://localhost:4566/000000000000/orders","WaitTimeSeconds":1}"#,
         ));
         let sender = sqs.clone();
-        let delayed_queue = queue.clone();
         let delayed_send = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
             sender
                 .send_message(
-                    &delayed_queue,
+                    &queue,
                     SendMessageInput {
                         body: "payload".to_owned(),
                         delay_seconds: None,
