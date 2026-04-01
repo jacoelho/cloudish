@@ -76,6 +76,20 @@ If you start Cloudish on a different bind address or port, update
 export AWS_ENDPOINT_URL="http://127.0.0.1:4570"
 ```
 
+Cloudish also supports an unsafe bootstrap-only auth bypass for local debugging:
+
+```sh
+export CLOUDISH_UNSAFE_BOOTSTRAP_AUTH="on"
+```
+
+Accepted values are `on`/`off`, `true`/`false`, `yes`/`no`, and `1`/`0`.
+Leave it unset or set it to `off` to keep normal bootstrap SigV4 validation.
+
+When enabled, requests signed with the built-in bootstrap access key id `test`
+continue even if their SigV4 signature does not match. This does not disable
+IAM access key or STS session credential validation, and it applies only to
+the built-in bootstrap access key id `test`.
+
 Example AWS CLI commands:
 
 ```sh
@@ -86,7 +100,8 @@ aws s3api list-buckets
 
 echo "hello from cloudish" > demo.txt
 aws s3 cp demo.txt s3://cloudish-demo/demo.txt
-aws s3 cp s3://cloudish-demo/demo.txt -
+aws s3api get-object --bucket cloudish-demo --key demo.txt demo-copy.txt
+cat demo-copy.txt
 ```
 
 If you prefer to make the endpoint explicit per command, use:
