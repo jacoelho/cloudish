@@ -18,9 +18,14 @@ Cloudish uses Cloudish-specific variables for server startup:
 export CLOUDISH_DEFAULT_ACCOUNT=000000000000
 export CLOUDISH_DEFAULT_REGION=eu-west-2
 export CLOUDISH_STATE_DIR=.cloudish/state
+export CLOUDISH_EDGE_WIRE_LOG=on
 
 cargo run -p app
 ```
+
+`CLOUDISH_EDGE_WIRE_LOG` controls JSON edge-request logging. Accepted values
+are `on`/`off`, `true`/`false`, `yes`/`no`, and `1`/`0`. Leave it unset or set
+it to `off` to disable wire logging.
 
 Check that the emulator is up:
 
@@ -37,6 +42,7 @@ export CLOUDISH_DEFAULT_REGION=eu-west-2
 export CLOUDISH_STATE_DIR=.cloudish/state
 export CLOUDISH_EDGE_HOST=0.0.0.0
 export CLOUDISH_EDGE_PORT=4570
+export CLOUDISH_EDGE_WIRE_LOG=on
 
 cargo run -p app
 ```
@@ -126,6 +132,18 @@ Run the container image with the baked server defaults:
 
 ```sh
 docker run --rm -p 4566:4566 -v cloudish-state:/var/lib/cloudish cloudish
+```
+
+The image enables edge wire logging by default with
+`CLOUDISH_EDGE_WIRE_LOG=on`. Override it at runtime if you want a quieter
+container:
+
+```sh
+docker run --rm \
+  -p 4566:4566 \
+  -e CLOUDISH_EDGE_WIRE_LOG=off \
+  -v cloudish-state:/var/lib/cloudish \
+  cloudish
 ```
 
 Omit the `-v` flag if you want disposable state instead of a persisted data
