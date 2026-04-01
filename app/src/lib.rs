@@ -18,8 +18,9 @@ mod transport;
 
 use auth::Authenticator;
 use aws::{
-    DEFAULT_ACCOUNT_ENV, DEFAULT_REGION_ENV, RuntimeDefaults,
-    RuntimeDefaultsError, STATE_DIRECTORY_ENV, SharedAdvertisedEdge,
+    BootstrapSignatureVerificationMode, DEFAULT_ACCOUNT_ENV,
+    DEFAULT_REGION_ENV, RuntimeDefaults, RuntimeDefaultsError,
+    STATE_DIRECTORY_ENV, SharedAdvertisedEdge, UNSAFE_BOOTSTRAP_AUTH_ENV,
 };
 use edge_runtime::DynamoDbInitError;
 use edge_runtime::ElastiCacheError;
@@ -375,12 +376,21 @@ pub fn load_runtime_defaults<F>(
 where
     F: FnMut(&'static str) -> Option<String>,
 {
-    RuntimeDefaults::try_new(
+    let defaults = RuntimeDefaults::try_new(
         read_env(DEFAULT_ACCOUNT_ENV),
         read_env(DEFAULT_REGION_ENV),
         read_env(STATE_DIRECTORY_ENV),
     )
-    .map_err(StartupError::Config)
+    .map_err(StartupError::Config)?;
+    let bootstrap_signature_verification = read_env(UNSAFE_BOOTSTRAP_AUTH_ENV)
+        .map(BootstrapSignatureVerificationMode::parse_env_value)
+        .transpose()
+        .map_err(StartupError::Config)?
+        .unwrap_or(BootstrapSignatureVerificationMode::Enforce);
+
+    Ok(defaults.with_bootstrap_signature_verification(
+        bootstrap_signature_verification,
+    ))
 }
 
 pub(crate) fn load_hosting_plan<F>(
@@ -594,8 +604,9 @@ mod tests {
         load_hosting_plan, load_runtime_defaults,
     };
     use aws::{
-        DEFAULT_ACCOUNT_ENV, DEFAULT_REGION_ENV, RuntimeDefaults,
-        STATE_DIRECTORY_ENV,
+        BootstrapSignatureVerificationMode, DEFAULT_ACCOUNT_ENV,
+        DEFAULT_REGION_ENV, RuntimeDefaults, STATE_DIRECTORY_ENV,
+        UNSAFE_BOOTSTRAP_AUTH_ENV,
     };
     #[cfg(unix)]
     use base64::Engine as _;
@@ -741,6 +752,40 @@ mod tests {
                 )
                 .as_str()
             )
+        );
+    }
+
+    #[test]
+    fn load_runtime_defaults_accepts_unsafe_bootstrap_auth_flag() {
+        let defaults = load_runtime_defaults(|name| match name {
+            DEFAULT_ACCOUNT_ENV => Some("000000000000".to_owned()),
+            DEFAULT_REGION_ENV => Some("eu-west-2".to_owned()),
+            STATE_DIRECTORY_ENV => Some("/tmp/cloudish".to_owned()),
+            UNSAFE_BOOTSTRAP_AUTH_ENV => Some("on".to_owned()),
+            _ => None,
+        })
+        .expect("valid bootstrap auth override should build");
+
+        assert_eq!(
+            defaults.bootstrap_signature_verification(),
+            BootstrapSignatureVerificationMode::Skip
+        );
+    }
+
+    #[test]
+    fn load_runtime_defaults_rejects_invalid_unsafe_bootstrap_auth_flag() {
+        let error = load_runtime_defaults(|name| match name {
+            DEFAULT_ACCOUNT_ENV => Some("000000000000".to_owned()),
+            DEFAULT_REGION_ENV => Some("eu-west-2".to_owned()),
+            STATE_DIRECTORY_ENV => Some("/tmp/cloudish".to_owned()),
+            UNSAFE_BOOTSTRAP_AUTH_ENV => Some("verbose".to_owned()),
+            _ => None,
+        })
+        .expect_err("invalid bootstrap auth override must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "startup configuration error: invalid bootstrap auth mode in CLOUDISH_UNSAFE_BOOTSTRAP_AUTH: unsupported value `verbose`"
         );
     }
 

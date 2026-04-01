@@ -25,6 +25,7 @@ pub struct AwsChunkedSigningContext {
     signing_key: [u8; 32],
     seed_signature: String,
     mode: AwsChunkedMode,
+    verify_signatures: bool,
 }
 
 impl AwsChunkedSigningContext {
@@ -36,6 +37,7 @@ impl AwsChunkedSigningContext {
         amz_date: &str,
         seed_signature: &str,
         mode: AwsChunkedMode,
+        verify_signatures: bool,
     ) -> Self {
         Self {
             amz_date: amz_date.to_owned(),
@@ -43,6 +45,7 @@ impl AwsChunkedSigningContext {
             signing_key: signing_key(secret_access_key, date, region, service),
             seed_signature: seed_signature.to_owned(),
             mode,
+            verify_signatures,
         }
     }
 
@@ -115,7 +118,8 @@ impl AwsChunkedSigningContext {
 
             let expected_signature =
                 self.chunk_signature(&previous_signature, chunk_data);
-            if expected_signature != chunk_signature {
+            if self.verify_signatures && expected_signature != chunk_signature
+            {
                 return Err(signature_does_not_match_error(
                     "The aws-chunked payload signature did not match the provided chunk signature.",
                 ));
@@ -168,7 +172,9 @@ impl AwsChunkedSigningContext {
                     &previous_signature,
                     canonical_trailer.as_bytes(),
                 );
-                if expected_signature != provided_signature {
+                if self.verify_signatures
+                    && expected_signature != provided_signature
+                {
                     return Err(signature_does_not_match_error(
                         "The aws-chunked trailer signature did not match the provided trailer signature.",
                     ));
@@ -402,6 +408,7 @@ mod tests {
             AMZ_DATE,
             "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
             AwsChunkedMode::Payload,
+            true,
         );
 
         let decoded =
@@ -427,6 +434,7 @@ mod tests {
             AMZ_DATE,
             "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
             AwsChunkedMode::Payload,
+            true,
         );
 
         let error = context
@@ -454,6 +462,7 @@ mod tests {
             AMZ_DATE,
             "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
             AwsChunkedMode::Payload,
+            true,
         );
         let mut malformed = payload_example_body();
         malformed.truncate(malformed.len().saturating_sub(2));
@@ -475,6 +484,7 @@ mod tests {
             AMZ_DATE,
             "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
             AwsChunkedMode::Payload,
+            true,
         );
 
         let error = context
@@ -494,6 +504,7 @@ mod tests {
             AMZ_DATE,
             "106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e",
             AwsChunkedMode::PayloadTrailer,
+            true,
         );
 
         let decoded = context
@@ -530,6 +541,7 @@ mod tests {
             AMZ_DATE,
             "106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e",
             AwsChunkedMode::PayloadTrailer,
+            true,
         );
 
         let error = context
@@ -543,6 +555,34 @@ mod tests {
             .expect_err("invalid trailer signature must fail");
 
         assert_eq!(error.code(), "SignatureDoesNotMatch");
+    }
+
+    #[test]
+    fn decode_can_skip_signature_verification() {
+        let context = AwsChunkedSigningContext::new(
+            SECRET_ACCESS_KEY,
+            DATE,
+            REGION,
+            SERVICE,
+            AMZ_DATE,
+            "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
+            AwsChunkedMode::Payload,
+            false,
+        );
+
+        let decoded = context
+            .decode(
+                &payload_body_with_signatures(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                ),
+                66_560,
+                &[],
+            )
+            .expect("signature verification can be disabled");
+
+        assert_eq!(decoded.decoded_body(), vec![b'a'; 66_560].as_slice());
     }
 
     fn payload_example_body() -> Vec<u8> {

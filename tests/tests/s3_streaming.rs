@@ -9,6 +9,7 @@
     clippy::missing_errors_doc
 )]
 use auth::{BOOTSTRAP_ACCESS_KEY_ID, BOOTSTRAP_SECRET_ACCESS_KEY};
+use aws::BootstrapSignatureVerificationMode;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use hmac::{Hmac, Mac};
@@ -59,8 +60,9 @@ async fn given_a_signed_aws_chunked_put_object_when_sent_over_raw_http_then_the_
         &sigv4_timestamp_now(),
         payload,
     );
+    let address = runtime.address();
     let response = tokio::task::spawn_blocking(move || {
-        send_http_request_bytes(runtime.address(), &request)
+        send_http_request_bytes(address, &request)
     })
     .await
     .expect("raw request task should complete")
@@ -87,12 +89,99 @@ async fn given_a_signed_aws_chunked_put_object_when_sent_over_raw_http_then_the_
     );
     assert_eq!(body.as_ref(), payload);
 }
+
+#[tokio::test]
+async fn given_unsafe_bootstrap_auth_when_aws_chunked_signature_uses_the_wrong_secret_then_the_object_is_stored()
+ {
+    let state_directory =
+        test_support::temporary_directory("s3-streaming-unsafe-bootstrap")
+            .join("state");
+    let defaults = aws::RuntimeDefaults::try_new(
+        Some("000000000000".to_owned()),
+        Some("eu-west-2".to_owned()),
+        Some(state_directory.to_string_lossy().into_owned()),
+    )
+    .expect("test defaults should be valid")
+    .with_bootstrap_signature_verification(
+        BootstrapSignatureVerificationMode::Skip,
+    );
+    let runtime =
+        runtime::RuntimeServer::spawn_with_runtime_defaults(defaults).await;
+    let target = sdk::SdkSmokeTarget::new(
+        runtime.localhost_endpoint_url(),
+        "us-east-1",
+    );
+    let client = s3_client(&target).await;
+    client
+        .create_bucket()
+        .bucket("sdk-s3-streaming-unsafe")
+        .send()
+        .await
+        .expect("bucket should be created");
+
+    let payload = b"hello unsafe bootstrap";
+    let request = aws_chunked_put_object_request_with_secret(
+        "/sdk-s3-streaming-unsafe/streamed.txt",
+        "localhost",
+        "us-east-1",
+        &sigv4_timestamp_now(),
+        payload,
+        "wrong-secret",
+    );
+    let address = runtime.address();
+    let response = tokio::task::spawn_blocking(move || {
+        send_http_request_bytes(address, &request)
+    })
+    .await
+    .expect("raw request task should complete")
+    .expect("signed aws-chunked request should receive a response");
+
+    let object = client
+        .get_object()
+        .bucket("sdk-s3-streaming-unsafe")
+        .key("streamed.txt")
+        .send()
+        .await
+        .expect("streamed object should be readable");
+    let body = object
+        .body
+        .collect()
+        .await
+        .expect("streamed body should collect")
+        .into_bytes();
+
+    assert!(
+        response.is_empty() || response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "expected an empty raw socket read or 200 OK, got {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(body.as_ref(), payload);
+}
+
 fn aws_chunked_put_object_request(
     path: &str,
     host: &str,
     region: &str,
     amz_date: &str,
     payload: &[u8],
+) -> Vec<u8> {
+    aws_chunked_put_object_request_with_secret(
+        path,
+        host,
+        region,
+        amz_date,
+        payload,
+        BOOTSTRAP_SECRET_ACCESS_KEY,
+    )
+}
+
+fn aws_chunked_put_object_request_with_secret(
+    path: &str,
+    host: &str,
+    region: &str,
+    amz_date: &str,
+    payload: &[u8],
+    secret_access_key: &str,
 ) -> Vec<u8> {
     let chunk_sizes = [5_usize, payload.len().saturating_sub(5), 0];
     let content_length = aws_chunked_body_length(&chunk_sizes);
@@ -103,7 +192,7 @@ fn aws_chunked_put_object_request(
         payload.len()
     );
     let seed_signature = build_signature(
-        BOOTSTRAP_SECRET_ACCESS_KEY,
+        secret_access_key,
         date,
         region,
         "s3",
@@ -113,6 +202,7 @@ fn aws_chunked_put_object_request(
     let body = aws_chunked_body(
         payload,
         &chunk_sizes,
+        secret_access_key,
         date,
         region,
         "s3",
@@ -146,14 +236,14 @@ fn sigv4_timestamp_now() -> String {
 fn aws_chunked_body(
     payload: &[u8],
     chunk_sizes: &[usize],
+    secret_access_key: &str,
     date: &str,
     region: &str,
     service: &str,
     amz_date: &str,
     seed_signature: &str,
 ) -> Vec<u8> {
-    let signing_key =
-        signing_key(BOOTSTRAP_SECRET_ACCESS_KEY, date, region, service);
+    let signing_key = signing_key(secret_access_key, date, region, service);
     let mut previous_signature = seed_signature.to_owned();
     let mut payload_offset = 0;
     let mut encoded = Vec::new();

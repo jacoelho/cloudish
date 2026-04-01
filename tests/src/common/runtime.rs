@@ -31,6 +31,13 @@ impl RuntimeServer {
         Self::spawn_with_defaults(defaults, state_directory).await
     }
 
+    pub async fn spawn_with_runtime_defaults(
+        defaults: aws::RuntimeDefaults,
+    ) -> Self {
+        let state_directory = defaults.state_directory().to_path_buf();
+        Self::spawn_with_defaults(defaults, state_directory).await
+    }
+
     pub async fn spawn_with_state_directory(state_directory: PathBuf) -> Self {
         let (defaults, state_directory) =
             runtime_defaults_for_state_directory(state_directory);
