@@ -4,6 +4,7 @@ use crate::delivery::{
     PlannedDelivery, PublishRequest,
 };
 use crate::errors::SnsError;
+use crate::pagination::{PaginatedList, PaginationContext, paginate};
 use crate::scope::SnsScope;
 use crate::topics::{TopicKey, validate_topic_name};
 use aws::{AccountId, Arn, ArnResource, Endpoint, ServiceName};
@@ -503,15 +504,15 @@ fn parse_subscription_endpoint(
 ) -> Result<SubscriptionEndpoint, SnsError> {
     match value {
         "http" => Ok(SubscriptionEndpoint {
-            delivery_endpoint: DeliveryEndpoint::Http(parse_http_endpoint(
-                endpoint,
-            )?),
+            delivery_endpoint: DeliveryEndpoint::Http(
+                parse_http_endpoint_for_protocol(endpoint, "http")?,
+            ),
             protocol: SubscriptionProtocol::Http,
         }),
         "https" => Ok(SubscriptionEndpoint {
-            delivery_endpoint: DeliveryEndpoint::Http(parse_http_endpoint(
-                endpoint,
-            )?),
+            delivery_endpoint: DeliveryEndpoint::Http(
+                parse_http_endpoint_for_protocol(endpoint, "https")?,
+            ),
             protocol: SubscriptionProtocol::Https,
         }),
         "lambda" => Ok(SubscriptionEndpoint {
@@ -729,11 +730,12 @@ impl SnsRegistry {
         &mut self,
         subscription_arn: &Arn,
     ) -> Result<(), SnsError> {
-        let parsed = ParsedSubscriptionArn::parse(subscription_arn)?;
+        let _ = ParsedSubscriptionArn::parse(subscription_arn)?;
         let Some(_subscription) = self.subscriptions.remove(subscription_arn)
         else {
-            let _ = parsed;
-            return Ok(());
+            return Err(SnsError::NotFound {
+                message: "Subscription does not exist".to_owned(),
+            });
         };
 
         self.remove_tokens_for_subscription(subscription_arn);
@@ -787,6 +789,23 @@ impl SnsRegistry {
             .collect()
     }
 
+    pub(crate) fn list_subscriptions_page(
+        &self,
+        scope: &SnsScope,
+        next_token: Option<&str>,
+    ) -> Result<PaginatedList<ListedSubscription>, SnsError> {
+        let subscriptions = self.list_subscriptions(scope);
+
+        paginate(
+            &subscriptions,
+            &PaginationContext::Scope {
+                operation: "ListSubscriptions",
+                scope: scope.clone(),
+            },
+            next_token,
+        )
+    }
+
     pub(crate) fn list_subscriptions_by_topic(
         &self,
         topic_arn: &Arn,
@@ -800,6 +819,23 @@ impl SnsRegistry {
             .filter(|subscription| subscription.topic == topic)
             .map(SubscriptionRecord::listed)
             .collect())
+    }
+
+    pub(crate) fn list_subscriptions_by_topic_page(
+        &self,
+        topic_arn: &Arn,
+        next_token: Option<&str>,
+    ) -> Result<PaginatedList<ListedSubscription>, SnsError> {
+        let subscriptions = self.list_subscriptions_by_topic(topic_arn)?;
+
+        paginate(
+            &subscriptions,
+            &PaginationContext::Topic {
+                operation: "ListSubscriptionsByTopic",
+                topic_arn: topic_arn.clone(),
+            },
+            next_token,
+        )
     }
 
     pub(crate) fn get_subscription_attributes(
@@ -940,6 +976,26 @@ pub(crate) fn parse_http_endpoint(
             format!("/{path}")
         },
     })
+}
+
+fn parse_http_endpoint_for_protocol(
+    endpoint: &str,
+    protocol: &str,
+) -> Result<ParsedHttpEndpoint, SnsError> {
+    let matches_protocol = match protocol {
+        "http" => endpoint.starts_with("http://"),
+        "https" => endpoint.starts_with("https://"),
+        _ => false,
+    };
+    if !matches_protocol {
+        return Err(SnsError::InvalidParameter {
+            message: "Invalid parameter: Endpoint must match the specified \
+                      protocol"
+                .to_owned(),
+        });
+    }
+
+    parse_http_endpoint(endpoint)
 }
 
 fn parse_attribute_bool(

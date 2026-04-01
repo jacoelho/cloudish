@@ -1,5 +1,6 @@
 use crate::SnsRegistry;
 use crate::errors::SnsError;
+use crate::pagination::{PaginatedList, PaginationContext, paginate};
 use crate::scope::SnsScope;
 use crate::subscriptions::SubscriptionRecordState;
 use aws::{AccountId, Arn, ArnResource, Partition, RegionId, ServiceName};
@@ -179,6 +180,10 @@ pub(crate) fn not_found_topic_error() -> SnsError {
     SnsError::NotFound { message: "Topic does not exist".to_owned() }
 }
 
+pub(crate) fn resource_not_found_topic_error() -> SnsError {
+    SnsError::ResourceNotFound { message: "Topic does not exist".to_owned() }
+}
+
 impl SnsRegistry {
     pub(crate) fn create_topic(
         &mut self,
@@ -245,6 +250,23 @@ impl SnsRegistry {
             .collect()
     }
 
+    pub(crate) fn list_topics_page(
+        &self,
+        scope: &SnsScope,
+        next_token: Option<&str>,
+    ) -> Result<PaginatedList<Arn>, SnsError> {
+        let topics = self.list_topics(scope);
+
+        paginate(
+            &topics,
+            &PaginationContext::Scope {
+                operation: "ListTopics",
+                scope: scope.clone(),
+            },
+            next_token,
+        )
+    }
+
     pub(crate) fn get_topic_attributes(
         &self,
         topic_arn: &Arn,
@@ -305,7 +327,10 @@ impl SnsRegistry {
         tags: BTreeMap<String, String>,
     ) -> Result<(), SnsError> {
         let topic = TopicKey::from_topic_arn(topic_arn)?;
-        let record = self.topic_record_mut(&topic)?;
+        let record = self
+            .topics
+            .get_mut(&topic)
+            .ok_or_else(resource_not_found_topic_error)?;
 
         for (key, value) in tags {
             record.tags.insert(key, value);
@@ -320,7 +345,10 @@ impl SnsRegistry {
         tag_keys: &[String],
     ) -> Result<(), SnsError> {
         let topic = TopicKey::from_topic_arn(topic_arn)?;
-        let record = self.topic_record_mut(&topic)?;
+        let record = self
+            .topics
+            .get_mut(&topic)
+            .ok_or_else(resource_not_found_topic_error)?;
 
         for tag_key in tag_keys {
             record.tags.remove(tag_key);
@@ -335,7 +363,12 @@ impl SnsRegistry {
     ) -> Result<BTreeMap<String, String>, SnsError> {
         let topic = TopicKey::from_topic_arn(topic_arn)?;
 
-        Ok(self.topic_record(&topic)?.tags.clone())
+        Ok(self
+            .topics
+            .get(&topic)
+            .ok_or_else(resource_not_found_topic_error)?
+            .tags
+            .clone())
     }
 
     fn subscription_counts(&self, topic: &TopicKey) -> (usize, usize) {
