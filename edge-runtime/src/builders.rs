@@ -2,8 +2,13 @@
 use crate::CloudWatchService;
 #[cfg(feature = "cognito")]
 use crate::CognitoService;
+#[cfg(feature = "lambda")]
+use crate::CreateRoleInput;
 #[cfg(feature = "eventbridge")]
 use crate::EventBridgeService;
+#[cfg(feature = "lambda")]
+use crate::IamScope;
+use crate::IamService;
 #[cfg(feature = "kinesis")]
 use crate::KinesisService;
 #[cfg(feature = "kms")]
@@ -16,15 +21,53 @@ use crate::SequentialSnsIdentifierSource;
 use crate::SqsService;
 #[cfg(feature = "ssm")]
 use crate::SsmService;
+use crate::StsService;
+#[cfg(any(feature = "lambda", feature = "s3"))]
+use crate::adapters::DirectoryBlobStore;
+#[cfg(any(
+    feature = "apigateway",
+    feature = "cloudwatch",
+    feature = "cognito",
+    feature = "dynamodb",
+    feature = "elasticache",
+    feature = "eventbridge",
+    feature = "kinesis",
+    feature = "kms",
+    feature = "lambda",
+    feature = "rds",
+    feature = "s3",
+    feature = "secrets-manager",
+    feature = "ssm",
+    feature = "step-functions"
+))]
+use crate::adapters::FixedClock;
+#[cfg(feature = "lambda")]
+use crate::adapters::OsRandomSource;
 #[cfg(feature = "lambda")]
 use crate::adapters::ProcessLambdaExecutor;
+#[cfg(any(
+    feature = "apigateway",
+    feature = "cloudwatch",
+    feature = "cognito",
+    feature = "eventbridge",
+    feature = "kinesis",
+    feature = "kms",
+    feature = "lambda",
+    feature = "s3",
+    feature = "secrets-manager",
+    feature = "ssm"
+))]
+use crate::adapters::SystemClock;
+#[cfg(any(feature = "apigateway", feature = "sns"))]
+use crate::adapters::TcpHttpForwarder;
+#[cfg(feature = "eventbridge")]
+use crate::adapters::ThreadBackgroundScheduler;
 #[cfg(feature = "rds")]
 use crate::adapters::ThreadRdsBackendRuntime;
-use crate::adapters::{
-    DirectoryBlobStore, FixedClock, MemoryBlobStore, OsRandomSource,
-    SequenceRandomSource, SystemClock, TcpHttpForwarder,
-    ThreadBackgroundScheduler, ThreadTcpProxyRuntime,
-};
+#[cfg(feature = "rds")]
+use crate::adapters::ThreadTcpProxyRuntime;
+#[cfg(feature = "lambda")]
+use crate::adapters::{MemoryBlobStore, SequenceRandomSource};
 #[cfg(feature = "elasticache")]
 use crate::adapters::{
     ThreadElastiCacheNodeRuntime, ThreadElastiCacheProxyRuntime,
@@ -53,7 +96,6 @@ use crate::composition::{SnsServiceDependencies, build_sns_service};
 use crate::{ApiGatewayService, ExecuteApiIntegrationExecutor};
 #[cfg(feature = "cloudformation")]
 use crate::{CloudFormationDependencies, CloudFormationService};
-use crate::{CreateRoleInput, StsService};
 #[cfg(feature = "dynamodb")]
 use crate::{DynamoDbInitError, DynamoDbService};
 #[cfg(feature = "elasticache")]
@@ -67,7 +109,6 @@ use crate::{
     EventBridgeDeliveryDispatcher, EventBridgeError,
     EventBridgeServiceDependencies, NoopEventBridgeDeliveryDispatcher,
 };
-use crate::{IamScope, IamService};
 #[cfg(feature = "lambda")]
 use crate::{LambdaInitError, LambdaService, LambdaServiceDependencies};
 #[cfg(feature = "rds")]
@@ -78,16 +119,22 @@ use crate::{
 use crate::{S3InitError, S3Service};
 #[cfg(feature = "step-functions")]
 use crate::{StepFunctionsService, StepFunctionsServiceDependencies};
-use auth::{Authenticator, RequestAuth, RequestHeader};
+use auth::Authenticator;
+#[cfg(any(feature = "elasticache", feature = "rds"))]
+use auth::{RequestAuth, RequestHeader};
+#[cfg(feature = "rds")]
+use aws::Endpoint;
+#[cfg(any(feature = "eventbridge", feature = "lambda"))]
 use aws::InfrastructureError;
-use aws::{
-    AccountId, Endpoint, RegionId, RuntimeDefaults, ServiceName,
-    SharedAdvertisedEdge,
-};
+#[cfg(feature = "lambda")]
+use aws::{AccountId, RegionId};
+use aws::{RuntimeDefaults, ServiceName, SharedAdvertisedEdge};
 #[cfg(feature = "elasticache")]
 use elasticache::ElastiCacheReplicationGroupId;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(feature = "sns")]
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use storage::{StorageConfig, StorageError, StorageFactory, StorageMode};
 use thiserror::Error;
 
@@ -210,6 +257,16 @@ impl LocalRuntimeBuilder {
         let defaults = self.defaults;
         let enabled_services = self.enabled_services;
         let authenticator = self.authenticator;
+        #[cfg(not(any(
+            feature = "apigateway",
+            feature = "cognito",
+            feature = "lambda",
+            feature = "s3",
+            feature = "sns"
+        )))]
+        let _ = &advertised_edge;
+        #[cfg(not(any(feature = "elasticache", feature = "rds")))]
+        let _ = &authenticator;
         let iam = IamService::new();
         let sts = StsService::new(iam.clone());
         #[cfg(feature = "dynamodb")]
@@ -299,14 +356,10 @@ impl LocalRuntimeBuilder {
             },
         )
         .map_err(RuntimeBuildError::LambdaState)?;
-        #[cfg(any(feature = "apigateway", feature = "sns"))]
+        #[cfg(feature = "sns")]
         let http_forwarder: Option<
             Arc<dyn crate::HttpForwarder + Send + Sync>,
         > = Some(Arc::new(TcpHttpForwarder::new()));
-        #[cfg(not(any(feature = "apigateway", feature = "sns")))]
-        let http_forwarder: Option<
-            Arc<dyn crate::HttpForwarder + Send + Sync>,
-        > = None;
         #[cfg(feature = "sns")]
         let sns = build_sns_service(
             advertised_edge.clone(),
@@ -584,6 +637,24 @@ impl TestRuntimeBuilder {
         let advertised_edge = self.advertised_edge;
         let label = self.label;
         let enabled_services = self.enabled_services;
+        #[cfg(not(any(
+            feature = "apigateway",
+            feature = "cloudwatch",
+            feature = "cognito",
+            feature = "dynamodb",
+            feature = "elasticache",
+            feature = "eventbridge",
+            feature = "kinesis",
+            feature = "kms",
+            feature = "lambda",
+            feature = "rds",
+            feature = "s3",
+            feature = "secrets-manager",
+            feature = "ssm",
+            feature = "sns",
+            feature = "step-functions"
+        )))]
+        let _ = (&advertised_edge, &label);
         #[cfg(any(feature = "apigateway", feature = "sns"))]
         let http_forwarder = self.http_forwarder;
         let iam = IamService::with_time_source(Arc::new(|| UNIX_EPOCH));
@@ -679,10 +750,6 @@ impl TestRuntimeBuilder {
             },
         )
         .map_err(RuntimeBuildError::LambdaState)?;
-        #[cfg(not(any(feature = "apigateway", feature = "sns")))]
-        let http_forwarder: Option<
-            Arc<dyn crate::HttpForwarder + Send + Sync>,
-        > = None;
         #[cfg(feature = "sns")]
         let sns = build_sns_service(
             advertised_edge.clone(),
@@ -851,6 +918,22 @@ impl TestRuntimeBuilder {
     }
 }
 
+#[cfg(any(
+    feature = "apigateway",
+    feature = "cloudwatch",
+    feature = "cognito",
+    feature = "dynamodb",
+    feature = "elasticache",
+    feature = "eventbridge",
+    feature = "kinesis",
+    feature = "kms",
+    feature = "lambda",
+    feature = "rds",
+    feature = "s3",
+    feature = "secrets-manager",
+    feature = "ssm",
+    feature = "step-functions"
+))]
 fn memory_factory(label: &str, service: &str) -> StorageFactory {
     StorageFactory::new(StorageConfig::new(
         std::env::temp_dir().join(format!("{label}-{service}")),
@@ -883,6 +966,7 @@ fn seed_lambda_role(iam: &IamService) -> Result<(), RuntimeBuildError> {
     Ok(())
 }
 
+#[cfg(feature = "lambda")]
 fn default_account_id() -> Result<AccountId, RuntimeBuildError> {
     "000000000000".parse().map_err(|error| {
         RuntimeBuildError::Configuration(format!(
@@ -891,6 +975,7 @@ fn default_account_id() -> Result<AccountId, RuntimeBuildError> {
     })
 }
 
+#[cfg(feature = "lambda")]
 fn default_region_id() -> Result<RegionId, RuntimeBuildError> {
     "eu-west-2".parse().map_err(|error| {
         RuntimeBuildError::Configuration(format!(

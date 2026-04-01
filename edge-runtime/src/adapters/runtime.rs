@@ -4,6 +4,7 @@ use aws::{
 };
 use getrandom::getrandom;
 use std::io;
+#[cfg(any(feature = "eventbridge", test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, LockResult, Mutex};
@@ -56,17 +57,20 @@ impl Drop for ManagedBackgroundTasks {
     }
 }
 
+#[cfg(any(feature = "eventbridge", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadWorkQueueShutdownOutcome {
     Drained,
     TimedOut,
 }
 
+#[cfg(any(feature = "eventbridge", test))]
 #[derive(Debug, Default)]
 pub(crate) struct ThreadWorkQueueStopToken {
     stop_requested: AtomicBool,
 }
 
+#[cfg(any(feature = "eventbridge", test))]
 impl ThreadWorkQueueStopToken {
     pub(crate) fn is_stop_requested(&self) -> bool {
         self.stop_requested.load(Ordering::SeqCst)
@@ -77,6 +81,7 @@ impl ThreadWorkQueueStopToken {
     }
 }
 
+#[cfg(any(feature = "eventbridge", test))]
 pub(crate) struct ThreadWorkQueue<T: Send + 'static> {
     completion: Mutex<mpsc::Receiver<()>>,
     completed: AtomicBool,
@@ -86,6 +91,7 @@ pub(crate) struct ThreadWorkQueue<T: Send + 'static> {
     task_name: String,
 }
 
+#[cfg(any(feature = "eventbridge", test))]
 impl<T: Send + 'static> ThreadWorkQueue<T> {
     pub(crate) fn spawn(
         task_name: String,
@@ -215,6 +221,7 @@ impl<T: Send + 'static> ThreadWorkQueue<T> {
     }
 }
 
+#[cfg(any(feature = "eventbridge", test))]
 impl<T: Send + 'static> Drop for ThreadWorkQueue<T> {
     fn drop(&mut self) {
         self.begin_shutdown();

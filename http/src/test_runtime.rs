@@ -1,26 +1,28 @@
 use crate::runtime::EdgeRouter;
 use auth::Authenticator;
 use aws::{RuntimeDefaults, ServiceName, SharedAdvertisedEdge};
-#[cfg(test)]
+#[cfg(any(
+    feature = "kinesis",
+    feature = "kms",
+    feature = "ssm",
+    feature = "step-functions"
+))]
 pub(crate) use edge_runtime::FixedClock;
-#[cfg(any(feature = "apigateway", feature = "sns"))]
+#[cfg(any(feature = "apigateway", feature = "sns", feature = "sqs"))]
 use edge_runtime::HttpForwarder;
 #[cfg(feature = "lambda")]
 use edge_runtime::LambdaExecutor;
 use edge_runtime::{RuntimeServices, TestRuntimeBuilder};
+#[cfg(any(feature = "apigateway", feature = "sns", feature = "sqs"))]
 use std::sync::Arc;
 
-pub(crate) fn runtime_defaults(label: &str) -> RuntimeDefaults {
+fn runtime_defaults(label: &str) -> RuntimeDefaults {
     RuntimeDefaults::try_new(
         Some("000000000000".to_owned()),
         Some("eu-west-2".to_owned()),
         Some(format!("/tmp/{label}")),
     )
     .expect("test defaults should be valid")
-}
-
-pub(crate) fn router(label: &str) -> EdgeRouter {
-    build_router(TestRuntimeBuilder::new(label), label)
 }
 
 pub(crate) fn router_with_services(
@@ -34,6 +36,7 @@ pub(crate) fn router_with_services(
     )
 }
 
+#[cfg(any(feature = "apigateway", feature = "eventbridge", feature = "s3"))]
 pub(crate) fn router_with_runtime(
     label: &str,
 ) -> (EdgeRouter, RuntimeServices) {
@@ -51,6 +54,17 @@ pub(crate) fn router_with_http_forwarder(
     )
 }
 
+#[cfg(all(
+    feature = "sqs",
+    not(any(feature = "apigateway", feature = "sns"))
+))]
+pub(crate) fn router_with_http_forwarder(
+    label: &str,
+    _http_forwarder: Option<Arc<dyn HttpForwarder + Send + Sync>>,
+) -> EdgeRouter {
+    build_router(TestRuntimeBuilder::new(label), label)
+}
+
 #[cfg(feature = "lambda")]
 pub(crate) fn router_with_lambda_executor(
     label: &str,
@@ -62,7 +76,10 @@ pub(crate) fn router_with_lambda_executor(
     )
 }
 
-fn build_router(builder: TestRuntimeBuilder, label: &str) -> EdgeRouter {
+pub(crate) fn build_router(
+    builder: TestRuntimeBuilder,
+    label: &str,
+) -> EdgeRouter {
     let (router, _) = build_router_with_runtime(builder, label);
     router
 }

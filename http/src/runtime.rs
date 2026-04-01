@@ -1,56 +1,29 @@
-#[cfg(feature = "apigateway")]
-use crate::apigateway;
+#[cfg(feature = "lambda")]
 use crate::aws_error_shape::AwsErrorShape as _;
-#[cfg(feature = "cloudformation")]
-use crate::cloudformation;
-#[cfg(feature = "cloudwatch")]
-use crate::cloudwatch;
 #[cfg(feature = "cognito")]
 use crate::cognito;
-#[cfg(feature = "dynamodb")]
-use crate::dynamodb;
-#[cfg(feature = "elasticache")]
-use crate::elasticache;
-#[cfg(feature = "eventbridge")]
-use crate::eventbridge;
-use crate::iam_query;
-#[cfg(feature = "kinesis")]
-use crate::kinesis;
-#[cfg(feature = "kms")]
-use crate::kms;
-#[cfg(feature = "lambda")]
-use crate::lambda;
 use crate::query::{
-    is_query_request, missing_action_error,
-    parse_request as parse_query_request,
+    missing_action_error, parse_request as parse_query_request,
 };
-#[cfg(feature = "rds")]
-use crate::rds;
 use crate::request::{EdgeRequest, HttpRequest};
+use crate::routing;
 #[cfg(feature = "s3")]
 use crate::s3;
-#[cfg(feature = "secrets-manager")]
-use crate::secrets_manager;
-#[cfg(feature = "sns")]
-use crate::sns;
-#[cfg(feature = "sqs")]
-use crate::sqs;
-#[cfg(feature = "ssm")]
-use crate::ssm;
-#[cfg(feature = "step-functions")]
-use crate::step_functions;
-use crate::sts_query;
 use crate::xml::XmlBuilder;
 use auth::{
     Authenticator, RequestAuth, RequestHeader, VerifiedRequest,
     VerifiedSignature,
 };
+#[cfg(feature = "apigateway")]
+use aws::parse_reserved_execute_api_path;
+#[cfg(feature = "lambda")]
+use aws::parse_reserved_lambda_function_url_path;
 use aws::{
-    AdvertisedEdge, AwsError, AwsErrorFamily, CredentialScope, ProtocolFamily,
-    RegionId, RequestContext, RuntimeDefaults, ServiceName,
-    SharedAdvertisedEdge, parse_reserved_execute_api_path,
-    parse_reserved_lambda_function_url_path,
+    AwsError, AwsErrorFamily, CredentialScope, ProtocolFamily, RequestContext,
+    RuntimeDefaults, ServiceName, SharedAdvertisedEdge,
 };
+#[cfg(feature = "lambda")]
+use aws::RegionId;
 use ciborium::into_writer;
 use edge_runtime::{EnabledServices, RuntimeServices};
 use httpdate::fmt_http_date;
@@ -60,42 +33,13 @@ use serde_json::{Value, json};
 use services::FunctionUrlInvocationInput;
 #[cfg(feature = "s3")]
 use services::S3Scope;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(any(feature = "apigateway", feature = "lambda"))]
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 const REQUEST_ID: &str = "0000000000000000";
 static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
-const JSON_10_TARGET_PREFIXES: [(&str, ServiceName); 6] = [
-    ("DynamoDB_20120810.", ServiceName::DynamoDb),
-    ("DynamoDBStreams_20120810.", ServiceName::DynamoDb),
-    ("AmazonSQS.", ServiceName::Sqs),
-    ("SNS_20100331.", ServiceName::Sns),
-    ("AWSStepFunctions.", ServiceName::StepFunctions),
-    ("GraniteServiceVersion20100801.", ServiceName::CloudWatch),
-];
-const JSON_11_TARGET_PREFIXES: [(&str, ServiceName); 7] = [
-    ("AmazonSSM.", ServiceName::Ssm),
-    ("AWSEvents.", ServiceName::EventBridge),
-    ("Logs_20140328.", ServiceName::Logs),
-    ("secretsmanager.", ServiceName::SecretsManager),
-    ("Kinesis_20131202.", ServiceName::Kinesis),
-    ("TrentService.", ServiceName::Kms),
-    (
-        "AWSCognitoIdentityProviderService.",
-        ServiceName::CognitoIdentityProvider,
-    ),
-];
-const QUERY_ACTION_FALLBACKS: [(&str, ServiceName); 9] = [
-    ("AssumeRole", ServiceName::Sts),
-    ("GetCallerIdentity", ServiceName::Sts),
-    ("CreateUser", ServiceName::Iam),
-    ("CreateTopic", ServiceName::Sns),
-    ("CreateQueue", ServiceName::Sqs),
-    ("PutMetricData", ServiceName::CloudWatch),
-    ("CreateReplicationGroup", ServiceName::ElastiCache),
-    ("CreateDBInstance", ServiceName::Rds),
-    ("CreateStack", ServiceName::CloudFormation),
-];
 
 #[derive(Clone)]
 pub struct EdgeRouter {
@@ -159,6 +103,15 @@ impl EdgeRouter {
         EdgeRequestExecutor { router: self.clone() }
     }
 
+    #[cfg(any(feature = "lambda", feature = "sqs"))]
+    pub(crate) fn advertised_edge(&self) -> &SharedAdvertisedEdge {
+        &self.advertised_edge
+    }
+
+    pub(crate) fn runtime_services(&self) -> &RuntimeServices {
+        &self.runtime
+    }
+
     fn route(
         &self,
         request: EdgeRequest,
@@ -188,7 +141,7 @@ impl EdgeRouter {
 
         let advertised_edge = self.advertised_edge.current();
         let Some(protocol) =
-            detect_generic_protocol(&request, &advertised_edge)
+            routing::detect_generic_protocol(&request, &advertised_edge)
         else {
             #[cfg(feature = "s3")]
             if s3::is_rest_xml_request(&request, &advertised_edge) {
@@ -652,7 +605,10 @@ impl EdgeRouter {
 
         let service = match scope {
             Some(scope) => {
-                if !supports_protocol(scope.service(), ProtocolFamily::Query) {
+                if !routing::supports_protocol(
+                    scope.service(),
+                    ProtocolFamily::Query,
+                ) {
                     let error = signature_scope_mismatch_error(format!(
                         "Credential scope service {} does not support Query requests.",
                         scope.service().as_str()
@@ -661,7 +617,7 @@ impl EdgeRouter {
                 }
 
                 if let Some(expected_service) =
-                    service_from_query_action(&action, Some(version))
+                    routing::service_from_query_action(&action, Some(version))
                     && expected_service != scope.service()
                 {
                     let error = signature_scope_mismatch_error(format!(
@@ -674,7 +630,10 @@ impl EdgeRouter {
 
                 scope.service()
             }
-            None => match service_from_query_action(&action, Some(version)) {
+            None => match routing::service_from_query_action(
+                &action,
+                Some(version),
+            ) {
                 Some(service) => service,
                 None => {
                     let error = invalid_query_action_error(&action, None);
@@ -682,7 +641,7 @@ impl EdgeRouter {
                 }
             },
         };
-        if !query_action_matches_version(service, &action, version) {
+        if !routing::query_action_matches_version(service, &action, version) {
             let error = invalid_query_version_error(&action, version);
             return EdgeResponse::aws(ProtocolFamily::Query, &error);
         }
@@ -703,120 +662,15 @@ impl EdgeRouter {
         let mut normalized_request = request.clone();
         normalized_request.set_body(parsed_query.raw_parameters().to_vec());
 
-        if service == ServiceName::Iam {
-            return match iam_query::handle(
-                self.runtime.iam(),
-                normalized_request.body(),
-                &context,
-            ) {
-                Ok(body) => {
-                    EdgeResponse::bytes(200, "text/xml", body.into_bytes())
-                }
-                Err(error) => EdgeResponse::aws(ProtocolFamily::Query, &error),
-            };
-        }
-
-        if service == ServiceName::Sts {
-            return match sts_query::handle(
-                self.runtime.sts(),
-                normalized_request.body(),
-                &context,
-                verified_request,
-            ) {
-                Ok(body) => {
-                    EdgeResponse::bytes(200, "text/xml", body.into_bytes())
-                }
-                Err(error) => EdgeResponse::aws(ProtocolFamily::Query, &error),
-            };
-        }
-
-        #[cfg(feature = "sqs")]
-        if service == ServiceName::Sqs {
-            let advertised_edge = self.advertised_edge.current();
-            let sqs_requests = self.runtime.sqs_requests();
-            return match sqs::handle_query(
-                self.runtime.sqs(),
-                &sqs_requests,
-                &advertised_edge,
-                &normalized_request,
-                &context,
-                request_cancellation,
-            ) {
-                Ok(body) => {
-                    EdgeResponse::bytes(200, "text/xml", body.into_bytes())
-                }
-                Err(error) => EdgeResponse::aws(ProtocolFamily::Query, &error),
-            };
-        }
-
-        #[cfg(feature = "sns")]
-        if service == ServiceName::Sns {
-            return match sns::handle_query(
-                self.runtime.sns(),
-                &normalized_request,
-                &context,
-            ) {
-                Ok(body) => {
-                    EdgeResponse::bytes(200, "text/xml", body.into_bytes())
-                }
-                Err(error) => EdgeResponse::aws(ProtocolFamily::Query, &error),
-            };
-        }
-
-        #[cfg(feature = "cloudformation")]
-        if service == ServiceName::CloudFormation {
-            return match cloudformation::handle_query(
-                self.runtime.cloudformation(),
-                normalized_request.body(),
-                &context,
-            ) {
-                Ok(body) => {
-                    EdgeResponse::bytes(200, "text/xml", body.into_bytes())
-                }
-                Err(error) => EdgeResponse::aws(ProtocolFamily::Query, &error),
-            };
-        }
-
-        #[cfg(feature = "cloudwatch")]
-        if service == ServiceName::CloudWatch {
-            return match cloudwatch::handle_metrics_query(
-                self.runtime.cloudwatch(),
-                &normalized_request,
-                &context,
-            ) {
-                Ok(body) => {
-                    EdgeResponse::bytes(200, "text/xml", body.into_bytes())
-                }
-                Err(error) => EdgeResponse::aws(ProtocolFamily::Query, &error),
-            };
-        }
-
-        #[cfg(feature = "rds")]
-        if service == ServiceName::Rds {
-            return match rds::handle_query(
-                self.runtime.rds(),
-                &normalized_request,
-                &context,
-            ) {
-                Ok(body) => {
-                    EdgeResponse::bytes(200, "text/xml", body.into_bytes())
-                }
-                Err(error) => EdgeResponse::aws(ProtocolFamily::Query, &error),
-            };
-        }
-
-        #[cfg(feature = "elasticache")]
-        if service == ServiceName::ElastiCache {
-            return match elasticache::handle_query(
-                self.runtime.elasticache(),
-                &normalized_request,
-                &context,
-            ) {
-                Ok(body) => {
-                    EdgeResponse::bytes(200, "text/xml", body.into_bytes())
-                }
-                Err(error) => EdgeResponse::aws(ProtocolFamily::Query, &error),
-            };
+        if let Some(response) = routing::dispatch_query(
+            self,
+            service,
+            &normalized_request,
+            &context,
+            verified_request,
+            request_cancellation,
+        ) {
+            return response;
         }
 
         EdgeResponse::aws(
@@ -856,223 +710,16 @@ impl EdgeRouter {
             route.operation.as_deref().unwrap_or("UnknownOperation"),
         );
 
-        #[cfg(feature = "sqs")]
-        if route.service == ServiceName::Sqs && route.operation.is_some() {
-            let advertised_edge = self.advertised_edge.current();
-            let sqs_requests = self.runtime.sqs_requests();
-            return match sqs::handle_json(
-                self.runtime.sqs(),
-                &sqs_requests,
-                &advertised_edge,
+        if route.operation.is_some()
+            && let Some(response) = routing::dispatch_json(
+                self,
+                route.service,
                 request,
                 &context,
                 request_cancellation,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.0",
-                    body,
-                ),
-                Err(error) => EdgeResponse::aws(protocol, &error),
-            };
-        }
-
-        #[cfg(feature = "sns")]
-        if route.service == ServiceName::Sns && route.operation.is_some() {
-            return match sns::handle_json(
-                self.runtime.sns(),
-                request,
-                &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.0",
-                    body,
-                ),
-                Err(error) => EdgeResponse::aws(protocol, &error),
-            };
-        }
-
-        #[cfg(feature = "dynamodb")]
-        if route.service == ServiceName::DynamoDb && route.operation.is_some()
+            )
         {
-            return match dynamodb::handle_json(
-                self.runtime.dynamodb(),
-                request,
-                &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.0",
-                    body,
-                ),
-                Err(error) => {
-                    if let Some(body) = error.body() {
-                        EdgeResponse::bytes(
-                            error.error().status_code(),
-                            "application/x-amz-json-1.0",
-                            body.to_vec(),
-                        )
-                        .set_header("x-amzn-errortype", error.code())
-                    } else {
-                        EdgeResponse::aws(protocol, error.error())
-                    }
-                }
-            };
-        }
-
-        #[cfg(feature = "ssm")]
-        if route.service == ServiceName::Ssm && route.operation.is_some() {
-            return match ssm::handle_json(
-                self.runtime.ssm(),
-                request,
-                &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.1",
-                    body,
-                ),
-                Err(error) => EdgeResponse::aws(protocol, &error),
-            };
-        }
-
-        #[cfg(feature = "cognito")]
-        if route.service == ServiceName::CognitoIdentityProvider
-            && route.operation.is_some()
-        {
-            return match cognito::handle_json(
-                self.runtime.cognito(),
-                request,
-                &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.1",
-                    body,
-                ),
-                Err(error) => EdgeResponse::aws(protocol, &error),
-            };
-        }
-
-        #[cfg(feature = "kinesis")]
-        if route.service == ServiceName::Kinesis && route.operation.is_some() {
-            return match kinesis::handle_json(
-                self.runtime.kinesis(),
-                request,
-                &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.1",
-                    body,
-                ),
-                Err(error) => EdgeResponse::aws(protocol, &error),
-            };
-        }
-
-        #[cfg(feature = "secrets-manager")]
-        if route.service == ServiceName::SecretsManager
-            && route.operation.is_some()
-        {
-            return match secrets_manager::handle_json(
-                self.runtime.secrets_manager(),
-                request,
-                &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.1",
-                    body,
-                ),
-                Err(error) => EdgeResponse::aws(protocol, &error),
-            };
-        }
-
-        #[cfg(feature = "kms")]
-        if route.service == ServiceName::Kms && route.operation.is_some() {
-            return match kms::handle_json(
-                self.runtime.kms(),
-                request,
-                &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.1",
-                    body,
-                ),
-                Err(error) => EdgeResponse::aws(protocol, &error),
-            };
-        }
-
-        #[cfg(feature = "cloudwatch")]
-        if route.service == ServiceName::CloudWatch
-            && route.operation.is_some()
-        {
-            return match cloudwatch::handle_metrics_json(
-                self.runtime.cloudwatch(),
-                request,
-                &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.0",
-                    body,
-                ),
-                Err(error) => EdgeResponse::aws(protocol, &error),
-            };
-        }
-
-        #[cfg(feature = "cloudwatch")]
-        if route.service == ServiceName::Logs && route.operation.is_some() {
-            return match cloudwatch::handle_logs_json(
-                self.runtime.cloudwatch(),
-                request,
-                &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.1",
-                    body,
-                ),
-                Err(error) => EdgeResponse::aws(protocol, &error),
-            };
-        }
-
-        #[cfg(feature = "step-functions")]
-        if route.service == ServiceName::StepFunctions
-            && route.operation.is_some()
-        {
-            return match step_functions::handle_json(
-                self.runtime.step_functions(),
-                request,
-                &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.0",
-                    body,
-                ),
-                Err(error) => EdgeResponse::aws(protocol, &error),
-            };
-        }
-
-        #[cfg(feature = "eventbridge")]
-        if route.service == ServiceName::EventBridge
-            && route.operation.is_some()
-        {
-            return match eventbridge::handle_json(
-                self.runtime.eventbridge(),
-                request,
-                &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(
-                    200,
-                    "application/x-amz-json-1.1",
-                    body,
-                ),
-                Err(error) => EdgeResponse::aws(protocol, &error),
-            };
+            return response;
         }
 
         EdgeResponse::aws(
@@ -1117,21 +764,15 @@ impl EdgeRouter {
             route.operation.as_deref().unwrap_or("UnknownOperation"),
         );
 
-        #[cfg(feature = "cloudwatch")]
-        if route.service == ServiceName::CloudWatch
-            && route.operation.is_some()
-        {
-            return match cloudwatch::handle_metrics_cbor(
-                self.runtime.cloudwatch(),
+        if route.operation.is_some()
+            && let Some(response) = routing::dispatch_smithy(
+                self,
+                route.service,
                 request,
                 &context,
-            ) {
-                Ok(body) => EdgeResponse::bytes(200, "application/cbor", body)
-                    .with_header("Smithy-Protocol", "rpc-v2-cbor"),
-                Err(error) => {
-                    EdgeResponse::aws(ProtocolFamily::SmithyRpcV2Cbor, &error)
-                }
-            };
+            )
+        {
+            return response;
         }
 
         EdgeResponse::aws(
@@ -1150,7 +791,7 @@ impl EdgeRouter {
         verified_request: Option<&VerifiedRequest>,
         request_cancellation: &AtomicBool,
     ) -> EdgeResponse {
-        let Some(service) = rest_json_service(request) else {
+        let Some(service) = routing::rest_json_service(request) else {
             return EdgeResponse::json(404, json!({ "message": "not found" }));
         };
 
@@ -1179,37 +820,15 @@ impl EdgeRouter {
             "UnknownOperation",
         );
 
-        match service {
-            #[cfg(feature = "lambda")]
-            ServiceName::Lambda => {
-                let advertised_edge = self.advertised_edge.current();
-                let lambda_requests = self.runtime.lambda_requests();
-                match lambda::handle_rest_json(
-                    self.runtime.lambda(),
-                    &lambda_requests,
-                    &advertised_edge,
-                    request,
-                    &context,
-                    request_cancellation,
-                ) {
-                    Ok(response) => response,
-                    Err(error) => {
-                        EdgeResponse::aws(ProtocolFamily::RestJson, &error)
-                    }
-                }
-            }
-            #[cfg(feature = "apigateway")]
-            ServiceName::ApiGateway => match apigateway::handle_rest_json(
-                self.runtime.apigateway(),
-                request,
-                &context,
-            ) {
-                Ok(response) => response,
-                Err(error) => {
-                    EdgeResponse::aws(ProtocolFamily::RestJson, &error)
-                }
-            },
-            _ => EdgeResponse::aws(
+        match routing::dispatch_rest_json(
+            self,
+            service,
+            request,
+            &context,
+            request_cancellation,
+        ) {
+            Some(response) => response,
+            None => EdgeResponse::aws(
                 ProtocolFamily::RestJson,
                 &service_not_available_error(service),
             ),
@@ -1306,6 +925,7 @@ impl EdgeRouter {
         )
     }
 
+    #[cfg(any(feature = "apigateway", feature = "lambda"))]
     fn authenticate(
         &self,
         request: &HttpRequest<'_>,
@@ -1387,7 +1007,7 @@ pub struct EdgeResponse {
 }
 
 impl EdgeResponse {
-    fn aws(protocol: ProtocolFamily, error: &AwsError) -> Self {
+    pub(crate) fn aws(protocol: ProtocolFamily, error: &AwsError) -> Self {
         match protocol {
             ProtocolFamily::Query | ProtocolFamily::RestXml => {
                 let body = query_error_body(error).into_bytes();
@@ -1449,7 +1069,7 @@ impl EdgeResponse {
         }
     }
 
-    fn with_header(mut self, name: &str, value: &str) -> Self {
+    pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
         self
     }
@@ -1508,87 +1128,21 @@ struct JsonRoute<'a> {
     original_target: Option<&'a str>,
 }
 
+#[cfg(feature = "cognito")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CognitoWellKnownDocument {
     Jwks,
     OpenIdConfiguration,
 }
 
+#[cfg(feature = "lambda")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FunctionUrlHost {
     region: RegionId,
     url_id: String,
 }
 
-fn detect_generic_protocol(
-    request: &HttpRequest<'_>,
-    advertised_edge: &AdvertisedEdge,
-) -> Option<ProtocolFamily> {
-    let content_type = request.header("content-type").unwrap_or_default();
-    let smithy_protocol =
-        request.header("smithy-protocol").unwrap_or_default();
-    let target = request.header("x-amz-target");
-    let path = request.path_without_query();
-    #[cfg(feature = "s3")]
-    let s3_candidate = s3::is_rest_xml_request(request, advertised_edge);
-    #[cfg(not(feature = "s3"))]
-    let s3_candidate = false;
-
-    if smithy_path(request.path_without_query()).is_some()
-        || smithy_protocol.eq_ignore_ascii_case("rpc-v2-cbor")
-    {
-        return Some(ProtocolFamily::SmithyRpcV2Cbor);
-    }
-
-    if content_type.eq_ignore_ascii_case("application/cbor") {
-        if s3_candidate && path != "/" {
-            return None;
-        }
-        return Some(ProtocolFamily::SmithyRpcV2Cbor);
-    }
-
-    if rest_json_service(request).is_some() {
-        return Some(ProtocolFamily::RestJson);
-    }
-
-    if content_type.contains("application/x-amz-json-1.0") {
-        if s3_candidate && path != "/" {
-            return None;
-        }
-        return Some(ProtocolFamily::AwsJson10);
-    }
-
-    if content_type.contains("application/x-amz-json-1.1") {
-        if s3_candidate && path != "/" {
-            return None;
-        }
-        return Some(ProtocolFamily::AwsJson11);
-    }
-
-    if let Some(target) = target {
-        if json_target(ProtocolFamily::AwsJson10, target).is_some() {
-            return Some(ProtocolFamily::AwsJson10);
-        }
-        if json_target(ProtocolFamily::AwsJson11, target).is_some() {
-            return Some(ProtocolFamily::AwsJson11);
-        }
-    }
-
-    if is_query_request(request) {
-        return Some(ProtocolFamily::Query);
-    }
-
-    if s3_candidate && path != "/" {
-        return None;
-    }
-
-    if content_type.contains("application/x-www-form-urlencoded") {
-        return Some(ProtocolFamily::Query);
-    }
-
-    None
-}
-
+#[cfg(feature = "cognito")]
 fn cognito_well_known_route(
     path: &str,
 ) -> Option<(&str, CognitoWellKnownDocument)> {
@@ -1607,11 +1161,13 @@ fn cognito_well_known_route(
     None
 }
 
+#[cfg(feature = "cognito")]
 fn cognito_pool_id_segment(pool_path: &str) -> Option<&str> {
     let pool_id = pool_path.strip_prefix('/')?;
     (!pool_id.is_empty() && !pool_id.contains('/')).then_some(pool_id)
 }
 
+#[cfg(feature = "lambda")]
 fn parse_function_url_host(host: &str) -> Option<FunctionUrlHost> {
     let authority = host.trim().to_ascii_lowercase();
     let host = authority
@@ -1629,6 +1185,7 @@ fn parse_function_url_host(host: &str) -> Option<FunctionUrlHost> {
     Some(FunctionUrlHost { region, url_id: url_id.to_owned() })
 }
 
+#[cfg(feature = "lambda")]
 fn function_url_error_response(error: &AwsError) -> EdgeResponse {
     EdgeResponse::json(
         error.status_code(),
@@ -1643,6 +1200,7 @@ fn function_url_lambda_error_response(
     function_url_error_response(&error.to_aws_error())
 }
 
+#[cfg(feature = "apigateway")]
 fn execute_api_auth_error_response(error: &AwsError) -> EdgeResponse {
     EdgeResponse::json(
         error.status_code(),
@@ -1660,6 +1218,7 @@ fn execute_api_error_response(
     )
 }
 
+#[cfg(feature = "lambda")]
 fn should_skip_function_url_response_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("content-length")
@@ -1698,7 +1257,9 @@ fn resolve_json_route<'a>(
     scope: Option<&CredentialScope>,
 ) -> Result<JsonRoute<'a>, AwsError> {
     if let Some(target) = target {
-        if let Some((service, operation)) = json_target(protocol, target) {
+        if let Some((service, operation)) =
+            routing::json_target(protocol, target)
+        {
             if let Some(scope) =
                 scope.filter(|scope| scope.service() != service)
             {
@@ -1717,9 +1278,9 @@ fn resolve_json_route<'a>(
             });
         }
 
-        if let Some(scope) =
-            scope.filter(|scope| supports_protocol(scope.service(), protocol))
-        {
+        if let Some(scope) = scope.filter(|scope| {
+            routing::supports_protocol(scope.service(), protocol)
+        }) {
             return Ok(JsonRoute {
                 service: scope.service(),
                 operation: None,
@@ -1745,7 +1306,7 @@ fn resolve_json_route<'a>(
         ));
     };
 
-    if !supports_protocol(scope.service(), protocol) {
+    if !routing::supports_protocol(scope.service(), protocol) {
         return Err(signature_scope_mismatch_error(format!(
             "Credential scope service {} does not support the requested JSON protocol.",
             scope.service().as_str(),
@@ -1765,7 +1326,8 @@ fn resolve_smithy_route<'a>(
     scope: Option<&CredentialScope>,
 ) -> Result<JsonRoute<'a>, AwsError> {
     if let Some(path) = smithy_path(request.path_without_query()) {
-        let Some(service) = service_from_smithy_id(path.service_id) else {
+        let Some(service) = routing::service_from_smithy_id(path.service_id)
+        else {
             return Err(unknown_json_operation_without_context(
                 path.service_id,
             ));
@@ -1789,7 +1351,7 @@ fn resolve_smithy_route<'a>(
 
     if let Some(target) = request.header("x-amz-target") {
         if let Some((service, operation)) =
-            json_target(ProtocolFamily::AwsJson10, target)
+            routing::json_target(ProtocolFamily::AwsJson10, target)
                 .filter(|(service, _)| *service == ServiceName::CloudWatch)
         {
             if let Some(scope) =
@@ -1819,7 +1381,10 @@ fn resolve_smithy_route<'a>(
         ));
     };
 
-    if !supports_protocol(scope.service(), ProtocolFamily::SmithyRpcV2Cbor) {
+    if !routing::supports_protocol(
+        scope.service(),
+        ProtocolFamily::SmithyRpcV2Cbor,
+    ) {
         return Err(signature_scope_mismatch_error(format!(
             "Credential scope service {} does not support Smithy RPC v2 CBOR.",
             scope.service().as_str(),
@@ -1834,129 +1399,10 @@ fn resolve_smithy_route<'a>(
     })
 }
 
-fn json_target(
-    protocol: ProtocolFamily,
-    target: &str,
-) -> Option<(ServiceName, &str)> {
-    let table = match protocol {
-        ProtocolFamily::AwsJson10 => Some(JSON_10_TARGET_PREFIXES.as_slice()),
-        ProtocolFamily::AwsJson11 => Some(JSON_11_TARGET_PREFIXES.as_slice()),
-        _ => None,
-    }?;
-
-    table.iter().find_map(|(prefix, service)| {
-        target.strip_prefix(prefix).map(|operation| (*service, operation))
-    })
-}
-
 fn non_empty_operation(operation: &str) -> Option<String> {
     let operation = operation.trim();
 
     if operation.is_empty() { None } else { Some(operation.to_owned()) }
-}
-
-fn supports_protocol(service: ServiceName, protocol: ProtocolFamily) -> bool {
-    match protocol {
-        ProtocolFamily::Query => matches!(
-            service,
-            ServiceName::CloudFormation
-                | ServiceName::CloudWatch
-                | ServiceName::ElastiCache
-                | ServiceName::Iam
-                | ServiceName::Rds
-                | ServiceName::Sns
-                | ServiceName::Sqs
-                | ServiceName::Sts
-        ),
-        ProtocolFamily::AwsJson10 => matches!(
-            service,
-            ServiceName::CloudWatch
-                | ServiceName::DynamoDb
-                | ServiceName::Sns
-                | ServiceName::Sqs
-                | ServiceName::StepFunctions
-        ),
-        ProtocolFamily::AwsJson11 => matches!(
-            service,
-            ServiceName::CognitoIdentityProvider
-                | ServiceName::EventBridge
-                | ServiceName::Kinesis
-                | ServiceName::Kms
-                | ServiceName::Logs
-                | ServiceName::SecretsManager
-                | ServiceName::Ssm
-        ),
-        ProtocolFamily::RestJson => {
-            matches!(service, ServiceName::ApiGateway | ServiceName::Lambda)
-        }
-        ProtocolFamily::RestXml => service == ServiceName::S3,
-        ProtocolFamily::SmithyRpcV2Cbor => service == ServiceName::CloudWatch,
-    }
-}
-
-fn rest_json_service(request: &HttpRequest<'_>) -> Option<ServiceName> {
-    #[cfg(feature = "lambda")]
-    if lambda::is_rest_json_request(request) {
-        return Some(ServiceName::Lambda);
-    }
-    #[cfg(feature = "apigateway")]
-    if apigateway::is_rest_json_request(request) {
-        return Some(ServiceName::ApiGateway);
-    }
-
-    None
-}
-
-fn service_from_smithy_id(service_id: &str) -> Option<ServiceName> {
-    match service_id {
-        "GraniteServiceVersion20100801" | "CloudWatch" | "monitoring" => {
-            Some(ServiceName::CloudWatch)
-        }
-        _ => None,
-    }
-}
-
-fn service_from_query_action(
-    action: &str,
-    version: Option<&str>,
-) -> Option<ServiceName> {
-    #[cfg(feature = "elasticache")]
-    if elasticache::is_elasticache_action(action)
-        && elasticache::action_matches_version(action, version)
-    {
-        return Some(ServiceName::ElastiCache);
-    }
-    if iam_query::is_iam_action(action) {
-        return Some(ServiceName::Iam);
-    }
-    #[cfg(feature = "sns")]
-    if sns::is_sns_action(action) {
-        return Some(ServiceName::Sns);
-    }
-    #[cfg(feature = "sqs")]
-    if sqs::is_sqs_action(action) {
-        return Some(ServiceName::Sqs);
-    }
-    #[cfg(feature = "cloudformation")]
-    if cloudformation::is_cloudformation_action(action) {
-        return Some(ServiceName::CloudFormation);
-    }
-    if sts_query::is_sts_action(action) {
-        return Some(ServiceName::Sts);
-    }
-    #[cfg(feature = "cloudwatch")]
-    if cloudwatch::is_metrics_query_action(action) {
-        return Some(ServiceName::CloudWatch);
-    }
-    #[cfg(feature = "rds")]
-    if rds::is_rds_action(action) {
-        return Some(ServiceName::Rds);
-    }
-
-    QUERY_ACTION_FALLBACKS
-        .iter()
-        .find(|(candidate, _)| *candidate == action)
-        .map(|(_, service)| *service)
 }
 
 fn invalid_query_action_error(
@@ -1990,36 +1436,6 @@ fn invalid_query_version_error(action: &str, version: &str) -> AwsError {
         400,
         true,
     )
-}
-
-fn query_action_matches_version(
-    service: ServiceName,
-    action: &str,
-    version: &str,
-) -> bool {
-    match service {
-        ServiceName::Iam => version == iam_query::IAM_QUERY_VERSION,
-        #[cfg(feature = "sns")]
-        ServiceName::Sns => version == sns::SNS_QUERY_VERSION,
-        #[cfg(feature = "sqs")]
-        ServiceName::Sqs => version == sqs::SQS_QUERY_VERSION,
-        #[cfg(feature = "cloudformation")]
-        ServiceName::CloudFormation => {
-            version == cloudformation::CLOUDFORMATION_QUERY_VERSION
-        }
-        ServiceName::Sts => version == sts_query::STS_QUERY_VERSION,
-        #[cfg(feature = "cloudwatch")]
-        ServiceName::CloudWatch => {
-            version == cloudwatch::CLOUDWATCH_QUERY_VERSION
-        }
-        #[cfg(feature = "rds")]
-        ServiceName::Rds => version == rds::RDS_QUERY_VERSION,
-        #[cfg(feature = "elasticache")]
-        ServiceName::ElastiCache => {
-            elasticache::action_matches_version(action, Some(version))
-        }
-        _ => true,
-    }
 }
 
 fn unknown_query_error(context: &RequestContext) -> AwsError {
@@ -2206,6 +1622,128 @@ fn smithy_path(path: &str) -> Option<SmithyPath<'_>> {
     Some(SmithyPath { service_id, operation })
 }
 
+#[cfg(test)]
+mod reduced_feature_tests {
+    use super::{AwsJsonErrorBody, EdgeRouter};
+    use crate::test_runtime;
+    use aws::ServiceName;
+    use ciborium::from_reader;
+
+    fn router_with_services(
+        label: &str,
+        enabled_services: &[ServiceName],
+    ) -> EdgeRouter {
+        test_runtime::router_with_services(label, enabled_services)
+    }
+
+    fn split_response(response: &[u8]) -> (&str, Vec<(&str, &str)>, &[u8]) {
+        let body_start = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response should contain header terminator");
+        let header_text = std::str::from_utf8(&response[..body_start])
+            .expect("headers should be UTF-8");
+        let mut lines = header_text.split("\r\n");
+        let status =
+            lines.next().expect("response should include status line");
+        let headers = lines
+            .map(|line| {
+                let (name, value) = line
+                    .split_once(": ")
+                    .expect("headers should include a separator");
+                (name, value)
+            })
+            .collect();
+
+        (status, headers, &response[body_start + 4..])
+    }
+
+    fn header_value<'a>(
+        headers: &'a [(&'a str, &'a str)],
+        name: &str,
+    ) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, value)| *value)
+    }
+
+    #[test]
+    fn disabled_known_query_service_returns_service_not_available() {
+        let body = "Action=CreateQueue&Version=2012-11-05&QueueName=demo";
+        let response = router_with_services(
+            "disabled-known-query-service",
+            &[ServiceName::Iam],
+        )
+        .handle_bytes(
+            format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+        let body =
+            std::str::from_utf8(body).expect("query body should be UTF-8");
+
+        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        assert_eq!(header_value(&headers, "content-type"), Some("text/xml"));
+        assert!(body.contains("<Code>ServiceNotAvailableException</Code>"));
+        assert!(body.contains("Service sqs is not enabled."));
+    }
+
+    #[test]
+    fn disabled_known_json_service_returns_service_not_available() {
+        let response = router_with_services(
+            "disabled-known-json-service",
+            &[ServiceName::Sqs],
+        )
+        .handle_bytes(
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nContent-Type: application/x-amz-json-1.1\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+        let body: AwsJsonErrorBody = serde_json::from_slice(body)
+            .expect("body should be a JSON AWS error");
+
+        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        assert_eq!(
+            header_value(&headers, "content-type"),
+            Some("application/x-amz-json-1.1")
+        );
+        assert_eq!(body.error_type, "ServiceNotAvailableException");
+        assert!(body.message.contains("ssm"));
+    }
+
+    #[test]
+    fn disabled_known_smithy_service_returns_service_not_available() {
+        let response = router_with_services(
+            "disabled-known-smithy-service",
+            &[ServiceName::Iam],
+        )
+        .handle_bytes(
+            b"POST /service/CloudWatch/operation/GetMetricData HTTP/1.1\r\nHost: localhost\r\nSmithy-Protocol: rpc-v2-cbor\r\nContent-Type: application/cbor\r\nContent-Length: 1\r\n\r\n\xa0",
+        );
+        let response_bytes = response.to_http_bytes();
+        let (status, headers, body) = split_response(&response_bytes);
+        let body: AwsJsonErrorBody =
+            from_reader(body).expect("body should be a CBOR AWS error");
+
+        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        assert_eq!(
+            header_value(&headers, "content-type"),
+            Some("application/cbor")
+        );
+        assert_eq!(
+            header_value(&headers, "smithy-protocol"),
+            Some("rpc-v2-cbor")
+        );
+        assert_eq!(body.error_type, "ServiceNotAvailableException");
+        assert!(body.message.contains("cloudwatch"));
+    }
+}
+
 #[cfg(all(test, feature = "all-services"))]
 mod tests {
     use super::{
@@ -2262,7 +1800,10 @@ mod tests {
     }
 
     fn router() -> EdgeRouter {
-        test_runtime::router("http-runtime")
+        test_runtime::build_router(
+            edge_runtime::TestRuntimeBuilder::new("http-runtime"),
+            "http-runtime",
+        )
     }
 
     fn router_with_services(enabled: &[ServiceName]) -> EdgeRouter {

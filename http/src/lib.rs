@@ -40,6 +40,7 @@ mod query;
 #[cfg(feature = "rds")]
 mod rds;
 mod request;
+mod routing;
 mod runtime;
 #[cfg(feature = "s3")]
 mod s3;

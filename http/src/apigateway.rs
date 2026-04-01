@@ -913,13 +913,15 @@ mod tests {
     use crate::request::HttpRequest;
     use crate::runtime::EdgeRouter;
     use crate::test_runtime;
+    use edge_runtime::TestRuntimeBuilder;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn router() -> EdgeRouter {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        test_runtime::router(&format!("http-apigw-tests-{id}"))
+        let label = format!("http-apigw-tests-{id}");
+        test_runtime::build_router(TestRuntimeBuilder::new(&label), &label)
     }
 
     fn split_response(response: &[u8]) -> (&str, Vec<(&str, &str)>, &str) {

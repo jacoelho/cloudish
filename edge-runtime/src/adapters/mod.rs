@@ -33,6 +33,7 @@ pub use runtime::{
 pub use runtime::{
     ThreadStepFunctionsExecutionSpawner, ThreadStepFunctionsSleeper,
 };
+#[cfg(feature = "eventbridge")]
 pub(crate) use runtime::{
     ThreadWorkQueue, ThreadWorkQueueShutdownOutcome, ThreadWorkQueueStopToken,
 };

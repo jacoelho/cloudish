@@ -15,7 +15,14 @@ use apigateway::{
 use aws::BackgroundScheduler;
 #[cfg(any(feature = "eventbridge", feature = "lambda"))]
 use aws::InfrastructureError;
+#[cfg(any(feature = "eventbridge", feature = "s3"))]
 use aws::ServiceName;
+#[cfg(any(
+    feature = "apigateway",
+    feature = "eventbridge",
+    feature = "s3",
+    feature = "sns"
+))]
 use aws::{Arn, HttpForwardRequest, HttpForwarder, SharedAdvertisedEdge};
 #[cfg(feature = "sns")]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -51,7 +58,16 @@ use sns::{
 };
 #[cfg(any(feature = "eventbridge", feature = "s3", feature = "sns"))]
 use sqs::{SendMessageInput, SqsService};
+#[cfg(any(feature = "eventbridge", feature = "s3", feature = "sns"))]
 use std::collections::BTreeMap;
+#[cfg(any(
+    feature = "apigateway",
+    feature = "eventbridge",
+    feature = "lambda",
+    feature = "s3",
+    feature = "sns",
+    feature = "step-functions"
+))]
 use std::sync::Arc;
 #[cfg(feature = "sns")]
 use std::sync::OnceLock;
@@ -639,9 +655,7 @@ impl EventBridgeDeliveryDispatcher for EventBridgeDispatcher {
         deliveries: Vec<EventBridgePlannedDelivery>,
     ) -> Result<(), EventBridgeError> {
         self.delivery_worker.enqueue(deliveries).map_err(|error| {
-            EventBridgeError::InternalFailure {
-                message: error.to_string(),
-            }
+            EventBridgeError::InternalFailure { message: error.to_string() }
         })
     }
 }
