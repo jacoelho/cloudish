@@ -35,8 +35,9 @@ async fn wait_for_execution_completion(
     execution_arn: &str,
 ) -> aws_sdk_sfn::operation::describe_execution::DescribeExecutionOutput {
     let mut last_described = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
 
-    for _ in 0..40 {
+    while tokio::time::Instant::now() < deadline {
         let described = sfn
             .describe_execution()
             .execution_arn(execution_arn)

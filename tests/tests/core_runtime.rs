@@ -110,30 +110,20 @@ async fn health_and_status_endpoints_return_internal_json() {
         .expect("health response body should be valid JSON");
     let status_json: Value = serde_json::from_slice(status_body)
         .expect("status response body should be valid JSON");
-    let enabled_services = status_json
-        .get("enabledServices")
-        .expect("enabledServices should exist")
-        .as_array()
-        .expect("enabledServices should be an array");
 
     assert_eq!(
         health_json.get("status").expect("health status should exist"),
         "ok"
     );
     assert_eq!(
-        health_json
-            .get("enabledServices")
-            .expect("health enabledServices should exist")
-            .as_u64(),
-        Some(enabled_services.len() as u64)
-    );
-    assert_eq!(status_json.get("ready").expect("ready should exist"), true);
-    assert_eq!(
         status_json
-            .get("serviceCount")
-            .expect("serviceCount should exist")
-            .as_u64(),
-        Some(enabled_services.len() as u64)
+            .get("defaultAccount")
+            .expect("defaultAccount should exist"),
+        "000000000000"
+    );
+    assert_eq!(
+        status_json.get("defaultRegion").expect("defaultRegion should exist"),
+        "eu-west-2"
     );
     assert!(
         status_json
@@ -141,6 +131,14 @@ async fn health_and_status_endpoints_return_internal_json() {
             .expect("stateDirectory should exist")
             .is_string()
     );
+    assert_eq!(health_json.as_object().map(|object| object.len()), Some(1));
+    assert_eq!(status_json.as_object().map(|object| object.len()), Some(3));
+    assert!(health_json.get("defaultAccount").is_none());
+    assert!(health_json.get("defaultRegion").is_none());
+    assert!(status_json.get("status").is_none());
+    assert!(status_json.get("ready").is_none());
+    assert!(status_json.get("enabledServices").is_none());
+    assert!(status_json.get("serviceCount").is_none());
     assert!(runtime.state_directory().exists());
 }
 

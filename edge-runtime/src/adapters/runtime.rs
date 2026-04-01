@@ -9,7 +9,6 @@ use std::sync::mpsc;
 use std::sync::{Arc, LockResult, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
-#[cfg(feature = "step-functions")]
 use step_functions::{
     StepFunctionsExecutionSpawner, StepFunctionsSleeper,
     StepFunctionsSpawnHandle,
@@ -324,11 +323,9 @@ impl Drop for ThreadScheduledTask {
     }
 }
 
-#[cfg(feature = "step-functions")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ThreadStepFunctionsExecutionSpawner;
 
-#[cfg(feature = "step-functions")]
 impl StepFunctionsExecutionSpawner for ThreadStepFunctionsExecutionSpawner {
     fn spawn_paused(
         &self,
@@ -358,13 +355,11 @@ impl StepFunctionsExecutionSpawner for ThreadStepFunctionsExecutionSpawner {
     }
 }
 
-#[cfg(feature = "step-functions")]
 #[derive(Debug)]
 struct ThreadStepFunctionsSpawnHandle {
     start_tx: Option<mpsc::Sender<bool>>,
 }
 
-#[cfg(feature = "step-functions")]
 impl StepFunctionsSpawnHandle for ThreadStepFunctionsSpawnHandle {
     fn start(mut self: Box<Self>) {
         if let Some(start_tx) = self.start_tx.take() {
@@ -373,7 +368,6 @@ impl StepFunctionsSpawnHandle for ThreadStepFunctionsSpawnHandle {
     }
 }
 
-#[cfg(feature = "step-functions")]
 impl Drop for ThreadStepFunctionsSpawnHandle {
     fn drop(&mut self) {
         if let Some(start_tx) = self.start_tx.take() {
@@ -382,11 +376,9 @@ impl Drop for ThreadStepFunctionsSpawnHandle {
     }
 }
 
-#[cfg(feature = "step-functions")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ThreadStepFunctionsSleeper;
 
-#[cfg(feature = "step-functions")]
 impl StepFunctionsSleeper for ThreadStepFunctionsSleeper {
     fn sleep(&self, duration: Duration) -> Result<(), InfrastructureError> {
         thread::sleep(duration);

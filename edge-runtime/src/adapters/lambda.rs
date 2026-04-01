@@ -399,14 +399,20 @@ fn wait_for_child_output(
         InfrastructureError::container(
             "wait",
             function_name,
-            io::Error::new(io::ErrorKind::NotFound, "lambda stdout pipe not configured"),
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "lambda stdout pipe not configured",
+            ),
         )
     })?;
     let mut stderr = child.stderr.take().ok_or_else(|| {
         InfrastructureError::container(
             "wait",
             function_name,
-            io::Error::new(io::ErrorKind::NotFound, "lambda stderr pipe not configured"),
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "lambda stderr pipe not configured",
+            ),
         )
     })?;
     let stdout_reader = thread::spawn(move || {
@@ -439,7 +445,11 @@ fn wait_for_child_output(
         })? {
             Some(_) => {
                 let status = child.wait().map_err(|source| {
-                    InfrastructureError::container("wait", function_name, source)
+                    InfrastructureError::container(
+                        "wait",
+                        function_name,
+                        source,
+                    )
                 })?;
                 let stdout = stdout_reader
                     .join()
@@ -480,11 +490,7 @@ fn wait_for_child_output(
                         )
                     })?;
 
-                return Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
+                return Ok(std::process::Output { status, stdout, stderr });
             }
             None => thread::sleep(
                 ProcessLambdaExecutor::CANCELLATION_POLL_INTERVAL,

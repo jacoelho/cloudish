@@ -223,6 +223,7 @@ fn dependency_contracts() -> BTreeMap<&'static str, PackageContract> {
             "dynamodb",
             PackageContract { normal: &["aws", "storage"], dev: &[] },
         ),
+        ("edge-protocol", PackageContract { normal: &[], dev: &[] }),
         (
             "edge-runtime",
             PackageContract {
@@ -272,6 +273,7 @@ fn dependency_contracts() -> BTreeMap<&'static str, PackageContract> {
                     "cloudwatch",
                     "cognito",
                     "dynamodb",
+                    "edge-protocol",
                     "edge-runtime",
                     "elasticache",
                     "eventbridge",
