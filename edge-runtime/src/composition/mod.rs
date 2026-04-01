@@ -637,8 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn api_gateway_integration_executor_rejects_missing_lambda_dependency()
-    {
+    fn api_gateway_integration_executor_rejects_missing_lambda_dependency() {
         let executor = ApiGatewayIntegrationExecutor::new(None, None);
         let invocation = ExecuteApiInvocation::new(
             "api-id".to_owned(),

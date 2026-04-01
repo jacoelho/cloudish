@@ -1051,7 +1051,8 @@ impl StepFunctionsService {
         let mut suffix = count + 1;
         loop {
             let name = format!("execution-{suffix}");
-            let key = ExecutionStorageKey::new(scope, state_machine_name, &name);
+            let key =
+                ExecutionStorageKey::new(scope, state_machine_name, &name);
             if self.execution_store.get(&key).is_none()
                 && !pending_executions.contains(&key)
             {
@@ -3927,9 +3928,7 @@ mod tests {
         assert!(matches!(
             service.describe_execution(
                 &scope(),
-                DescribeExecutionInput {
-                    execution_arn,
-                },
+                DescribeExecutionInput { execution_arn },
             ),
             Err(StepFunctionsError::ExecutionDoesNotExist { .. })
         ));
@@ -4099,9 +4098,7 @@ mod tests {
         assert!(matches!(
             service.describe_execution(
                 &step_functions_scope,
-                DescribeExecutionInput {
-                    execution_arn,
-                },
+                DescribeExecutionInput { execution_arn },
             ),
             Err(StepFunctionsError::ExecutionDoesNotExist { .. })
         ));
