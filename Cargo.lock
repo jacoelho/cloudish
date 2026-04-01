@@ -1707,6 +1707,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "edge-protocol"
+version = "0.1.0"
+dependencies = [
+ "httpdate",
+ "serde_json",
+]
+
+[[package]]
 name = "edge-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2186,6 +2194,7 @@ dependencies = [
  "cloudwatch",
  "cognito",
  "dynamodb",
+ "edge-protocol",
  "edge-runtime",
  "elasticache",
  "eventbridge",

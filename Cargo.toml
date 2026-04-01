@@ -3,6 +3,7 @@ members = [
     "app",
     "auth",
     "aws",
+    "edge-protocol",
     "edge-runtime",
     "http",
     "services/apigateway",

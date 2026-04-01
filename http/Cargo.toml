@@ -60,6 +60,7 @@ cloudformation = { path = "../services/cloudformation", optional = true }
 cloudwatch = { path = "../services/cloudwatch", optional = true }
 cognito = { path = "../services/cognito", optional = true }
 dynamodb = { path = "../services/dynamodb", optional = true }
+edge-protocol = { path = "../edge-protocol" }
 elasticache = { path = "../services/elasticache", optional = true }
 eventbridge = { path = "../services/eventbridge", optional = true }
 edge-runtime = { path = "../edge-runtime", default-features = false }
