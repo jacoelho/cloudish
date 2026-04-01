@@ -67,7 +67,7 @@ impl EdgeResponse {
         let mut response = format!(
             "HTTP/1.1 {} {}\r\n",
             self.status_code,
-            reason_phrase(self.status_code)
+            http_reason_phrase(self.status_code)
         )
         .into_bytes();
 
@@ -88,7 +88,7 @@ impl EdgeResponse {
     }
 }
 
-fn reason_phrase(status_code: u16) -> &'static str {
+pub fn http_reason_phrase(status_code: u16) -> &'static str {
     match status_code {
         200 => "OK",
         201 => "Created",
@@ -101,9 +101,48 @@ fn reason_phrase(status_code: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        412 => "Precondition Failed",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EdgeResponse;
+
+    fn status_line(response: &[u8]) -> &str {
+        let line_end = response
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .expect("response should contain a status line terminator");
+        std::str::from_utf8(&response[..line_end])
+            .expect("status line should be UTF-8")
+    }
+
+    #[test]
+    fn edge_response_serializes_extended_reason_phrases() {
+        let cases = [
+            (412, "HTTP/1.1 412 Precondition Failed"),
+            (413, "HTTP/1.1 413 Payload Too Large"),
+            (415, "HTTP/1.1 415 Unsupported Media Type"),
+            (429, "HTTP/1.1 429 Too Many Requests"),
+            (502, "HTTP/1.1 502 Bad Gateway"),
+        ];
+
+        for (status_code, expected_status_line) in cases {
+            let response =
+                EdgeResponse::bytes(status_code, "text/plain", Vec::new());
+            assert_eq!(
+                status_line(&response.to_http_bytes()),
+                expected_status_line
+            );
+        }
     }
 }

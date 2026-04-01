@@ -16,4 +16,4 @@ mod request;
 mod response;
 
 pub use request::{EdgeRequest, HttpRequest, RequestParseError};
-pub use response::EdgeResponse;
+pub use response::{EdgeResponse, http_reason_phrase};
