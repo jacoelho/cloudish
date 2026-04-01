@@ -14,9 +14,9 @@ use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+use test_support::send_http_request_bytes;
 use tests::common::runtime;
 use tests::common::sdk;
-use test_support::send_http_request_bytes;
 use time::OffsetDateTime;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -65,7 +65,6 @@ async fn given_a_signed_aws_chunked_put_object_when_sent_over_raw_http_then_the_
     .await
     .expect("raw request task should complete")
     .expect("signed aws-chunked request should receive a response");
-
 
     let object = client
         .get_object()

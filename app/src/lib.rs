@@ -871,7 +871,8 @@ mod tests {
     }
 
     #[test]
-    fn prepare_for_serve_ignores_existing_tracing_subscriber_when_wire_log_disabled() {
+    fn prepare_for_serve_ignores_existing_tracing_subscriber_when_wire_log_disabled()
+     {
         let server = CloudishApp::from_runtime_defaults(runtime_defaults(
             "wire-log-disabled-existing-subscriber",
         ))
@@ -1218,7 +1219,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_listener_with_wire_log_disabled_ignores_existing_tracing_subscriber()
-    {
+     {
         let server = CloudishApp::from_runtime_defaults(runtime_defaults(
             "wire-log-disabled-existing-subscriber-serving",
         ))
@@ -1241,9 +1242,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         shutdown_tx.send(()).expect("server should still be running");
-        let result = handle
-            .await
-            .expect("server task should complete");
+        let result = handle.await.expect("server task should complete");
         result.expect("server should stop cleanly");
     }
 
