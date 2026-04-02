@@ -8,22 +8,21 @@ use aws::{
     AccountId, AdvertisedEdge, Arn, AwsError, AwsErrorFamily, RequestContext,
     ServiceName,
 };
-use base64::Engine as _;
 use edge_runtime::SqsRequestRuntime;
 use serde_json::{Map, Value, json};
 use services::{
-    BatchFailure, CancelMessageMoveTaskInput,
-    ChangeMessageVisibilityBatchEntryInput,
-    ChangeMessageVisibilityBatchOutput, CreateQueueInput,
-    DeleteMessageBatchEntryInput, DeleteMessageBatchOutput,
-    ListMessageMoveTasksInput, ListMessageMoveTasksOutput, ListQueuesInput,
-    ReceiveMessageInput, ReceivedMessage, SendMessageBatchEntryInput,
-    SendMessageBatchOutput, SendMessageInput, SqsAddPermissionInput, SqsError,
-    SqsMessageAttributeValue, SqsQueueIdentity, SqsRemovePermissionInput,
-    SqsScope, SqsService, StartMessageMoveTaskInput,
+    CancelMessageMoveTaskInput, ChangeMessageVisibilityBatchEntryInput,
+    CreateQueueInput, DeleteMessageBatchEntryInput, ListMessageMoveTasksInput,
+    ListQueuesInput, ReceiveMessageInput, SendMessageBatchEntryInput,
+    SendMessageInput, SqsAddPermissionInput, SqsError, SqsQueueIdentity,
+    SqsRemovePermissionInput, SqsScope, SqsService, StartMessageMoveTaskInput,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+mod json_protocol;
+mod message_attributes;
+mod query_protocol;
 
 const REQUEST_ID: &str = "0000000000000000";
 const SQS_XMLNS: &str = "http://queue.amazonaws.com/doc/2012-11-05/";
@@ -231,20 +230,22 @@ pub(crate) fn handle_query(
                             &params,
                             "DelaySeconds",
                         )?,
-                        message_attributes: query_message_attributes(
-                            &params,
-                            "MessageAttribute.",
-                        )?,
+                        message_attributes:
+                            message_attributes::query_message_attributes(
+                                &params,
+                                "MessageAttribute.",
+                            )?,
                         message_deduplication_id: params
                             .optional("MessageDeduplicationId")
                             .map(str::to_owned),
                         message_group_id: params
                             .optional("MessageGroupId")
                             .map(str::to_owned),
-                        message_system_attributes: query_message_attributes(
-                            &params,
-                            "MessageSystemAttribute.",
-                        )?,
+                        message_system_attributes:
+                            message_attributes::query_message_attributes(
+                                &params,
+                                "MessageSystemAttribute.",
+                            )?,
                     },
                 )
                 .map_err(|error| error.to_aws_error())?;
@@ -283,7 +284,7 @@ pub(crate) fn handle_query(
 
             Ok(response_with_result(
                 action,
-                &query_send_message_batch_result_xml(&batch),
+                &query_protocol::query_send_message_batch_result_xml(&batch),
             ))
         }
         "ReceiveMessage" => {
@@ -327,7 +328,7 @@ pub(crate) fn handle_query(
 
             Ok(response_with_result(
                 action,
-                &query_received_messages_xml(&messages),
+                &query_protocol::query_received_messages_xml(&messages),
             ))
         }
         "DeleteMessage" => {
@@ -356,7 +357,7 @@ pub(crate) fn handle_query(
 
             Ok(response_with_result(
                 action,
-                &query_delete_message_batch_result_xml(&batch),
+                &query_protocol::query_delete_message_batch_result_xml(&batch),
             ))
         }
         "ChangeMessageVisibility" => {
@@ -391,7 +392,9 @@ pub(crate) fn handle_query(
 
             Ok(response_with_result(
                 action,
-                &query_change_visibility_batch_result_xml(&batch),
+                &query_protocol::query_change_visibility_batch_result_xml(
+                    &batch,
+                ),
             ))
         }
         "ListDeadLetterSourceQueues" => {
@@ -457,7 +460,7 @@ pub(crate) fn handle_query(
 
             Ok(response_with_result(
                 action,
-                &query_list_message_move_tasks_xml(&tasks),
+                &query_protocol::query_list_message_move_tasks_xml(&tasks),
             ))
         }
         "CancelMessageMoveTask" => {
@@ -707,10 +710,11 @@ pub(crate) fn handle_json(
                             &body,
                             "DelaySeconds",
                         )?,
-                        message_attributes: json_message_attributes_field(
-                            &body,
-                            "MessageAttributes",
-                        )?,
+                        message_attributes:
+                            message_attributes::json_message_attributes_field(
+                                &body,
+                                "MessageAttributes",
+                            )?,
                         message_deduplication_id: optional_string_json(
                             &body,
                             "MessageDeduplicationId",
@@ -722,7 +726,7 @@ pub(crate) fn handle_json(
                         )
                         .map(str::to_owned),
                         message_system_attributes:
-                            json_message_attributes_field(
+                            message_attributes::json_message_attributes_field(
                                 &body,
                                 "MessageSystemAttributes",
                             )?,
@@ -775,7 +779,7 @@ pub(crate) fn handle_json(
                 )
                 .map_err(|error| error.to_aws_error())?;
 
-            json_send_message_batch_result(&batch)
+            json_protocol::json_send_message_batch_result(&batch)
         }
         "ReceiveMessage" => {
             let queue = queue_identity_from_request(
@@ -822,7 +826,7 @@ pub(crate) fn handle_json(
                 )
                 .map_err(|error| error.to_aws_error())?;
 
-            json!({ "Messages": json_received_messages(&messages) })
+            json!({ "Messages": json_protocol::json_received_messages(&messages) })
         }
         "DeleteMessage" => {
             let queue = queue_identity_from_request(
@@ -851,7 +855,7 @@ pub(crate) fn handle_json(
                 )
                 .map_err(|error| error.to_aws_error())?;
 
-            json_delete_message_batch_result(&batch)
+            json_protocol::json_delete_message_batch_result(&batch)
         }
         "ChangeMessageVisibility" => {
             let queue = queue_identity_from_request(
@@ -881,7 +885,7 @@ pub(crate) fn handle_json(
                 )
                 .map_err(|error| error.to_aws_error())?;
 
-            json_change_visibility_batch_result(&batch)
+            json_protocol::json_change_visibility_batch_result(&batch)
         }
         "ListDeadLetterSourceQueues" => {
             let queue = queue_identity_from_request(
@@ -939,7 +943,7 @@ pub(crate) fn handle_json(
                 })
                 .map_err(|error| error.to_aws_error())?;
 
-            json!({ "Results": json_list_message_move_tasks(&tasks) })
+            json!({ "Results": json_protocol::json_list_message_move_tasks(&tasks) })
         }
         "CancelMessageMoveTask" => {
             let cancelled = sqs
@@ -1148,7 +1152,7 @@ fn query_send_message_batch_entries(
             body: params.required(&body_name)?.to_owned(),
             delay_seconds: optional_u32_query(params, &delay_name)?,
             id: id.to_owned(),
-            message_attributes: query_message_attributes(
+            message_attributes: message_attributes::query_message_attributes(
                 params,
                 &format!("{prefix}.MessageAttribute."),
             )?,
@@ -1156,10 +1160,11 @@ fn query_send_message_batch_entries(
                 .optional(&dedup_name)
                 .map(str::to_owned),
             message_group_id: params.optional(&group_name).map(str::to_owned),
-            message_system_attributes: query_message_attributes(
-                params,
-                &format!("{prefix}.MessageSystemAttribute."),
-            )?,
+            message_system_attributes:
+                message_attributes::query_message_attributes(
+                    params,
+                    &format!("{prefix}.MessageSystemAttribute."),
+                )?,
         });
     }
 
@@ -1418,231 +1423,6 @@ fn json_map_field(
     Ok(map)
 }
 
-fn json_message_attributes_field(
-    body: &Value,
-    field: &str,
-) -> Result<BTreeMap<String, SqsMessageAttributeValue>, AwsError> {
-    let Some(value) = body.get(field) else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(entries) = value.as_object() else {
-        return Err(invalid_json_parameter(field));
-    };
-    let mut attributes = BTreeMap::new();
-    for (name, value) in entries {
-        let Some(entry) = value.as_object() else {
-            return Err(invalid_json_parameter(field));
-        };
-        let Some(data_type) = entry.get("DataType").and_then(Value::as_str)
-        else {
-            return Err(invalid_json_parameter(field));
-        };
-        let string_list_values = entry
-            .get("StringListValues")
-            .map(json_string_list)
-            .transpose()?
-            .unwrap_or_default();
-        let binary_list_values = entry
-            .get("BinaryListValues")
-            .map(json_binary_list)
-            .transpose()?
-            .unwrap_or_default();
-        attributes.insert(
-            name.clone(),
-            SqsMessageAttributeValue {
-                binary_list_values,
-                binary_value: entry
-                    .get("BinaryValue")
-                    .map(json_binary_value)
-                    .transpose()?,
-                data_type: data_type.to_owned(),
-                string_list_values,
-                string_value: entry
-                    .get("StringValue")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            },
-        );
-    }
-
-    Ok(attributes)
-}
-
-fn json_string_list(value: &Value) -> Result<Vec<String>, AwsError> {
-    let Some(items) = value.as_array() else {
-        return Err(invalid_json_parameter("MessageAttributes"));
-    };
-
-    items
-        .iter()
-        .map(|item| {
-            item.as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| invalid_json_parameter("MessageAttributes"))
-        })
-        .collect()
-}
-
-fn json_binary_list(value: &Value) -> Result<Vec<Vec<u8>>, AwsError> {
-    let Some(items) = value.as_array() else {
-        return Err(invalid_json_parameter("MessageAttributes"));
-    };
-
-    items.iter().map(json_binary_value).collect()
-}
-
-fn json_binary_value(value: &Value) -> Result<Vec<u8>, AwsError> {
-    let Some(value) = value.as_str() else {
-        return Err(invalid_json_parameter("MessageAttributes"));
-    };
-
-    base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .map_err(|_| invalid_json_parameter("MessageAttributes"))
-}
-
-#[derive(Default)]
-struct QueryMessageAttributeParts {
-    binary_list_values: BTreeMap<usize, Vec<u8>>,
-    binary_value: Option<Vec<u8>>,
-    data_type: Option<String>,
-    name: Option<String>,
-    string_list_values: BTreeMap<usize, String>,
-    string_value: Option<String>,
-}
-
-fn query_message_attributes(
-    params: &QueryParameters,
-    prefix: &str,
-) -> Result<BTreeMap<String, SqsMessageAttributeValue>, AwsError> {
-    let mut indexed: BTreeMap<usize, QueryMessageAttributeParts> =
-        BTreeMap::new();
-    for (name, value) in params.iter() {
-        let Some(remainder) = name.strip_prefix(prefix) else {
-            continue;
-        };
-        let Some((index, field)) = remainder.split_once('.') else {
-            return Err(invalid_json_parameter(prefix));
-        };
-        let index = parse_query_attribute_list_index(index, prefix)?;
-        let entry = indexed.entry(index).or_default();
-        match field {
-            "Name" => entry.name = Some(value.to_owned()),
-            "Value.DataType" => entry.data_type = Some(value.to_owned()),
-            "Value.StringValue" => entry.string_value = Some(value.to_owned()),
-            "Value.BinaryValue" => {
-                entry.binary_value = Some(
-                    base64::engine::general_purpose::STANDARD
-                        .decode(value)
-                        .map_err(|_| invalid_json_parameter(prefix))?,
-                );
-            }
-            _ => {
-                if let Some(member) =
-                    field.strip_prefix("Value.StringListValue.")
-                {
-                    let index =
-                        parse_query_attribute_list_index(member, prefix)?;
-                    if entry
-                        .string_list_values
-                        .insert(index, value.to_owned())
-                        .is_some()
-                    {
-                        return Err(invalid_json_parameter(prefix));
-                    }
-                } else if let Some(member) =
-                    field.strip_prefix("Value.BinaryListValue.")
-                {
-                    let index =
-                        parse_query_attribute_list_index(member, prefix)?;
-                    let decoded = base64::engine::general_purpose::STANDARD
-                        .decode(value)
-                        .map_err(|_| invalid_json_parameter(prefix))?;
-                    if entry
-                        .binary_list_values
-                        .insert(index, decoded)
-                        .is_some()
-                    {
-                        return Err(invalid_json_parameter(prefix));
-                    }
-                }
-            }
-        }
-    }
-
-    collect_contiguous_query_indexed_values(indexed, prefix)?
-        .into_iter()
-        .map(|entry| {
-            let name =
-                entry.name.ok_or_else(|| invalid_json_parameter(prefix))?;
-            let data_type = entry
-                .data_type
-                .ok_or_else(|| invalid_json_parameter(prefix))?;
-            Ok((
-                name,
-                SqsMessageAttributeValue {
-                    binary_list_values: collect_query_attribute_list_values(
-                        entry.binary_list_values,
-                        prefix,
-                    )?,
-                    binary_value: entry.binary_value,
-                    data_type,
-                    string_list_values: collect_query_attribute_list_values(
-                        entry.string_list_values,
-                        prefix,
-                    )?,
-                    string_value: entry.string_value,
-                },
-            ))
-        })
-        .collect()
-}
-
-fn parse_query_attribute_list_index(
-    value: &str,
-    prefix: &str,
-) -> Result<usize, AwsError> {
-    let index =
-        value.parse::<usize>().map_err(|_| invalid_json_parameter(prefix))?;
-    if index == 0 {
-        return Err(invalid_json_parameter(prefix));
-    }
-
-    Ok(index)
-}
-
-fn collect_contiguous_query_indexed_values<T>(
-    mut values: BTreeMap<usize, T>,
-    prefix: &str,
-) -> Result<Vec<T>, AwsError> {
-    if values.is_empty() {
-        return Ok(Vec::new());
-    }
-    let Some(max_index) = values.keys().next_back().copied() else {
-        return Ok(Vec::new());
-    };
-    if values.len() != max_index {
-        return Err(invalid_json_parameter(prefix));
-    }
-
-    let mut items = Vec::with_capacity(max_index);
-    for index in 1..=max_index {
-        let Some(value) = values.remove(&index) else {
-            return Err(invalid_json_parameter(prefix));
-        };
-        items.push(value);
-    }
-
-    Ok(items)
-}
-
-fn collect_query_attribute_list_values<T: Clone>(
-    values: BTreeMap<usize, T>,
-    prefix: &str,
-) -> Result<Vec<T>, AwsError> {
-    collect_contiguous_query_indexed_values(values, prefix)
-}
-
 fn json_send_message_batch_entries(
     body: &Value,
 ) -> Result<Vec<SendMessageBatchEntryInput>, AwsError> {
@@ -1660,10 +1440,11 @@ fn json_send_message_batch_entries(
                 body: required_string_json(entry, "MessageBody")?,
                 delay_seconds: optional_u32_json(entry, "DelaySeconds")?,
                 id: required_string_json(entry, "Id")?,
-                message_attributes: json_message_attributes_field(
-                    entry,
-                    "MessageAttributes",
-                )?,
+                message_attributes:
+                    message_attributes::json_message_attributes_field(
+                        entry,
+                        "MessageAttributes",
+                    )?,
                 message_deduplication_id: optional_string_json(
                     entry,
                     "MessageDeduplicationId",
@@ -1674,10 +1455,11 @@ fn json_send_message_batch_entries(
                     "MessageGroupId",
                 )
                 .map(str::to_owned),
-                message_system_attributes: json_message_attributes_field(
-                    entry,
-                    "MessageSystemAttributes",
-                )?,
+                message_system_attributes:
+                    message_attributes::json_message_attributes_field(
+                        entry,
+                        "MessageSystemAttributes",
+                    )?,
             })
         })
         .collect()
@@ -1727,430 +1509,6 @@ fn json_change_visibility_batch_entries(
             })
         })
         .collect()
-}
-
-fn json_batch_failures(failed: &[BatchFailure]) -> Vec<Value> {
-    failed
-        .iter()
-        .map(|failure| {
-            json!({
-                "Code": failure.code,
-                "Id": failure.id,
-                "Message": failure.message,
-                "SenderFault": failure.sender_fault,
-            })
-        })
-        .collect()
-}
-
-fn json_send_message_batch_result(batch: &SendMessageBatchOutput) -> Value {
-    let successful = batch
-        .successful
-        .iter()
-        .map(|entry| {
-            let mut value = json!({
-                "Id": entry.id,
-                "MD5OfMessageBody": entry.md5_of_message_body,
-                "MessageId": entry.message_id,
-            });
-            if let Some(md5_of_message_attributes) =
-                &entry.md5_of_message_attributes
-                && let Some(object) = value.as_object_mut()
-            {
-                object.insert(
-                    "MD5OfMessageAttributes".to_owned(),
-                    Value::String(md5_of_message_attributes.clone()),
-                );
-            }
-            if let Some(md5_of_message_system_attributes) =
-                &entry.md5_of_message_system_attributes
-                && let Some(object) = value.as_object_mut()
-            {
-                object.insert(
-                    "MD5OfMessageSystemAttributes".to_owned(),
-                    Value::String(md5_of_message_system_attributes.clone()),
-                );
-            }
-            if let Some(sequence_number) = &entry.sequence_number
-                && let Some(object) = value.as_object_mut()
-            {
-                object.insert(
-                    "SequenceNumber".to_owned(),
-                    Value::String(sequence_number.clone()),
-                );
-            }
-            value
-        })
-        .collect::<Vec<_>>();
-
-    json!({
-        "Failed": json_batch_failures(&batch.failed),
-        "Successful": successful,
-    })
-}
-
-fn json_delete_message_batch_result(
-    batch: &DeleteMessageBatchOutput,
-) -> Value {
-    let successful = batch
-        .successful
-        .iter()
-        .map(|entry| json!({ "Id": entry.id }))
-        .collect::<Vec<_>>();
-
-    json!({
-        "Failed": json_batch_failures(&batch.failed),
-        "Successful": successful,
-    })
-}
-
-fn json_change_visibility_batch_result(
-    batch: &ChangeMessageVisibilityBatchOutput,
-) -> Value {
-    let successful = batch
-        .successful
-        .iter()
-        .map(|entry| json!({ "Id": entry.id }))
-        .collect::<Vec<_>>();
-
-    json!({
-        "Failed": json_batch_failures(&batch.failed),
-        "Successful": successful,
-    })
-}
-
-fn query_list_message_move_tasks_xml(
-    tasks: &ListMessageMoveTasksOutput,
-) -> String {
-    let mut xml = XmlBuilder::new();
-    for task in &tasks.results {
-        xml = xml.start("Result", None);
-        if let Some(task_handle) = task.task_handle.as_deref() {
-            xml = xml.elem("TaskHandle", task_handle);
-        }
-        xml = xml
-            .elem("Status", &task.status)
-            .elem("SourceArn", &task.source_arn)
-            .elem(
-                "ApproximateNumberOfMessagesMoved",
-                &task.approximate_number_of_messages_moved.to_string(),
-            )
-            .elem("StartedTimestamp", &task.started_timestamp.to_string());
-        if let Some(destination_arn) = task.destination_arn.as_deref() {
-            xml = xml.elem("DestinationArn", destination_arn);
-        }
-        if let Some(max_number_of_messages_per_second) =
-            task.max_number_of_messages_per_second
-        {
-            xml = xml.elem(
-                "MaxNumberOfMessagesPerSecond",
-                &max_number_of_messages_per_second.to_string(),
-            );
-        }
-        if let Some(approximate_number_of_messages_to_move) =
-            task.approximate_number_of_messages_to_move
-        {
-            xml = xml.elem(
-                "ApproximateNumberOfMessagesToMove",
-                &approximate_number_of_messages_to_move.to_string(),
-            );
-        }
-        if let Some(failure_reason) = task.failure_reason.as_deref() {
-            xml = xml.elem("FailureReason", failure_reason);
-        }
-        xml = xml.end("Result");
-    }
-
-    xml.build()
-}
-
-fn query_received_messages_xml(messages: &[ReceivedMessage]) -> String {
-    let mut xml = XmlBuilder::new();
-    for message in messages {
-        xml = xml
-            .start("Message", None)
-            .elem("MessageId", &message.message_id)
-            .elem("ReceiptHandle", &message.receipt_handle)
-            .elem("MD5OfBody", &message.md5_of_body)
-            .elem("Body", &message.body);
-        if let Some(md5_of_message_attributes) =
-            message.md5_of_message_attributes.as_deref()
-        {
-            xml =
-                xml.elem("MD5OfMessageAttributes", md5_of_message_attributes);
-        }
-
-        for (name, value) in &message.attributes {
-            xml = xml
-                .start("Attribute", None)
-                .elem("Name", name)
-                .elem("Value", value)
-                .end("Attribute");
-        }
-        for (name, value) in &message.message_attributes {
-            xml = xml
-                .start("MessageAttribute", None)
-                .elem("Name", name)
-                .raw(&query_message_attribute_value_xml(value))
-                .end("MessageAttribute");
-        }
-
-        xml = xml.end("Message");
-    }
-
-    xml.build()
-}
-
-fn query_batch_failures_xml(failures: &[BatchFailure]) -> String {
-    let mut xml = XmlBuilder::new();
-    for failure in failures {
-        xml = xml
-            .start("BatchResultErrorEntry", None)
-            .elem("Id", &failure.id)
-            .elem("SenderFault", &failure.sender_fault.to_string())
-            .elem("Code", &failure.code);
-        if !failure.message.is_empty() {
-            xml = xml.elem("Message", &failure.message);
-        }
-        xml = xml.end("BatchResultErrorEntry");
-    }
-
-    xml.build()
-}
-
-fn query_send_message_batch_result_xml(
-    batch: &SendMessageBatchOutput,
-) -> String {
-    let mut xml = XmlBuilder::new();
-    for entry in &batch.successful {
-        xml = xml
-            .start("SendMessageBatchResultEntry", None)
-            .elem("Id", &entry.id)
-            .elem("MessageId", &entry.message_id)
-            .elem("MD5OfMessageBody", &entry.md5_of_message_body);
-        if let Some(md5_of_message_attributes) =
-            &entry.md5_of_message_attributes
-        {
-            xml =
-                xml.elem("MD5OfMessageAttributes", md5_of_message_attributes);
-        }
-        if let Some(md5_of_message_system_attributes) =
-            &entry.md5_of_message_system_attributes
-        {
-            xml = xml.elem(
-                "MD5OfMessageSystemAttributes",
-                md5_of_message_system_attributes,
-            );
-        }
-        if let Some(sequence_number) = &entry.sequence_number {
-            xml = xml.elem("SequenceNumber", sequence_number);
-        }
-        xml = xml.end("SendMessageBatchResultEntry");
-    }
-
-    xml.raw(&query_batch_failures_xml(&batch.failed)).build()
-}
-
-fn query_delete_message_batch_result_xml(
-    batch: &DeleteMessageBatchOutput,
-) -> String {
-    let mut xml = XmlBuilder::new();
-    for entry in &batch.successful {
-        xml = xml
-            .start("DeleteMessageBatchResultEntry", None)
-            .elem("Id", &entry.id)
-            .end("DeleteMessageBatchResultEntry");
-    }
-
-    xml.raw(&query_batch_failures_xml(&batch.failed)).build()
-}
-
-fn query_change_visibility_batch_result_xml(
-    batch: &ChangeMessageVisibilityBatchOutput,
-) -> String {
-    let mut xml = XmlBuilder::new();
-    for entry in &batch.successful {
-        xml = xml
-            .start("ChangeMessageVisibilityBatchResultEntry", None)
-            .elem("Id", &entry.id)
-            .end("ChangeMessageVisibilityBatchResultEntry");
-    }
-
-    xml.raw(&query_batch_failures_xml(&batch.failed)).build()
-}
-
-fn json_received_messages(messages: &[ReceivedMessage]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|message| {
-            let mut value = json!({
-                "Attributes": message.attributes,
-                "Body": message.body,
-                "MD5OfBody": message.md5_of_body,
-                "MessageId": message.message_id,
-                "ReceiptHandle": message.receipt_handle,
-                "MessageAttributes": json_message_attributes_map(
-                    &message.message_attributes,
-                ),
-            });
-            if let Some(md5_of_message_attributes) =
-                &message.md5_of_message_attributes
-                && let Some(object) = value.as_object_mut()
-            {
-                object.insert(
-                    "MD5OfMessageAttributes".to_owned(),
-                    Value::String(md5_of_message_attributes.clone()),
-                );
-            }
-            value
-        })
-        .collect()
-}
-
-fn json_list_message_move_tasks(
-    tasks: &ListMessageMoveTasksOutput,
-) -> Vec<Value> {
-    tasks
-        .results
-        .iter()
-        .map(|task| {
-            let mut value = json!({
-                "ApproximateNumberOfMessagesMoved":
-                    task.approximate_number_of_messages_moved,
-                "SourceArn": task.source_arn,
-                "StartedTimestamp": task.started_timestamp,
-                "Status": task.status,
-            });
-            if let Some(object) = value.as_object_mut() {
-                if let Some(task_handle) = task.task_handle.as_ref() {
-                    object.insert(
-                        "TaskHandle".to_owned(),
-                        Value::String(task_handle.clone()),
-                    );
-                }
-                if let Some(destination_arn) = task.destination_arn.as_ref() {
-                    object.insert(
-                        "DestinationArn".to_owned(),
-                        Value::String(destination_arn.clone()),
-                    );
-                }
-                if let Some(max_number_of_messages_per_second) =
-                    task.max_number_of_messages_per_second
-                {
-                    object.insert(
-                        "MaxNumberOfMessagesPerSecond".to_owned(),
-                        json!(max_number_of_messages_per_second),
-                    );
-                }
-                if let Some(approximate_number_of_messages_to_move) =
-                    task.approximate_number_of_messages_to_move
-                {
-                    object.insert(
-                        "ApproximateNumberOfMessagesToMove".to_owned(),
-                        json!(approximate_number_of_messages_to_move),
-                    );
-                }
-                if let Some(failure_reason) = task.failure_reason.as_ref() {
-                    object.insert(
-                        "FailureReason".to_owned(),
-                        Value::String(failure_reason.clone()),
-                    );
-                }
-            }
-
-            value
-        })
-        .collect()
-}
-
-fn json_message_attributes_map(
-    attributes: &BTreeMap<String, SqsMessageAttributeValue>,
-) -> Value {
-    let mut object = Map::new();
-    for (name, value) in attributes {
-        object.insert(name.clone(), json_message_attribute_value(value));
-    }
-
-    Value::Object(object)
-}
-
-fn json_message_attribute_value(value: &SqsMessageAttributeValue) -> Value {
-    let mut object = Map::new();
-    object
-        .insert("DataType".to_owned(), Value::String(value.data_type.clone()));
-    if let Some(string_value) = value.string_value.as_ref() {
-        object.insert(
-            "StringValue".to_owned(),
-            Value::String(string_value.clone()),
-        );
-    }
-    if let Some(binary_value) = value.binary_value.as_ref() {
-        object.insert(
-            "BinaryValue".to_owned(),
-            Value::String(
-                base64::engine::general_purpose::STANDARD.encode(binary_value),
-            ),
-        );
-    }
-    if !value.string_list_values.is_empty() {
-        object.insert(
-            "StringListValues".to_owned(),
-            Value::Array(
-                value
-                    .string_list_values
-                    .iter()
-                    .cloned()
-                    .map(Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !value.binary_list_values.is_empty() {
-        object.insert(
-            "BinaryListValues".to_owned(),
-            Value::Array(
-                value
-                    .binary_list_values
-                    .iter()
-                    .map(|entry| {
-                        Value::String(
-                            base64::engine::general_purpose::STANDARD
-                                .encode(entry),
-                        )
-                    })
-                    .collect(),
-            ),
-        );
-    }
-
-    Value::Object(object)
-}
-
-fn query_message_attribute_value_xml(
-    value: &SqsMessageAttributeValue,
-) -> String {
-    let mut xml = XmlBuilder::new().start("Value", None);
-    xml = xml.elem("DataType", &value.data_type);
-    if let Some(string_value) = value.string_value.as_deref() {
-        xml = xml.elem("StringValue", string_value);
-    }
-    if let Some(binary_value) = value.binary_value.as_ref() {
-        xml = xml.elem(
-            "BinaryValue",
-            &base64::engine::general_purpose::STANDARD.encode(binary_value),
-        );
-    }
-    for string_value in &value.string_list_values {
-        xml = xml.elem("StringListValue", string_value);
-    }
-    for binary_value in &value.binary_list_values {
-        xml = xml.elem(
-            "BinaryListValue",
-            &base64::engine::general_purpose::STANDARD.encode(binary_value),
-        );
-    }
-
-    xml.end("Value").build()
 }
 
 fn response_with_result(action: &str, result: &str) -> String {
