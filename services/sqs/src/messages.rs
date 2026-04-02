@@ -2,6 +2,11 @@ use crate::attributes::{
     DEFAULT_DELAY_SECONDS, MAX_DELAY_SECONDS, MAX_VISIBILITY_TIMEOUT,
 };
 use crate::errors::SqsError;
+use crate::message_attributes::{
+    MessageAttributeValue, md5_of_message_attributes,
+    md5_of_message_system_attributes, message_attribute_size,
+    selected_message_attributes, validate_message_attribute_name,
+};
 use crate::queues::{
     CallbackSqsReceiveCancellation, QueueRecord, SqsReceiveWaitOutcome,
     SqsService, SqsWorld,
@@ -14,25 +19,59 @@ const MAX_NUMBER_OF_MESSAGES: u32 = 10;
 const MAX_RECEIVE_WAIT_TIME_SECONDS: u32 = 20;
 const MAX_BATCH_ENTRY_ID_LENGTH: usize = 80;
 const LONG_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const RECEIVE_REQUEST_ATTEMPT_ID_WINDOW_MILLIS: u64 = 5 * 60 * 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ListQueuesInput {
+    pub max_results: Option<u32>,
+    pub next_token: Option<String>,
+    pub queue_name_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaginatedQueues {
+    pub next_token: Option<String>,
+    pub queue_urls: Vec<SqsQueueIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListDeadLetterSourceQueuesInput {
+    pub max_results: Option<u32>,
+    pub next_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaginatedDeadLetterSourceQueues {
+    pub next_token: Option<String>,
+    pub queue_urls: Vec<SqsQueueIdentity>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendMessageInput {
     pub body: String,
     pub delay_seconds: Option<u32>,
+    pub message_attributes: BTreeMap<String, MessageAttributeValue>,
     pub message_deduplication_id: Option<String>,
     pub message_group_id: Option<String>,
+    pub message_system_attributes: BTreeMap<String, MessageAttributeValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendMessageOutput {
     pub md5_of_message_body: String,
+    pub md5_of_message_attributes: Option<String>,
+    pub md5_of_message_system_attributes: Option<String>,
     pub message_id: String,
     pub sequence_number: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReceiveMessageInput {
+    pub attribute_names: Vec<String>,
     pub max_number_of_messages: Option<u32>,
+    pub message_attribute_names: Vec<String>,
+    pub message_system_attribute_names: Vec<String>,
+    pub receive_request_attempt_id: Option<String>,
     pub visibility_timeout: Option<u32>,
     pub wait_time_seconds: Option<u32>,
 }
@@ -42,6 +81,8 @@ pub struct ReceivedMessage {
     pub attributes: BTreeMap<String, String>,
     pub body: String,
     pub md5_of_body: String,
+    pub md5_of_message_attributes: Option<String>,
+    pub message_attributes: BTreeMap<String, MessageAttributeValue>,
     pub message_id: String,
     pub receipt_handle: String,
 }
@@ -51,14 +92,18 @@ pub struct SendMessageBatchEntryInput {
     pub body: String,
     pub delay_seconds: Option<u32>,
     pub id: String,
+    pub message_attributes: BTreeMap<String, MessageAttributeValue>,
     pub message_deduplication_id: Option<String>,
     pub message_group_id: Option<String>,
+    pub message_system_attributes: BTreeMap<String, MessageAttributeValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendMessageBatchSuccess {
     pub id: String,
     pub md5_of_message_body: String,
+    pub md5_of_message_attributes: Option<String>,
+    pub md5_of_message_system_attributes: Option<String>,
     pub message_id: String,
     pub sequence_number: Option<String>,
 }
@@ -130,6 +175,19 @@ pub(crate) struct ReceiveMessageAttempt {
     pub(crate) received: Vec<ReceivedMessage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceiveSelectors {
+    pub(crate) message_attribute_names: Vec<String>,
+    pub(crate) system_attribute_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceiveAttemptRecord {
+    pub(crate) expires_at_millis: u64,
+    pub(crate) receipt_handles_by_message_id: BTreeMap<String, String>,
+    pub(crate) received: Vec<ReceivedMessage>,
+}
+
 impl SqsService {
     /// Stores a message in the target queue.
     ///
@@ -182,7 +240,7 @@ impl SqsService {
         let now_millis = timestamp_millis((self.time_source)());
         let first_attempt = self.receive_message_attempt(
             queue,
-            input,
+            input.clone(),
             now_millis,
             &mut next_receipt_handle,
         )?;
@@ -217,7 +275,7 @@ impl SqsService {
 
             let attempt = self.receive_message_attempt(
                 queue,
-                input,
+                input.clone(),
                 current_millis,
                 &mut next_receipt_handle,
             )?;
@@ -350,7 +408,7 @@ impl SqsService {
         let mut state =
             self.state.lock().unwrap_or_else(|poison| poison.into_inner());
 
-        state.purge_queue(queue)
+        state.purge_queue(queue, timestamp_millis((self.time_source)()))
     }
 }
 
@@ -386,8 +444,10 @@ impl SqsWorld {
                 SendMessageInput {
                     body: entry.body,
                     delay_seconds: entry.delay_seconds,
+                    message_attributes: entry.message_attributes,
                     message_deduplication_id: entry.message_deduplication_id,
                     message_group_id: entry.message_group_id,
+                    message_system_attributes: entry.message_system_attributes,
                 },
                 now_millis,
                 next_message_id(),
@@ -395,6 +455,10 @@ impl SqsWorld {
                 Ok(result) => successful.push(SendMessageBatchSuccess {
                     id: entry.id,
                     md5_of_message_body: result.md5_of_message_body,
+                    md5_of_message_attributes: result
+                        .md5_of_message_attributes,
+                    md5_of_message_system_attributes: result
+                        .md5_of_message_system_attributes,
                     message_id: result.message_id,
                     sequence_number: result.sequence_number,
                 }),
@@ -433,11 +497,30 @@ impl SqsWorld {
                 .visibility_timeout
                 .unwrap_or_else(|| queue.visibility_timeout());
             validate_visibility_timeout(visibility_timeout)?;
+            let selectors = receive_selectors(&input)?;
+
+            if queue.is_fifo()
+                && let Some(attempt_id) =
+                    input.receive_request_attempt_id.as_deref()
+            {
+                queue.prune_expired_receive_attempts(now_millis);
+                if let Some(cached) = queue.replay_receive_attempt(
+                    attempt_id,
+                    now_millis,
+                    visibility_timeout,
+                ) {
+                    return Ok(ReceiveMessageAttempt {
+                        effective_wait_time_seconds: wait_time_seconds,
+                        received: cached,
+                    });
+                }
+            }
 
             let outcome = if queue.is_fifo() {
                 queue.receive_fifo_messages(
                     max_number_of_messages,
                     now_millis,
+                    &selectors,
                     visibility_timeout,
                     next_receipt_handle,
                 )
@@ -445,10 +528,37 @@ impl SqsWorld {
                 queue.receive_standard_messages(
                     max_number_of_messages,
                     now_millis,
+                    &selectors,
                     visibility_timeout,
                     next_receipt_handle,
                 )
             };
+
+            if queue.is_fifo()
+                && !outcome.received.is_empty()
+                && let Some(attempt_id) =
+                    input.receive_request_attempt_id.as_deref()
+            {
+                queue.receive_attempts.insert(
+                    attempt_id.to_owned(),
+                    ReceiveAttemptRecord {
+                        expires_at_millis: now_millis.saturating_add(
+                            RECEIVE_REQUEST_ATTEMPT_ID_WINDOW_MILLIS,
+                        ),
+                        receipt_handles_by_message_id: outcome
+                            .received
+                            .iter()
+                            .map(|message| {
+                                (
+                                    message.message_id.clone(),
+                                    message.receipt_handle.clone(),
+                                )
+                            })
+                            .collect(),
+                        received: outcome.received.clone(),
+                    },
+                );
+            }
 
             (
                 outcome.received,
@@ -502,7 +612,9 @@ impl SqsWorld {
             return Ok(());
         }
 
+        let message_id = message.message_id.clone();
         message.deleted = true;
+        queue.invalidate_receive_attempts_for_message(&message_id);
         Ok(())
     }
 
@@ -552,8 +664,10 @@ impl SqsWorld {
             });
         }
 
+        let message_id = message.message_id.clone();
         message.visible_at_millis =
             now_millis + u64::from(visibility_timeout).saturating_mul(1_000);
+        queue.invalidate_receive_attempts_for_message(&message_id);
 
         Ok(())
     }
@@ -590,11 +704,21 @@ impl SqsWorld {
     pub(crate) fn purge_queue(
         &mut self,
         queue: &SqsQueueIdentity,
+        now_millis: u64,
     ) -> Result<(), SqsError> {
         let queue =
             self.queues.get_mut(queue).ok_or(SqsError::QueueDoesNotExist)?;
+        if queue.last_purged_timestamp_millis.is_some_and(|last_purged| {
+            now_millis < last_purged.saturating_add(60_000)
+        }) {
+            return Err(SqsError::PurgeQueueInProgress {
+                message: "Only one PurgeQueue operation on a queue is allowed every 60 seconds.".to_owned(),
+            });
+        }
         queue.messages.clear();
         queue.deduplication_records.clear();
+        queue.receive_attempts.clear();
+        queue.last_purged_timestamp_millis = Some(now_millis);
 
         Ok(())
     }
@@ -607,8 +731,20 @@ impl QueueRecord {
         now_millis: u64,
         message_id: String,
     ) -> Result<SendMessageOutput, SqsError> {
+        validate_message_body(&input.body)?;
+        validate_message_attributes(&input.message_attributes)?;
+        validate_message_system_attributes(&input.message_system_attributes)?;
+        validate_message_size(
+            self.maximum_message_size(),
+            &input.body,
+            &input.message_attributes,
+        )?;
         let body = input.body.clone();
         let md5_of_message_body = md5_hex(&body);
+        let md5_of_message_attributes =
+            md5_of_message_attributes(&input.message_attributes);
+        let md5_of_message_system_attributes =
+            md5_of_message_system_attributes(&input.message_system_attributes);
 
         if self.is_fifo() {
             return self.send_fifo_message(
@@ -616,6 +752,8 @@ impl QueueRecord {
                 now_millis,
                 message_id,
                 md5_of_message_body,
+                md5_of_message_attributes,
+                md5_of_message_system_attributes,
             );
         }
 
@@ -627,11 +765,15 @@ impl QueueRecord {
             dead_letter_source_arn: None,
             deleted: false,
             deduplication_id: None,
+            first_receive_timestamp_millis: None,
             issued_receipt_handles: BTreeSet::new(),
             latest_receipt_handle: None,
             md5_of_body: md5_of_message_body.clone(),
+            md5_of_message_attributes: md5_of_message_attributes.clone(),
+            message_attributes: input.message_attributes,
             message_group_id: None,
             message_id: message_id.clone(),
+            message_system_attributes: input.message_system_attributes,
             receive_count: 0,
             sent_timestamp_millis: now_millis,
             sequence_number: None,
@@ -641,6 +783,8 @@ impl QueueRecord {
 
         Ok(SendMessageOutput {
             md5_of_message_body,
+            md5_of_message_attributes,
+            md5_of_message_system_attributes,
             message_id,
             sequence_number: None,
         })
@@ -650,11 +794,13 @@ impl QueueRecord {
         &mut self,
         max_number_of_messages: u32,
         now_millis: u64,
+        selectors: &ReceiveSelectors,
         visibility_timeout: u32,
         next_receipt_handle: &mut dyn FnMut() -> String,
     ) -> ReceiveOutcome {
         let mut outcome = ReceiveOutcome::default();
         let queue_arn = self.queue_arn();
+        let queue_identity = self.identity.clone();
         let max_receive_count = self
             .redrive_policy_document()
             .map(|policy| policy.max_receive_count);
@@ -680,12 +826,69 @@ impl QueueRecord {
 
             outcome.received.push(message.receive(
                 now_millis,
+                selectors,
+                &queue_identity,
                 visibility_timeout,
                 next_receipt_handle(),
             ));
         }
 
         outcome
+    }
+
+    pub(crate) fn prune_expired_receive_attempts(&mut self, now_millis: u64) {
+        self.receive_attempts
+            .retain(|_, attempt| attempt.expires_at_millis > now_millis);
+    }
+
+    pub(crate) fn invalidate_receive_attempts_for_message(
+        &mut self,
+        message_id: &str,
+    ) {
+        self.receive_attempts.retain(|_, attempt| {
+            !attempt.receipt_handles_by_message_id.contains_key(message_id)
+        });
+    }
+
+    pub(crate) fn replay_receive_attempt(
+        &mut self,
+        attempt_id: &str,
+        now_millis: u64,
+        visibility_timeout: u32,
+    ) -> Option<Vec<ReceivedMessage>> {
+        let cached = self.receive_attempts.get(attempt_id)?.clone();
+        for (message_id, receipt_handle) in
+            &cached.receipt_handles_by_message_id
+        {
+            let message = self
+                .messages
+                .iter()
+                .find(|message| message.message_id == *message_id)?;
+            if message.deleted
+                || message.latest_receipt_handle.as_deref()
+                    != Some(receipt_handle.as_str())
+                || message.visible_at_millis <= now_millis
+            {
+                self.receive_attempts.remove(attempt_id);
+                return None;
+            }
+        }
+
+        let visible_at_millis =
+            now_millis + u64::from(visibility_timeout).saturating_mul(1_000);
+        for message_id in cached.receipt_handles_by_message_id.keys() {
+            let Some(message) = self
+                .messages
+                .iter_mut()
+                .find(|message| message.message_id == *message_id)
+            else {
+                self.receive_attempts.remove(attempt_id);
+                return None;
+            };
+            message.visible_at_millis = visible_at_millis;
+        }
+
+        Some(cached.received)
     }
 }
 
@@ -695,11 +898,16 @@ pub(crate) struct MessageRecord {
     pub(crate) dead_letter_source_arn: Option<String>,
     pub(crate) deleted: bool,
     pub(crate) deduplication_id: Option<String>,
+    pub(crate) first_receive_timestamp_millis: Option<u64>,
     pub(crate) issued_receipt_handles: BTreeSet<String>,
     pub(crate) latest_receipt_handle: Option<String>,
     pub(crate) md5_of_body: String,
+    pub(crate) md5_of_message_attributes: Option<String>,
+    pub(crate) message_attributes: BTreeMap<String, MessageAttributeValue>,
     pub(crate) message_group_id: Option<String>,
     pub(crate) message_id: String,
+    pub(crate) message_system_attributes:
+        BTreeMap<String, MessageAttributeValue>,
     pub(crate) receive_count: u32,
     pub(crate) sent_timestamp_millis: u64,
     pub(crate) sequence_number: Option<String>,
@@ -714,30 +922,28 @@ impl MessageRecord {
     pub(crate) fn receive(
         &mut self,
         now_millis: u64,
+        selectors: &ReceiveSelectors,
+        queue: &SqsQueueIdentity,
         visibility_timeout: u32,
         receipt_handle: String,
     ) -> ReceivedMessage {
         self.receive_count += 1;
+        self.first_receive_timestamp_millis.get_or_insert(now_millis);
         self.visible_at_millis =
             now_millis + u64::from(visibility_timeout).saturating_mul(1_000);
         self.issued_receipt_handles.clear();
         self.issued_receipt_handles.insert(receipt_handle.clone());
         self.latest_receipt_handle = Some(receipt_handle.clone());
 
-        let mut attributes = BTreeMap::new();
-        attributes.insert(
-            "ApproximateReceiveCount".to_owned(),
-            self.receive_count.to_string(),
-        );
-        attributes.insert(
-            "SentTimestamp".to_owned(),
-            self.sent_timestamp_millis.to_string(),
-        );
-
         ReceivedMessage {
-            attributes,
+            attributes: self.selected_attributes(selectors, queue),
             body: self.body.clone(),
             md5_of_body: self.md5_of_body.clone(),
+            md5_of_message_attributes: self.md5_of_message_attributes.clone(),
+            message_attributes: selected_message_attributes(
+                &self.message_attributes,
+                &selectors.message_attribute_names,
+            ),
             message_id: self.message_id.clone(),
             receipt_handle,
         }
@@ -752,16 +958,85 @@ impl MessageRecord {
             dead_letter_source_arn,
             deleted: false,
             deduplication_id: self.deduplication_id.clone(),
+            first_receive_timestamp_millis: None,
             issued_receipt_handles: BTreeSet::new(),
             latest_receipt_handle: None,
             md5_of_body: self.md5_of_body.clone(),
+            md5_of_message_attributes: self.md5_of_message_attributes.clone(),
+            message_attributes: self.message_attributes.clone(),
             message_group_id: self.message_group_id.clone(),
             message_id: self.message_id.clone(),
+            message_system_attributes: self.message_system_attributes.clone(),
             receive_count: 0,
             sent_timestamp_millis: self.sent_timestamp_millis,
             sequence_number: self.sequence_number.clone(),
             visible_at_millis: self.sent_timestamp_millis,
         }
+    }
+
+    fn selected_attributes(
+        &self,
+        selectors: &ReceiveSelectors,
+        queue: &SqsQueueIdentity,
+    ) -> BTreeMap<String, String> {
+        let mut selected = BTreeMap::new();
+        for name in &selectors.system_attribute_names {
+            match name.as_str() {
+                "AWSTraceHeader" => {
+                    if let Some(value) = self
+                        .message_system_attributes
+                        .get("AWSTraceHeader")
+                        .and_then(|value| value.string_value.as_deref())
+                    {
+                        selected.insert(name.clone(), value.to_owned());
+                    }
+                }
+                "ApproximateFirstReceiveTimestamp" => {
+                    if let Some(value) = self.first_receive_timestamp_millis {
+                        selected.insert(name.clone(), value.to_string());
+                    }
+                }
+                "ApproximateReceiveCount" => {
+                    selected
+                        .insert(name.clone(), self.receive_count.to_string());
+                }
+                "DeadLetterQueueSourceArn" => {
+                    if let Some(value) = self.dead_letter_source_arn.as_ref() {
+                        selected.insert(name.clone(), value.clone());
+                    }
+                }
+                "MessageDeduplicationId" => {
+                    if let Some(value) = self.deduplication_id.as_ref() {
+                        selected.insert(name.clone(), value.clone());
+                    }
+                }
+                "MessageGroupId" => {
+                    if let Some(value) = self.message_group_id.as_ref() {
+                        selected.insert(name.clone(), value.clone());
+                    }
+                }
+                "SenderId" => {
+                    selected.insert(
+                        name.clone(),
+                        queue.account_id().as_str().to_owned(),
+                    );
+                }
+                "SentTimestamp" => {
+                    selected.insert(
+                        name.clone(),
+                        self.sent_timestamp_millis.to_string(),
+                    );
+                }
+                "SequenceNumber" => {
+                    if let Some(value) = self.sequence_number.as_ref() {
+                        selected.insert(name.clone(), value.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        selected
     }
 }
 
@@ -798,21 +1073,34 @@ fn batch_failure(id: &str, error: &SqsError) -> BatchFailure {
             "InvalidAttributeName",
             format!("Unknown Attribute {attribute_name}."),
         ),
+        SqsError::InvalidAddress { message } => {
+            ("InvalidAddress", message.clone())
+        }
         SqsError::BatchEntryIdsNotDistinct { message } => (
             "AWS.SimpleQueueService.BatchEntryIdsNotDistinct",
             message.clone(),
         ),
+        SqsError::BatchRequestTooLong { message } => {
+            ("BatchRequestTooLong", message.clone())
+        }
         SqsError::EmptyBatchRequest { message } => {
             ("AWS.SimpleQueueService.EmptyBatchRequest", message.clone())
         }
         SqsError::InvalidBatchEntryId { message } => {
             ("AWS.SimpleQueueService.InvalidBatchEntryId", message.clone())
         }
+        SqsError::InvalidMessageContents { message } => {
+            ("InvalidMessageContents", message.clone())
+        }
         SqsError::InvalidParameterValue { message } => {
             ("InvalidParameterValue", message.clone())
         }
         SqsError::MissingParameter { message } => {
             ("MissingParameter", message.clone())
+        }
+        SqsError::OverLimit { message } => ("OverLimit", message.clone()),
+        SqsError::PurgeQueueInProgress { message } => {
+            ("AWS.SimpleQueueService.PurgeQueueInProgress", message.clone())
         }
         SqsError::QueueAlreadyExists { message } => {
             ("QueueAlreadyExists", message.clone())
@@ -833,11 +1121,14 @@ fn batch_failure(id: &str, error: &SqsError) -> BatchFailure {
                 "Value {receipt_handle} for parameter ReceiptHandle is invalid. Reason: Message does not exist or is not available for visibility timeout change."
             ),
         ),
+        SqsError::MessageNotInflight { message } => {
+            ("MessageNotInflight", message.clone())
+        }
         SqsError::ResourceNotFound { message } => {
             ("ResourceNotFoundException", message.clone())
         }
         SqsError::UnsupportedOperation { message } => {
-            ("UnsupportedOperation", message.clone())
+            ("AWS.SimpleQueueService.UnsupportedOperation", message.clone())
         }
     };
 
@@ -971,4 +1262,150 @@ pub(crate) fn timestamp_millis(time: SystemTime) -> u64 {
 
 pub(crate) fn md5_hex(value: &str) -> String {
     format!("{:x}", md5::compute(value.as_bytes()))
+}
+
+fn receive_selectors(
+    input: &ReceiveMessageInput,
+) -> Result<ReceiveSelectors, SqsError> {
+    let mut system_attribute_names = BTreeSet::new();
+    let requested_system_attributes = input
+        .attribute_names
+        .iter()
+        .chain(&input.message_system_attribute_names)
+        .cloned()
+        .collect::<Vec<_>>();
+    if requested_system_attributes.iter().any(|name| name == "All") {
+        for name in [
+            "AWSTraceHeader",
+            "ApproximateFirstReceiveTimestamp",
+            "ApproximateReceiveCount",
+            "DeadLetterQueueSourceArn",
+            "MessageDeduplicationId",
+            "MessageGroupId",
+            "SenderId",
+            "SentTimestamp",
+            "SequenceNumber",
+        ] {
+            system_attribute_names.insert(name.to_owned());
+        }
+    } else {
+        for name in requested_system_attributes {
+            validate_system_attribute_name(&name)?;
+            system_attribute_names.insert(name);
+        }
+    }
+
+    let message_attribute_names =
+        normalize_message_attribute_names(&input.message_attribute_names)?;
+
+    Ok(ReceiveSelectors {
+        message_attribute_names,
+        system_attribute_names: system_attribute_names.into_iter().collect(),
+    })
+}
+
+fn validate_system_attribute_name(name: &str) -> Result<(), SqsError> {
+    if matches!(
+        name,
+        "AWSTraceHeader"
+            | "ApproximateFirstReceiveTimestamp"
+            | "ApproximateReceiveCount"
+            | "DeadLetterQueueSourceArn"
+            | "MessageDeduplicationId"
+            | "MessageGroupId"
+            | "SenderId"
+            | "SentTimestamp"
+            | "SequenceNumber"
+    ) {
+        Ok(())
+    } else {
+        Err(SqsError::InvalidAttributeName { attribute_name: name.to_owned() })
+    }
+}
+
+fn normalize_message_attribute_names(
+    names: &[String],
+) -> Result<Vec<String>, SqsError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    if names.iter().any(|name| name == "All" || name == ".*") {
+        return Ok(vec!["All".to_owned()]);
+    }
+    for name in names {
+        validate_message_attribute_selector_name(name)?;
+    }
+
+    Ok(names.to_vec())
+}
+
+fn validate_message_attribute_selector_name(
+    name: &str,
+) -> Result<(), SqsError> {
+    if let Some(prefix) = name.strip_suffix(".*") {
+        validate_message_attribute_name(prefix)?;
+        return Ok(());
+    }
+
+    validate_message_attribute_name(name)
+}
+
+fn validate_message_body(body: &str) -> Result<(), SqsError> {
+    if body.chars().any(|character| {
+        let code = u32::from(character);
+        !(code == 0x9
+            || code == 0xA
+            || code == 0xD
+            || (0x20..=0xD7FF).contains(&code)
+            || (0xE000..=0xFFFD).contains(&code)
+            || (0x10000..=0x10FFFF).contains(&code))
+    }) {
+        return Err(SqsError::InvalidMessageContents {
+            message:
+                "The message contains characters outside the allowed set."
+                    .to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_message_attributes(
+    attributes: &BTreeMap<String, MessageAttributeValue>,
+) -> Result<(), SqsError> {
+    crate::message_attributes::validate_message_attributes(
+        attributes,
+        validate_message_body,
+    )
+}
+
+fn validate_message_system_attributes(
+    attributes: &BTreeMap<String, MessageAttributeValue>,
+) -> Result<(), SqsError> {
+    crate::message_attributes::validate_message_system_attributes(
+        attributes,
+        validate_message_body,
+    )
+}
+
+fn validate_message_size(
+    maximum_message_size: u32,
+    body: &str,
+    message_attributes: &BTreeMap<String, MessageAttributeValue>,
+) -> Result<(), SqsError> {
+    let body_size = body.len();
+    let message_attributes_size = message_attributes
+        .iter()
+        .map(|(name, value)| message_attribute_size(name, value))
+        .sum::<usize>();
+    let total_size = body_size.saturating_add(message_attributes_size);
+    if total_size > maximum_message_size as usize {
+        return Err(SqsError::InvalidParameterValue {
+            message: format!(
+                "One or more parameters are invalid. Reason: Message must be shorter than {maximum_message_size} bytes."
+            ),
+        });
+    }
+
+    Ok(())
 }

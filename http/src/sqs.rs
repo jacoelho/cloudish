@@ -8,14 +8,18 @@ use aws::{
     AccountId, AdvertisedEdge, Arn, AwsError, AwsErrorFamily, RequestContext,
     ServiceName,
 };
+use base64::Engine as _;
 use edge_runtime::SqsRequestRuntime;
 use serde_json::{Map, Value, json};
 use services::{
-    BatchFailure, ChangeMessageVisibilityBatchEntryInput,
+    BatchFailure, CancelMessageMoveTaskInput,
+    ChangeMessageVisibilityBatchEntryInput,
     ChangeMessageVisibilityBatchOutput, CreateQueueInput,
     DeleteMessageBatchEntryInput, DeleteMessageBatchOutput,
+    ListMessageMoveTasksInput, ListMessageMoveTasksOutput, ListQueuesInput,
     ReceiveMessageInput, ReceivedMessage, SendMessageBatchEntryInput,
-    SendMessageBatchOutput, SendMessageInput, SqsError, SqsQueueIdentity,
+    SendMessageBatchOutput, SendMessageInput, SqsAddPermissionInput, SqsError,
+    SqsMessageAttributeValue, SqsQueueIdentity, SqsRemovePermissionInput,
     SqsScope, SqsService, StartMessageMoveTaskInput,
 };
 use std::collections::BTreeMap;
@@ -99,8 +103,12 @@ pub(crate) fn handle_query(
             Ok(response_without_result(action))
         }
         "GetQueueUrl" => {
+            let get_queue_scope = scope_with_queue_owner(
+                &scope,
+                params.optional("QueueOwnerAWSAccountId"),
+            )?;
             let queue = sqs
-                .get_queue_url(&scope, params.required("QueueName")?)
+                .get_queue_url(&get_queue_scope, params.required("QueueName")?)
                 .map_err(|error| error.to_aws_error())?;
 
             Ok(response_with_result(
@@ -145,13 +153,65 @@ pub(crate) fn handle_query(
 
             Ok(response_without_result(action))
         }
+        "AddPermission" => {
+            let queue = queue_identity_from_request(
+                params.optional("QueueUrl"),
+                request,
+                context,
+            )?;
+            sqs.add_permission(
+                &queue,
+                SqsAddPermissionInput {
+                    actions: query_list(&params, "ActionName"),
+                    aws_account_ids: query_list(&params, "AWSAccountId"),
+                    label: params.required("Label")?.to_owned(),
+                },
+            )
+            .map_err(|error| error.to_aws_error())?;
+
+            Ok(response_without_result(action))
+        }
+        "RemovePermission" => {
+            let queue = queue_identity_from_request(
+                params.optional("QueueUrl"),
+                request,
+                context,
+            )?;
+            sqs.remove_permission(
+                &queue,
+                SqsRemovePermissionInput {
+                    label: params.required("Label")?.to_owned(),
+                },
+            )
+            .map_err(|error| error.to_aws_error())?;
+
+            Ok(response_without_result(action))
+        }
         "ListQueues" => {
-            let queues =
-                sqs.list_queues(&scope, params.optional("QueueNamePrefix"));
+            let queues = sqs
+                .list_queues_page(
+                    &scope,
+                    &ListQueuesInput {
+                        max_results: optional_u32_query(
+                            &params,
+                            "MaxResults",
+                        )?,
+                        next_token: params
+                            .optional("NextToken")
+                            .map(str::to_owned),
+                        queue_name_prefix: params
+                            .optional("QueueNamePrefix")
+                            .map(str::to_owned),
+                    },
+                )
+                .map_err(|error| error.to_aws_error())?;
             let mut xml = XmlBuilder::new();
-            for queue in queues {
+            for queue in queues.queue_urls {
                 xml =
                     xml.elem("QueueUrl", &queue_url(advertised_edge, &queue));
+            }
+            if let Some(next_token) = queues.next_token.as_deref() {
+                xml = xml.elem("NextToken", next_token);
             }
 
             Ok(response_with_result(action, &xml.build()))
@@ -171,12 +231,20 @@ pub(crate) fn handle_query(
                             &params,
                             "DelaySeconds",
                         )?,
+                        message_attributes: query_message_attributes(
+                            &params,
+                            "MessageAttribute.",
+                        )?,
                         message_deduplication_id: params
                             .optional("MessageDeduplicationId")
                             .map(str::to_owned),
                         message_group_id: params
                             .optional("MessageGroupId")
                             .map(str::to_owned),
+                        message_system_attributes: query_message_attributes(
+                            &params,
+                            "MessageSystemAttribute.",
+                        )?,
                     },
                 )
                 .map_err(|error| error.to_aws_error())?;
@@ -185,6 +253,14 @@ pub(crate) fn handle_query(
                 let mut xml = XmlBuilder::new()
                     .elem("MessageId", &sent.message_id)
                     .elem("MD5OfMessageBody", &sent.md5_of_message_body);
+                if let Some(md5) = sent.md5_of_message_attributes.as_deref() {
+                    xml = xml.elem("MD5OfMessageAttributes", md5);
+                }
+                if let Some(md5) =
+                    sent.md5_of_message_system_attributes.as_deref()
+                {
+                    xml = xml.elem("MD5OfMessageSystemAttributes", md5);
+                }
                 if let Some(sequence_number) = sent.sequence_number.as_deref()
                 {
                     xml = xml.elem("SequenceNumber", sequence_number);
@@ -220,10 +296,22 @@ pub(crate) fn handle_query(
                 .receive_message(
                     &queue,
                     ReceiveMessageInput {
+                        attribute_names: query_list(&params, "AttributeName"),
                         max_number_of_messages: optional_u32_query(
                             &params,
                             "MaxNumberOfMessages",
                         )?,
+                        message_attribute_names: query_list(
+                            &params,
+                            "MessageAttributeName",
+                        ),
+                        message_system_attribute_names: query_list(
+                            &params,
+                            "MessageSystemAttributeName",
+                        ),
+                        receive_request_attempt_id: params
+                            .optional("ReceiveRequestAttemptId")
+                            .map(str::to_owned),
                         visibility_timeout: optional_u32_query(
                             &params,
                             "VisibilityTimeout",
@@ -313,12 +401,26 @@ pub(crate) fn handle_query(
                 context,
             )?;
             let sources = sqs
-                .list_dead_letter_source_queues(&queue)
+                .list_dead_letter_source_queues_page(
+                    &queue,
+                    &services::ListDeadLetterSourceQueuesInput {
+                        max_results: optional_u32_query(
+                            &params,
+                            "MaxResults",
+                        )?,
+                        next_token: params
+                            .optional("NextToken")
+                            .map(str::to_owned),
+                    },
+                )
                 .map_err(|error| error.to_aws_error())?;
             let mut xml = XmlBuilder::new();
-            for source in sources {
+            for source in sources.queue_urls {
                 xml =
                     xml.elem("QueueUrl", &queue_url(advertised_edge, &source));
+            }
+            if let Some(next_token) = sources.next_token.as_deref() {
+                xml = xml.elem("NextToken", next_token);
             }
 
             Ok(response_with_result(action, &xml.build()))
@@ -342,6 +444,38 @@ pub(crate) fn handle_query(
                 action,
                 &XmlBuilder::new()
                     .elem("TaskHandle", &task.task_handle)
+                    .build(),
+            ))
+        }
+        "ListMessageMoveTasks" => {
+            let tasks = sqs
+                .list_message_move_tasks(ListMessageMoveTasksInput {
+                    max_results: optional_i32_query(&params, "MaxResults")?,
+                    source_arn: required_sqs_arn_query(&params, "SourceArn")?,
+                })
+                .map_err(|error| error.to_aws_error())?;
+
+            Ok(response_with_result(
+                action,
+                &query_list_message_move_tasks_xml(&tasks),
+            ))
+        }
+        "CancelMessageMoveTask" => {
+            let cancelled = sqs
+                .cancel_message_move_task(CancelMessageMoveTaskInput {
+                    task_handle: params.required("TaskHandle")?.to_owned(),
+                })
+                .map_err(|error| error.to_aws_error())?;
+
+            Ok(response_with_result(
+                action,
+                &XmlBuilder::new()
+                    .elem(
+                        "ApproximateNumberOfMessagesMoved",
+                        &cancelled
+                            .approximate_number_of_messages_moved
+                            .to_string(),
+                    )
                     .build(),
             ))
         }
@@ -449,9 +583,13 @@ pub(crate) fn handle_json(
             json!({})
         }
         "GetQueueUrl" => {
+            let get_queue_scope = scope_with_queue_owner(
+                &scope,
+                optional_string_json(&body, "QueueOwnerAWSAccountId"),
+            )?;
             let queue = sqs
                 .get_queue_url(
-                    &scope,
+                    &get_queue_scope,
                     &required_string_json(&body, "QueueName")?,
                 )
                 .map_err(|error| error.to_aws_error())?;
@@ -486,17 +624,73 @@ pub(crate) fn handle_json(
 
             json!({})
         }
+        "AddPermission" => {
+            let queue = queue_identity_from_request(
+                optional_string_json(&body, "QueueUrl"),
+                request,
+                context,
+            )?;
+            sqs.add_permission(
+                &queue,
+                SqsAddPermissionInput {
+                    actions: json_string_list_field(&body, "Actions")?,
+                    aws_account_ids: json_string_list_field(
+                        &body,
+                        "AWSAccountIds",
+                    )?,
+                    label: required_string_json(&body, "Label")?,
+                },
+            )
+            .map_err(|error| error.to_aws_error())?;
+
+            json!({})
+        }
+        "RemovePermission" => {
+            let queue = queue_identity_from_request(
+                optional_string_json(&body, "QueueUrl"),
+                request,
+                context,
+            )?;
+            sqs.remove_permission(
+                &queue,
+                SqsRemovePermissionInput {
+                    label: required_string_json(&body, "Label")?,
+                },
+            )
+            .map_err(|error| error.to_aws_error())?;
+
+            json!({})
+        }
         "ListQueues" => {
-            let queues = sqs.list_queues(
-                &scope,
-                optional_string_json(&body, "QueueNamePrefix"),
-            );
+            let queues = sqs
+                .list_queues_page(
+                    &scope,
+                    &ListQueuesInput {
+                        max_results: optional_u32_json(&body, "MaxResults")?,
+                        next_token: optional_string_json(&body, "NextToken")
+                            .map(str::to_owned),
+                        queue_name_prefix: optional_string_json(
+                            &body,
+                            "QueueNamePrefix",
+                        )
+                        .map(str::to_owned),
+                    },
+                )
+                .map_err(|error| error.to_aws_error())?;
             let urls = queues
+                .queue_urls
                 .into_iter()
                 .map(|queue| Value::String(queue_url(advertised_edge, &queue)))
                 .collect::<Vec<_>>();
+            let mut response = json!({ "QueueUrls": urls });
+            if let Some(next_token) = queues.next_token
+                && let Some(object) = response.as_object_mut()
+            {
+                object
+                    .insert("NextToken".to_owned(), Value::String(next_token));
+            }
 
-            json!({ "QueueUrls": urls })
+            response
         }
         "SendMessage" => {
             let queue = queue_identity_from_request(
@@ -513,6 +707,10 @@ pub(crate) fn handle_json(
                             &body,
                             "DelaySeconds",
                         )?,
+                        message_attributes: json_message_attributes_field(
+                            &body,
+                            "MessageAttributes",
+                        )?,
                         message_deduplication_id: optional_string_json(
                             &body,
                             "MessageDeduplicationId",
@@ -523,6 +721,11 @@ pub(crate) fn handle_json(
                             "MessageGroupId",
                         )
                         .map(str::to_owned),
+                        message_system_attributes:
+                            json_message_attributes_field(
+                                &body,
+                                "MessageSystemAttributes",
+                            )?,
                     },
                 )
                 .map_err(|error| error.to_aws_error())?;
@@ -537,6 +740,24 @@ pub(crate) fn handle_json(
                 object.insert(
                     "SequenceNumber".to_owned(),
                     Value::String(sequence_number),
+                );
+            }
+            if let Some(md5_of_message_attributes) =
+                sent.md5_of_message_attributes
+                && let Some(object) = response.as_object_mut()
+            {
+                object.insert(
+                    "MD5OfMessageAttributes".to_owned(),
+                    Value::String(md5_of_message_attributes),
+                );
+            }
+            if let Some(md5_of_message_system_attributes) =
+                sent.md5_of_message_system_attributes
+                && let Some(object) = response.as_object_mut()
+            {
+                object.insert(
+                    "MD5OfMessageSystemAttributes".to_owned(),
+                    Value::String(md5_of_message_system_attributes),
                 );
             }
             response
@@ -566,10 +787,28 @@ pub(crate) fn handle_json(
                 .receive_message(
                     &queue,
                     ReceiveMessageInput {
+                        attribute_names: json_string_list_field(
+                            &body,
+                            "AttributeNames",
+                        )?,
                         max_number_of_messages: optional_u32_json(
                             &body,
                             "MaxNumberOfMessages",
                         )?,
+                        message_attribute_names: json_string_list_field(
+                            &body,
+                            "MessageAttributeNames",
+                        )?,
+                        message_system_attribute_names:
+                            json_string_list_field(
+                                &body,
+                                "MessageSystemAttributeNames",
+                            )?,
+                        receive_request_attempt_id: optional_string_json(
+                            &body,
+                            "ReceiveRequestAttemptId",
+                        )
+                        .map(str::to_owned),
                         visibility_timeout: optional_u32_json(
                             &body,
                             "VisibilityTimeout",
@@ -651,14 +890,29 @@ pub(crate) fn handle_json(
                 context,
             )?;
             let sources = sqs
-                .list_dead_letter_source_queues(&queue)
+                .list_dead_letter_source_queues_page(
+                    &queue,
+                    &services::ListDeadLetterSourceQueuesInput {
+                        max_results: optional_u32_json(&body, "MaxResults")?,
+                        next_token: optional_string_json(&body, "NextToken")
+                            .map(str::to_owned),
+                    },
+                )
                 .map_err(|error| error.to_aws_error())?;
             let queue_urls = sources
+                .queue_urls
                 .into_iter()
                 .map(|queue| Value::String(queue_url(advertised_edge, &queue)))
                 .collect::<Vec<_>>();
+            let mut response = json!({ "queueUrls": queue_urls });
+            if let Some(next_token) = sources.next_token
+                && let Some(object) = response.as_object_mut()
+            {
+                object
+                    .insert("NextToken".to_owned(), Value::String(next_token));
+            }
 
-            json!({ "queueUrls": queue_urls })
+            response
         }
         "StartMessageMoveTask" => {
             let task = sqs
@@ -676,6 +930,28 @@ pub(crate) fn handle_json(
                 .map_err(|error| error.to_aws_error())?;
 
             json!({ "TaskHandle": task.task_handle })
+        }
+        "ListMessageMoveTasks" => {
+            let tasks = sqs
+                .list_message_move_tasks(ListMessageMoveTasksInput {
+                    max_results: optional_i32_json(&body, "MaxResults")?,
+                    source_arn: required_sqs_arn_json(&body, "SourceArn")?,
+                })
+                .map_err(|error| error.to_aws_error())?;
+
+            json!({ "Results": json_list_message_move_tasks(&tasks) })
+        }
+        "CancelMessageMoveTask" => {
+            let cancelled = sqs
+                .cancel_message_move_task(CancelMessageMoveTaskInput {
+                    task_handle: required_string_json(&body, "TaskHandle")?,
+                })
+                .map_err(|error| error.to_aws_error())?;
+
+            json!({
+                "ApproximateNumberOfMessagesMoved":
+                    cancelled.approximate_number_of_messages_moved,
+            })
         }
         "PurgeQueue" => {
             let queue = queue_identity_from_request(
@@ -752,6 +1028,25 @@ fn queue_identity_from_request(
     };
 
     parse_queue_identity(candidate, context)
+}
+
+fn scope_with_queue_owner(
+    default_scope: &SqsScope,
+    queue_owner_account_id: Option<&str>,
+) -> Result<SqsScope, AwsError> {
+    let Some(queue_owner_account_id) = queue_owner_account_id else {
+        return Ok(default_scope.clone());
+    };
+    let account_id = queue_owner_account_id.parse::<AccountId>().map_err(|_| {
+        SqsError::InvalidAddress {
+            message: format!(
+                "Value {queue_owner_account_id} for parameter QueueOwnerAWSAccountId is invalid."
+            ),
+        }
+        .to_aws_error()
+    })?;
+
+    Ok(SqsScope::new(account_id, default_scope.region().clone()))
 }
 
 fn parse_queue_identity(
@@ -853,10 +1148,18 @@ fn query_send_message_batch_entries(
             body: params.required(&body_name)?.to_owned(),
             delay_seconds: optional_u32_query(params, &delay_name)?,
             id: id.to_owned(),
+            message_attributes: query_message_attributes(
+                params,
+                &format!("{prefix}.MessageAttribute."),
+            )?,
             message_deduplication_id: params
                 .optional(&dedup_name)
                 .map(str::to_owned),
             message_group_id: params.optional(&group_name).map(str::to_owned),
+            message_system_attributes: query_message_attributes(
+                params,
+                &format!("{prefix}.MessageSystemAttribute."),
+            )?,
         });
     }
 
@@ -910,6 +1213,23 @@ fn optional_u32_query(
 ) -> Result<Option<u32>, AwsError> {
     match params.optional(name) {
         Some(value) => value.parse::<u32>().map(Some).map_err(|_| {
+            SqsError::InvalidParameterValue {
+                message: format!(
+                    "Value {value} for parameter {name} is invalid."
+                ),
+            }
+            .to_aws_error()
+        }),
+        None => Ok(None),
+    }
+}
+
+fn optional_i32_query(
+    params: &QueryParameters,
+    name: &str,
+) -> Result<Option<i32>, AwsError> {
+    match params.optional(name) {
+        Some(value) => value.parse::<i32>().map(Some).map_err(|_| {
             SqsError::InvalidParameterValue {
                 message: format!(
                     "Value {value} for parameter {name} is invalid."
@@ -1031,6 +1351,28 @@ fn optional_u32_json(
     }
 }
 
+fn optional_i32_json(
+    body: &Value,
+    field: &str,
+) -> Result<Option<i32>, AwsError> {
+    let Some(value) = body.get(field) else {
+        return Ok(None);
+    };
+
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .and_then(|value| value.try_into().ok())
+            .map(Some)
+            .ok_or_else(|| invalid_json_parameter(field)),
+        Value::String(value) => value
+            .parse::<i32>()
+            .map(Some)
+            .map_err(|_| invalid_json_parameter(field)),
+        _ => Err(invalid_json_parameter(field)),
+    }
+}
+
 fn json_string_list_field(
     body: &Value,
     field: &str,
@@ -1076,6 +1418,231 @@ fn json_map_field(
     Ok(map)
 }
 
+fn json_message_attributes_field(
+    body: &Value,
+    field: &str,
+) -> Result<BTreeMap<String, SqsMessageAttributeValue>, AwsError> {
+    let Some(value) = body.get(field) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(entries) = value.as_object() else {
+        return Err(invalid_json_parameter(field));
+    };
+    let mut attributes = BTreeMap::new();
+    for (name, value) in entries {
+        let Some(entry) = value.as_object() else {
+            return Err(invalid_json_parameter(field));
+        };
+        let Some(data_type) = entry.get("DataType").and_then(Value::as_str)
+        else {
+            return Err(invalid_json_parameter(field));
+        };
+        let string_list_values = entry
+            .get("StringListValues")
+            .map(json_string_list)
+            .transpose()?
+            .unwrap_or_default();
+        let binary_list_values = entry
+            .get("BinaryListValues")
+            .map(json_binary_list)
+            .transpose()?
+            .unwrap_or_default();
+        attributes.insert(
+            name.clone(),
+            SqsMessageAttributeValue {
+                binary_list_values,
+                binary_value: entry
+                    .get("BinaryValue")
+                    .map(json_binary_value)
+                    .transpose()?,
+                data_type: data_type.to_owned(),
+                string_list_values,
+                string_value: entry
+                    .get("StringValue")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            },
+        );
+    }
+
+    Ok(attributes)
+}
+
+fn json_string_list(value: &Value) -> Result<Vec<String>, AwsError> {
+    let Some(items) = value.as_array() else {
+        return Err(invalid_json_parameter("MessageAttributes"));
+    };
+
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid_json_parameter("MessageAttributes"))
+        })
+        .collect()
+}
+
+fn json_binary_list(value: &Value) -> Result<Vec<Vec<u8>>, AwsError> {
+    let Some(items) = value.as_array() else {
+        return Err(invalid_json_parameter("MessageAttributes"));
+    };
+
+    items.iter().map(json_binary_value).collect()
+}
+
+fn json_binary_value(value: &Value) -> Result<Vec<u8>, AwsError> {
+    let Some(value) = value.as_str() else {
+        return Err(invalid_json_parameter("MessageAttributes"));
+    };
+
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| invalid_json_parameter("MessageAttributes"))
+}
+
+#[derive(Default)]
+struct QueryMessageAttributeParts {
+    binary_list_values: BTreeMap<usize, Vec<u8>>,
+    binary_value: Option<Vec<u8>>,
+    data_type: Option<String>,
+    name: Option<String>,
+    string_list_values: BTreeMap<usize, String>,
+    string_value: Option<String>,
+}
+
+fn query_message_attributes(
+    params: &QueryParameters,
+    prefix: &str,
+) -> Result<BTreeMap<String, SqsMessageAttributeValue>, AwsError> {
+    let mut indexed: BTreeMap<usize, QueryMessageAttributeParts> =
+        BTreeMap::new();
+    for (name, value) in params.iter() {
+        let Some(remainder) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some((index, field)) = remainder.split_once('.') else {
+            return Err(invalid_json_parameter(prefix));
+        };
+        let index = parse_query_attribute_list_index(index, prefix)?;
+        let entry = indexed.entry(index).or_default();
+        match field {
+            "Name" => entry.name = Some(value.to_owned()),
+            "Value.DataType" => entry.data_type = Some(value.to_owned()),
+            "Value.StringValue" => entry.string_value = Some(value.to_owned()),
+            "Value.BinaryValue" => {
+                entry.binary_value = Some(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(value)
+                        .map_err(|_| invalid_json_parameter(prefix))?,
+                );
+            }
+            _ => {
+                if let Some(member) =
+                    field.strip_prefix("Value.StringListValue.")
+                {
+                    let index =
+                        parse_query_attribute_list_index(member, prefix)?;
+                    if entry
+                        .string_list_values
+                        .insert(index, value.to_owned())
+                        .is_some()
+                    {
+                        return Err(invalid_json_parameter(prefix));
+                    }
+                } else if let Some(member) =
+                    field.strip_prefix("Value.BinaryListValue.")
+                {
+                    let index =
+                        parse_query_attribute_list_index(member, prefix)?;
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(value)
+                        .map_err(|_| invalid_json_parameter(prefix))?;
+                    if entry
+                        .binary_list_values
+                        .insert(index, decoded)
+                        .is_some()
+                    {
+                        return Err(invalid_json_parameter(prefix));
+                    }
+                }
+            }
+        }
+    }
+
+    collect_contiguous_query_indexed_values(indexed, prefix)?
+        .into_iter()
+        .map(|entry| {
+            let name =
+                entry.name.ok_or_else(|| invalid_json_parameter(prefix))?;
+            let data_type = entry
+                .data_type
+                .ok_or_else(|| invalid_json_parameter(prefix))?;
+            Ok((
+                name,
+                SqsMessageAttributeValue {
+                    binary_list_values: collect_query_attribute_list_values(
+                        entry.binary_list_values,
+                        prefix,
+                    )?,
+                    binary_value: entry.binary_value,
+                    data_type,
+                    string_list_values: collect_query_attribute_list_values(
+                        entry.string_list_values,
+                        prefix,
+                    )?,
+                    string_value: entry.string_value,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn parse_query_attribute_list_index(
+    value: &str,
+    prefix: &str,
+) -> Result<usize, AwsError> {
+    let index =
+        value.parse::<usize>().map_err(|_| invalid_json_parameter(prefix))?;
+    if index == 0 {
+        return Err(invalid_json_parameter(prefix));
+    }
+
+    Ok(index)
+}
+
+fn collect_contiguous_query_indexed_values<T>(
+    mut values: BTreeMap<usize, T>,
+    prefix: &str,
+) -> Result<Vec<T>, AwsError> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(max_index) = values.keys().next_back().copied() else {
+        return Ok(Vec::new());
+    };
+    if values.len() != max_index {
+        return Err(invalid_json_parameter(prefix));
+    }
+
+    let mut items = Vec::with_capacity(max_index);
+    for index in 1..=max_index {
+        let Some(value) = values.remove(&index) else {
+            return Err(invalid_json_parameter(prefix));
+        };
+        items.push(value);
+    }
+
+    Ok(items)
+}
+
+fn collect_query_attribute_list_values<T: Clone>(
+    values: BTreeMap<usize, T>,
+    prefix: &str,
+) -> Result<Vec<T>, AwsError> {
+    collect_contiguous_query_indexed_values(values, prefix)
+}
+
 fn json_send_message_batch_entries(
     body: &Value,
 ) -> Result<Vec<SendMessageBatchEntryInput>, AwsError> {
@@ -1093,6 +1660,10 @@ fn json_send_message_batch_entries(
                 body: required_string_json(entry, "MessageBody")?,
                 delay_seconds: optional_u32_json(entry, "DelaySeconds")?,
                 id: required_string_json(entry, "Id")?,
+                message_attributes: json_message_attributes_field(
+                    entry,
+                    "MessageAttributes",
+                )?,
                 message_deduplication_id: optional_string_json(
                     entry,
                     "MessageDeduplicationId",
@@ -1103,6 +1674,10 @@ fn json_send_message_batch_entries(
                     "MessageGroupId",
                 )
                 .map(str::to_owned),
+                message_system_attributes: json_message_attributes_field(
+                    entry,
+                    "MessageSystemAttributes",
+                )?,
             })
         })
         .collect()
@@ -1178,6 +1753,24 @@ fn json_send_message_batch_result(batch: &SendMessageBatchOutput) -> Value {
                 "MD5OfMessageBody": entry.md5_of_message_body,
                 "MessageId": entry.message_id,
             });
+            if let Some(md5_of_message_attributes) =
+                &entry.md5_of_message_attributes
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert(
+                    "MD5OfMessageAttributes".to_owned(),
+                    Value::String(md5_of_message_attributes.clone()),
+                );
+            }
+            if let Some(md5_of_message_system_attributes) =
+                &entry.md5_of_message_system_attributes
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert(
+                    "MD5OfMessageSystemAttributes".to_owned(),
+                    Value::String(md5_of_message_system_attributes.clone()),
+                );
+            }
             if let Some(sequence_number) = &entry.sequence_number
                 && let Some(object) = value.as_object_mut()
             {
@@ -1226,6 +1819,51 @@ fn json_change_visibility_batch_result(
     })
 }
 
+fn query_list_message_move_tasks_xml(
+    tasks: &ListMessageMoveTasksOutput,
+) -> String {
+    let mut xml = XmlBuilder::new();
+    for task in &tasks.results {
+        xml = xml.start("Result", None);
+        if let Some(task_handle) = task.task_handle.as_deref() {
+            xml = xml.elem("TaskHandle", task_handle);
+        }
+        xml = xml
+            .elem("Status", &task.status)
+            .elem("SourceArn", &task.source_arn)
+            .elem(
+                "ApproximateNumberOfMessagesMoved",
+                &task.approximate_number_of_messages_moved.to_string(),
+            )
+            .elem("StartedTimestamp", &task.started_timestamp.to_string());
+        if let Some(destination_arn) = task.destination_arn.as_deref() {
+            xml = xml.elem("DestinationArn", destination_arn);
+        }
+        if let Some(max_number_of_messages_per_second) =
+            task.max_number_of_messages_per_second
+        {
+            xml = xml.elem(
+                "MaxNumberOfMessagesPerSecond",
+                &max_number_of_messages_per_second.to_string(),
+            );
+        }
+        if let Some(approximate_number_of_messages_to_move) =
+            task.approximate_number_of_messages_to_move
+        {
+            xml = xml.elem(
+                "ApproximateNumberOfMessagesToMove",
+                &approximate_number_of_messages_to_move.to_string(),
+            );
+        }
+        if let Some(failure_reason) = task.failure_reason.as_deref() {
+            xml = xml.elem("FailureReason", failure_reason);
+        }
+        xml = xml.end("Result");
+    }
+
+    xml.build()
+}
+
 fn query_received_messages_xml(messages: &[ReceivedMessage]) -> String {
     let mut xml = XmlBuilder::new();
     for message in messages {
@@ -1235,6 +1873,12 @@ fn query_received_messages_xml(messages: &[ReceivedMessage]) -> String {
             .elem("ReceiptHandle", &message.receipt_handle)
             .elem("MD5OfBody", &message.md5_of_body)
             .elem("Body", &message.body);
+        if let Some(md5_of_message_attributes) =
+            message.md5_of_message_attributes.as_deref()
+        {
+            xml =
+                xml.elem("MD5OfMessageAttributes", md5_of_message_attributes);
+        }
 
         for (name, value) in &message.attributes {
             xml = xml
@@ -1242,6 +1886,13 @@ fn query_received_messages_xml(messages: &[ReceivedMessage]) -> String {
                 .elem("Name", name)
                 .elem("Value", value)
                 .end("Attribute");
+        }
+        for (name, value) in &message.message_attributes {
+            xml = xml
+                .start("MessageAttribute", None)
+                .elem("Name", name)
+                .raw(&query_message_attribute_value_xml(value))
+                .end("MessageAttribute");
         }
 
         xml = xml.end("Message");
@@ -1277,6 +1928,20 @@ fn query_send_message_batch_result_xml(
             .elem("Id", &entry.id)
             .elem("MessageId", &entry.message_id)
             .elem("MD5OfMessageBody", &entry.md5_of_message_body);
+        if let Some(md5_of_message_attributes) =
+            &entry.md5_of_message_attributes
+        {
+            xml =
+                xml.elem("MD5OfMessageAttributes", md5_of_message_attributes);
+        }
+        if let Some(md5_of_message_system_attributes) =
+            &entry.md5_of_message_system_attributes
+        {
+            xml = xml.elem(
+                "MD5OfMessageSystemAttributes",
+                md5_of_message_system_attributes,
+            );
+        }
         if let Some(sequence_number) = &entry.sequence_number {
             xml = xml.elem("SequenceNumber", sequence_number);
         }
@@ -1318,15 +1983,174 @@ fn json_received_messages(messages: &[ReceivedMessage]) -> Vec<Value> {
     messages
         .iter()
         .map(|message| {
-            json!({
+            let mut value = json!({
                 "Attributes": message.attributes,
                 "Body": message.body,
                 "MD5OfBody": message.md5_of_body,
                 "MessageId": message.message_id,
                 "ReceiptHandle": message.receipt_handle,
-            })
+                "MessageAttributes": json_message_attributes_map(
+                    &message.message_attributes,
+                ),
+            });
+            if let Some(md5_of_message_attributes) =
+                &message.md5_of_message_attributes
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert(
+                    "MD5OfMessageAttributes".to_owned(),
+                    Value::String(md5_of_message_attributes.clone()),
+                );
+            }
+            value
         })
         .collect()
+}
+
+fn json_list_message_move_tasks(
+    tasks: &ListMessageMoveTasksOutput,
+) -> Vec<Value> {
+    tasks
+        .results
+        .iter()
+        .map(|task| {
+            let mut value = json!({
+                "ApproximateNumberOfMessagesMoved":
+                    task.approximate_number_of_messages_moved,
+                "SourceArn": task.source_arn,
+                "StartedTimestamp": task.started_timestamp,
+                "Status": task.status,
+            });
+            if let Some(object) = value.as_object_mut() {
+                if let Some(task_handle) = task.task_handle.as_ref() {
+                    object.insert(
+                        "TaskHandle".to_owned(),
+                        Value::String(task_handle.clone()),
+                    );
+                }
+                if let Some(destination_arn) = task.destination_arn.as_ref() {
+                    object.insert(
+                        "DestinationArn".to_owned(),
+                        Value::String(destination_arn.clone()),
+                    );
+                }
+                if let Some(max_number_of_messages_per_second) =
+                    task.max_number_of_messages_per_second
+                {
+                    object.insert(
+                        "MaxNumberOfMessagesPerSecond".to_owned(),
+                        json!(max_number_of_messages_per_second),
+                    );
+                }
+                if let Some(approximate_number_of_messages_to_move) =
+                    task.approximate_number_of_messages_to_move
+                {
+                    object.insert(
+                        "ApproximateNumberOfMessagesToMove".to_owned(),
+                        json!(approximate_number_of_messages_to_move),
+                    );
+                }
+                if let Some(failure_reason) = task.failure_reason.as_ref() {
+                    object.insert(
+                        "FailureReason".to_owned(),
+                        Value::String(failure_reason.clone()),
+                    );
+                }
+            }
+
+            value
+        })
+        .collect()
+}
+
+fn json_message_attributes_map(
+    attributes: &BTreeMap<String, SqsMessageAttributeValue>,
+) -> Value {
+    let mut object = Map::new();
+    for (name, value) in attributes {
+        object.insert(name.clone(), json_message_attribute_value(value));
+    }
+
+    Value::Object(object)
+}
+
+fn json_message_attribute_value(value: &SqsMessageAttributeValue) -> Value {
+    let mut object = Map::new();
+    object
+        .insert("DataType".to_owned(), Value::String(value.data_type.clone()));
+    if let Some(string_value) = value.string_value.as_ref() {
+        object.insert(
+            "StringValue".to_owned(),
+            Value::String(string_value.clone()),
+        );
+    }
+    if let Some(binary_value) = value.binary_value.as_ref() {
+        object.insert(
+            "BinaryValue".to_owned(),
+            Value::String(
+                base64::engine::general_purpose::STANDARD.encode(binary_value),
+            ),
+        );
+    }
+    if !value.string_list_values.is_empty() {
+        object.insert(
+            "StringListValues".to_owned(),
+            Value::Array(
+                value
+                    .string_list_values
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !value.binary_list_values.is_empty() {
+        object.insert(
+            "BinaryListValues".to_owned(),
+            Value::Array(
+                value
+                    .binary_list_values
+                    .iter()
+                    .map(|entry| {
+                        Value::String(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(entry),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+    }
+
+    Value::Object(object)
+}
+
+fn query_message_attribute_value_xml(
+    value: &SqsMessageAttributeValue,
+) -> String {
+    let mut xml = XmlBuilder::new().start("Value", None);
+    xml = xml.elem("DataType", &value.data_type);
+    if let Some(string_value) = value.string_value.as_deref() {
+        xml = xml.elem("StringValue", string_value);
+    }
+    if let Some(binary_value) = value.binary_value.as_ref() {
+        xml = xml.elem(
+            "BinaryValue",
+            &base64::engine::general_purpose::STANDARD.encode(binary_value),
+        );
+    }
+    for string_value in &value.string_list_values {
+        xml = xml.elem("StringListValue", string_value);
+    }
+    for binary_value in &value.binary_list_values {
+        xml = xml.elem(
+            "BinaryListValue",
+            &base64::engine::general_purpose::STANDARD.encode(binary_value),
+        );
+    }
+
+    xml.end("Value").build()
 }
 
 fn response_with_result(action: &str, result: &str) -> String {
@@ -1674,8 +2498,10 @@ mod tests {
                     SendMessageInput {
                         body: "payload".to_owned(),
                         delay_seconds: None,
+                        message_attributes: BTreeMap::new(),
                         message_deduplication_id: None,
                         message_group_id: None,
+                        message_system_attributes: BTreeMap::new(),
                     },
                 )
                 .expect("message should send");
@@ -1727,8 +2553,10 @@ mod tests {
                     SendMessageInput {
                         body: "payload".to_owned(),
                         delay_seconds: None,
+                        message_attributes: BTreeMap::new(),
                         message_deduplication_id: None,
                         message_group_id: None,
+                        message_system_attributes: BTreeMap::new(),
                     },
                 )
                 .expect("message should send");
@@ -2027,7 +2855,10 @@ mod tests {
             &shutdown_signal,
         )
         .expect_err("unsupported query actions should fail");
-        assert_eq!(unsupported_query.code(), "UnsupportedOperation");
+        assert_eq!(
+            unsupported_query.code(),
+            "AWS.SimpleQueueService.UnsupportedOperation"
+        );
 
         let missing_target_request = crate::request::HttpRequest::parse(
             b"POST / HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-amz-json-1.0\r\nContent-Length: 2\r\n\r\n{}",
@@ -2042,7 +2873,10 @@ mod tests {
             &shutdown_signal,
         )
         .expect_err("missing JSON targets should fail");
-        assert_eq!(missing_target.code(), "UnsupportedOperation");
+        assert_eq!(
+            missing_target.code(),
+            "AWS.SimpleQueueService.UnsupportedOperation"
+        );
 
         let invalid_json_request = crate::request::HttpRequest::parse(
             b"POST / HTTP/1.1\r\nHost: localhost:4566\r\nContent-Type: application/x-amz-json-1.0\r\nX-Amz-Target: AmazonSQS.ListQueues\r\nContent-Length: 1\r\n\r\n{",
@@ -2193,8 +3027,91 @@ mod tests {
         );
         assert_eq!(
             super::unsupported_operation_error("Nope").code(),
-            "UnsupportedOperation"
+            "AWS.SimpleQueueService.UnsupportedOperation"
         );
+    }
+
+    #[test]
+    fn sqs_query_message_attribute_zero_index_returns_validation_error() {
+        let router = router();
+        let _ = router.handle_bytes(&query_request(
+            "/",
+            "Action=CreateQueue&QueueName=orders",
+        ));
+        let response = router.handle_bytes(&query_request(
+            "/000000000000/orders",
+            "Action=SendMessage&MessageBody=payload&MessageAttribute.1.Name=broken&MessageAttribute.1.Value.DataType=String&MessageAttribute.1.Value.StringListValue.0=value",
+        ));
+        let bytes = response.to_http_bytes();
+        let (status, _, body) = split_response(&bytes);
+
+        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        assert!(body.contains("<Code>InvalidParameterValue</Code>"));
+    }
+
+    #[test]
+    fn sqs_query_message_attribute_sparse_index_returns_validation_error() {
+        let router = router();
+        let _ = router.handle_bytes(&query_request(
+            "/",
+            "Action=CreateQueue&QueueName=orders",
+        ));
+        let response = router.handle_bytes(&query_request(
+            "/000000000000/orders",
+            "Action=SendMessage&MessageBody=payload&MessageAttribute.2.Name=broken&MessageAttribute.2.Value.DataType=String&MessageAttribute.2.Value.StringValue=value",
+        ));
+        let bytes = response.to_http_bytes();
+        let (status, _, body) = split_response(&bytes);
+
+        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        assert!(body.contains("<Code>InvalidParameterValue</Code>"));
+    }
+
+    #[test]
+    fn sqs_query_message_system_attribute_sparse_index_returns_validation_error()
+     {
+        let router = router();
+        let _ = router.handle_bytes(&query_request(
+            "/",
+            "Action=CreateQueue&QueueName=orders",
+        ));
+        let response = router.handle_bytes(&query_request(
+            "/000000000000/orders",
+            "Action=SendMessage&MessageBody=payload&MessageSystemAttribute.2.Name=AWSTraceHeader&MessageSystemAttribute.2.Value.DataType=String&MessageSystemAttribute.2.Value.StringValue=Root=1-67891233-abcdef012345678912345678",
+        ));
+        let bytes = response.to_http_bytes();
+        let (status, _, body) = split_response(&bytes);
+
+        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        assert!(body.contains("<Code>InvalidParameterValue</Code>"));
+    }
+
+    #[test]
+    fn sqs_query_binary_message_attributes_are_base64_decoded() {
+        let router = router();
+        let _ = router.handle_bytes(&query_request(
+            "/",
+            "Action=CreateQueue&QueueName=orders",
+        ));
+        let send = router.handle_bytes(&query_request(
+            "/000000000000/orders",
+            "Action=SendMessage&MessageBody=payload&MessageAttribute.1.Name=blob&MessageAttribute.1.Value.DataType=Binary&MessageAttribute.1.Value.BinaryValue=AQI=",
+        ));
+        let receive = router.handle_bytes(&query_request(
+            "/000000000000/orders",
+            "Action=ReceiveMessage&MessageAttributeName.1=All&VisibilityTimeout=0&WaitTimeSeconds=0",
+        ));
+        let send_bytes = send.to_http_bytes();
+        let receive_bytes = receive.to_http_bytes();
+        let (send_status, _, send_body) = split_response(&send_bytes);
+        let (receive_status, _, receive_body) = split_response(&receive_bytes);
+
+        assert_eq!(send_status, "HTTP/1.1 200 OK");
+        assert!(send_body.contains("<MD5OfMessageAttributes>"));
+        assert_eq!(receive_status, "HTTP/1.1 200 OK");
+        assert!(receive_body.contains(
+            "<MessageAttribute><Name>blob</Name><Value><DataType>Binary</DataType><BinaryValue>AQI=</BinaryValue></Value></MessageAttribute>"
+        ));
     }
 
     #[test]

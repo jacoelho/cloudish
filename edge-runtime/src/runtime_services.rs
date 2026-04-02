@@ -412,10 +412,17 @@ pub use sns::{
 };
 pub use sqs::request_runtime::SqsRequestRuntime;
 pub use sqs::{
-    BatchFailure, ChangeMessageVisibilityBatchEntryInput,
+    AddPermissionInput as SqsAddPermissionInput, BatchFailure,
+    CancelMessageMoveTaskInput, CancelMessageMoveTaskOutput,
+    ChangeMessageVisibilityBatchEntryInput,
     ChangeMessageVisibilityBatchOutput, ChangeMessageVisibilityBatchSuccess,
     CreateQueueInput, DeleteMessageBatchEntryInput, DeleteMessageBatchOutput,
-    DeleteMessageBatchSuccess, ReceiveMessageInput, ReceivedMessage,
+    DeleteMessageBatchSuccess, ListDeadLetterSourceQueuesInput,
+    ListMessageMoveTasksInput, ListMessageMoveTasksOutput,
+    ListMessageMoveTasksResultEntry, ListQueuesInput,
+    MessageAttributeValue as SqsMessageAttributeValue,
+    PaginatedDeadLetterSourceQueues, PaginatedQueues, ReceiveMessageInput,
+    ReceivedMessage, RemovePermissionInput as SqsRemovePermissionInput,
     SendMessageBatchEntryInput, SendMessageBatchOutput,
     SendMessageBatchSuccess, SendMessageInput, SendMessageOutput,
     SequentialSqsIdentifierSource, SqsError, SqsIdentifierSource,

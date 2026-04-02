@@ -1095,9 +1095,23 @@ impl AwsErrorShape for SqsError {
                     true,
                 )
             }
+            Self::InvalidAddress { message } => trusted_aws_error(
+                AwsErrorFamily::Validation,
+                "InvalidAddress",
+                message.clone(),
+                400,
+                true,
+            ),
             Self::BatchEntryIdsNotDistinct { message } => trusted_aws_error(
                 AwsErrorFamily::Validation,
                 "AWS.SimpleQueueService.BatchEntryIdsNotDistinct",
+                message.clone(),
+                400,
+                true,
+            ),
+            Self::BatchRequestTooLong { message } => trusted_aws_error(
+                AwsErrorFamily::Validation,
+                "BatchRequestTooLong",
                 message.clone(),
                 400,
                 true,
@@ -1116,6 +1130,13 @@ impl AwsErrorShape for SqsError {
                 400,
                 true,
             ),
+            Self::InvalidMessageContents { message } => trusted_aws_error(
+                AwsErrorFamily::Validation,
+                "InvalidMessageContents",
+                message.clone(),
+                400,
+                true,
+            ),
             Self::InvalidParameterValue { message } => trusted_aws_error(
                 AwsErrorFamily::Validation,
                 "InvalidParameterValue",
@@ -1126,6 +1147,20 @@ impl AwsErrorShape for SqsError {
             Self::MissingParameter { message } => trusted_aws_error(
                 AwsErrorFamily::MissingParameter,
                 "MissingParameter",
+                message.clone(),
+                400,
+                true,
+            ),
+            Self::OverLimit { message } => trusted_aws_error(
+                AwsErrorFamily::Validation,
+                "OverLimit",
+                message.clone(),
+                400,
+                true,
+            ),
+            Self::PurgeQueueInProgress { message } => trusted_aws_error(
+                AwsErrorFamily::Validation,
+                "AWS.SimpleQueueService.PurgeQueueInProgress",
                 message.clone(),
                 400,
                 true,
@@ -1173,9 +1208,16 @@ impl AwsErrorShape for SqsError {
                 400,
                 true,
             ),
+            Self::MessageNotInflight { message } => trusted_aws_error(
+                AwsErrorFamily::Validation,
+                "MessageNotInflight",
+                message.clone(),
+                400,
+                true,
+            ),
             Self::UnsupportedOperation { message } => trusted_aws_error(
                 AwsErrorFamily::UnsupportedOperation,
-                "UnsupportedOperation",
+                "AWS.SimpleQueueService.UnsupportedOperation",
                 message.clone(),
                 400,
                 true,

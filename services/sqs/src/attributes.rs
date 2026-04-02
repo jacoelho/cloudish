@@ -3,6 +3,7 @@ use crate::messages::timestamp_seconds;
 use crate::queues::{QueueRecord, SqsService, SqsWorld};
 use crate::redrive::{parse_redrive_policy, validate_redrive_policy_target};
 use crate::scope::SqsQueueIdentity;
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 pub(crate) const DEFAULT_DELAY_SECONDS: u32 = 0;
@@ -11,6 +12,10 @@ pub(crate) const DEFAULT_MESSAGE_RETENTION_PERIOD: u32 = 345_600;
 pub(crate) const DEFAULT_RECEIVE_WAIT_TIME_SECONDS: u32 = 0;
 pub(crate) const DEFAULT_VISIBILITY_TIMEOUT: u32 = 30;
 pub(crate) const MAX_DELAY_SECONDS: u32 = 900;
+pub(crate) const MAX_MAXIMUM_MESSAGE_SIZE: u32 = 262_144;
+pub(crate) const MAX_MESSAGE_RETENTION_PERIOD: u32 = 1_209_600;
+pub(crate) const MIN_MAXIMUM_MESSAGE_SIZE: u32 = 1_024;
+pub(crate) const MIN_MESSAGE_RETENTION_PERIOD: u32 = 60;
 pub(crate) const MAX_RECEIVE_WAIT_TIME_SECONDS: u32 = 20;
 pub(crate) const MAX_VISIBILITY_TIMEOUT: u32 = 43_200;
 
@@ -57,11 +62,49 @@ const UNSUPPORTED_CREATE_ATTRIBUTES: &[&str] = &[
     "RedriveAllowPolicy",
     "SqsManagedSseEnabled",
 ];
+const SUPPORTED_PERMISSION_ACTIONS: &[&str] = &[
+    "*",
+    "AddPermission",
+    "CancelMessageMoveTask",
+    "ChangeMessageVisibility",
+    "ChangeMessageVisibilityBatch",
+    "CreateQueue",
+    "DeleteMessage",
+    "DeleteMessageBatch",
+    "DeleteQueue",
+    "GetQueueAttributes",
+    "GetQueueUrl",
+    "ListDeadLetterSourceQueues",
+    "ListMessageMoveTasks",
+    "ListQueueTags",
+    "ListQueues",
+    "PurgeQueue",
+    "ReceiveMessage",
+    "RemovePermission",
+    "SendMessage",
+    "SendMessageBatch",
+    "SetQueueAttributes",
+    "StartMessageMoveTask",
+    "TagQueue",
+    "UntagQueue",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttributeMode {
     Create,
     Set,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddPermissionInput {
+    pub actions: Vec<String>,
+    pub aws_account_ids: Vec<String>,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovePermissionInput {
+    pub label: String,
 }
 
 impl SqsService {
@@ -155,6 +198,47 @@ impl SqsService {
             self.state.lock().unwrap_or_else(|poison| poison.into_inner());
 
         state.list_queue_tags(queue)
+    }
+
+    /// Adds a permission statement to the queue policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqsError`] when the queue does not exist, the input is invalid,
+    /// or the existing policy document is not valid JSON.
+    pub fn add_permission(
+        &self,
+        queue: &SqsQueueIdentity,
+        input: AddPermissionInput,
+    ) -> Result<(), SqsError> {
+        let mut state =
+            self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        state.add_permission(
+            queue,
+            input,
+            timestamp_seconds((self.time_source)()),
+        )
+    }
+
+    /// Removes a permission statement from the queue policy by label.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqsError`] when the queue does not exist or the label is invalid.
+    pub fn remove_permission(
+        &self,
+        queue: &SqsQueueIdentity,
+        input: RemovePermissionInput,
+    ) -> Result<(), SqsError> {
+        let mut state =
+            self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        state.remove_permission(
+            queue,
+            input,
+            timestamp_seconds((self.time_source)()),
+        )
     }
 }
 
@@ -260,6 +344,57 @@ impl SqsWorld {
             .tags
             .clone())
     }
+
+    pub(crate) fn add_permission(
+        &mut self,
+        queue: &SqsQueueIdentity,
+        input: AddPermissionInput,
+        now_seconds: u64,
+    ) -> Result<(), SqsError> {
+        validate_add_permission_input(&input)?;
+        let queue_record =
+            self.queues.get_mut(queue).ok_or(SqsError::QueueDoesNotExist)?;
+        let mut document = queue_record.policy_document()?;
+        let statement = permission_statement(queue_record, &input);
+        let statements = document
+            .entry("Statement".to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Some(statements) = statements.as_array_mut() else {
+            return Err(invalid_policy_document());
+        };
+
+        statements.retain(|statement| {
+            statement.get("Sid") != Some(&json!(input.label))
+        });
+        statements.push(statement);
+        queue_record.set_policy_document(document, now_seconds)?;
+
+        Ok(())
+    }
+
+    pub(crate) fn remove_permission(
+        &mut self,
+        queue: &SqsQueueIdentity,
+        input: RemovePermissionInput,
+        now_seconds: u64,
+    ) -> Result<(), SqsError> {
+        validate_permission_label(&input.label)?;
+        let queue_record =
+            self.queues.get_mut(queue).ok_or(SqsError::QueueDoesNotExist)?;
+        let mut document = queue_record.policy_document()?;
+        let statements = document
+            .entry("Statement".to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Some(statements) = statements.as_array_mut() else {
+            return Err(invalid_policy_document());
+        };
+        statements.retain(|statement| {
+            statement.get("Sid") != Some(&json!(input.label))
+        });
+        queue_record.set_policy_document(document, now_seconds)?;
+
+        Ok(())
+    }
 }
 
 impl QueueRecord {
@@ -361,6 +496,132 @@ impl QueueRecord {
             .get("DelaySeconds")
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_DELAY_SECONDS)
+    }
+
+    pub(crate) fn maximum_message_size(&self) -> u32 {
+        self.attributes
+            .get("MaximumMessageSize")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_MAXIMUM_MESSAGE_SIZE)
+    }
+
+    pub(crate) fn policy_document(
+        &self,
+    ) -> Result<Map<String, Value>, SqsError> {
+        match self.attributes.get("Policy") {
+            Some(policy) => serde_json::from_str(policy)
+                .map_err(|_| invalid_policy_document()),
+            None => Ok(Map::from_iter([
+                ("Version".to_owned(), Value::String("2012-10-17".to_owned())),
+                ("Statement".to_owned(), Value::Array(Vec::new())),
+            ])),
+        }
+    }
+
+    pub(crate) fn set_policy_document(
+        &mut self,
+        document: Map<String, Value>,
+        now_seconds: u64,
+    ) -> Result<(), SqsError> {
+        let policy =
+            serde_json::to_string(&Value::Object(document)).map_err(|_| {
+                SqsError::InvalidParameterValue {
+                    message: "Value for attribute Policy must be valid JSON."
+                        .to_owned(),
+                }
+            })?;
+        self.attributes.insert("Policy".to_owned(), policy);
+        self.last_modified_timestamp = now_seconds;
+
+        Ok(())
+    }
+}
+
+fn validate_add_permission_input(
+    input: &AddPermissionInput,
+) -> Result<(), SqsError> {
+    validate_permission_label(&input.label)?;
+    if input.aws_account_ids.is_empty() || input.actions.is_empty() {
+        return Err(SqsError::InvalidParameterValue {
+            message: "AddPermission requires at least one AWS account ID and one action.".to_owned(),
+        });
+    }
+    for account_id in &input.aws_account_ids {
+        if account_id.parse::<u64>().is_err() || account_id.len() != 12 {
+            return Err(SqsError::InvalidParameterValue {
+                message: format!(
+                    "Value {account_id} for parameter AWSAccountId is invalid."
+                ),
+            });
+        }
+    }
+    for action in &input.actions {
+        if action.trim().is_empty() {
+            return Err(SqsError::InvalidParameterValue {
+                message: "ActionName entries must not be empty.".to_owned(),
+            });
+        }
+        if !SUPPORTED_PERMISSION_ACTIONS.contains(&action.as_str()) {
+            return Err(SqsError::InvalidParameterValue {
+                message: format!(
+                    "Value {action} for parameter ActionName is invalid."
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_permission_label(label: &str) -> Result<(), SqsError> {
+    if label.is_empty()
+        || label.len() > 80
+        || !label.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+        })
+    {
+        return Err(SqsError::InvalidParameterValue {
+            message: format!("Value {label} for parameter Label is invalid."),
+        });
+    }
+
+    Ok(())
+}
+
+fn permission_statement(
+    queue: &QueueRecord,
+    input: &AddPermissionInput,
+) -> Value {
+    let actions = input
+        .actions
+        .iter()
+        .map(|action| Value::String(permission_action(action)))
+        .collect::<Vec<_>>();
+    let principals = input
+        .aws_account_ids
+        .iter()
+        .map(|account_id| {
+            Value::String(format!("arn:aws:iam::{account_id}:root"))
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "Sid": input.label,
+        "Effect": "Allow",
+        "Principal": { "AWS": principals },
+        "Action": actions,
+        "Resource": queue.queue_arn(),
+    })
+}
+
+fn permission_action(action: &str) -> String {
+    let action = action.strip_prefix("SQS:").unwrap_or(action);
+    format!("SQS:{action}")
+}
+
+fn invalid_policy_document() -> SqsError {
+    SqsError::InvalidParameterValue {
+        message: "Value for attribute Policy must be valid JSON.".to_owned(),
     }
 }
 
@@ -493,12 +754,18 @@ pub(crate) fn normalize_queue_attributes(
                 }
                 normalized_fifo
             }
-            "MaximumMessageSize" => {
-                validate_positive_attribute(&name, &value)?
-            }
-            "MessageRetentionPeriod" => {
-                validate_positive_attribute(&name, &value)?
-            }
+            "MaximumMessageSize" => validate_attribute_range(
+                &name,
+                &value,
+                MIN_MAXIMUM_MESSAGE_SIZE,
+                MAX_MAXIMUM_MESSAGE_SIZE,
+            )?,
+            "MessageRetentionPeriod" => validate_attribute_range(
+                &name,
+                &value,
+                MIN_MESSAGE_RETENTION_PERIOD,
+                MAX_MESSAGE_RETENTION_PERIOD,
+            )?,
             "Policy" => value,
             "ReceiveMessageWaitTimeSeconds" => validate_numeric_attribute(
                 &name,
@@ -619,15 +886,25 @@ pub(crate) fn normalize_boolean_attribute(
     Ok(parse_boolean_attribute(name, value)?.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn validate_positive_attribute(
     name: &str,
     value: &str,
+) -> Result<String, SqsError> {
+    validate_attribute_range(name, value, 1, u32::MAX)
+}
+
+pub(crate) fn validate_attribute_range(
+    name: &str,
+    value: &str,
+    min_value: u32,
+    max_value: u32,
 ) -> Result<String, SqsError> {
     let parsed =
         value.parse::<u32>().map_err(|_| SqsError::InvalidParameterValue {
             message: format!("Value {value} for attribute {name} is invalid."),
         })?;
-    if parsed == 0 {
+    if !(min_value..=max_value).contains(&parsed) {
         return Err(SqsError::InvalidParameterValue {
             message: format!("Value {value} for attribute {name} is invalid."),
         });

@@ -167,8 +167,10 @@ fn dispatch_eventbridge_delivery(
                     body: String::from_utf8_lossy(&delivery.payload)
                         .into_owned(),
                     delay_seconds: None,
+                    message_attributes: BTreeMap::new(),
                     message_deduplication_id: None,
                     message_group_id: None,
+                    message_system_attributes: BTreeMap::new(),
                 },
             );
         }

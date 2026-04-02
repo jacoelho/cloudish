@@ -4255,7 +4255,11 @@ mod tests {
             .receive_message(
                 &queue,
                 ReceiveMessageInput {
+                    attribute_names: Vec::new(),
                     max_number_of_messages: Some(10),
+                    message_attribute_names: Vec::new(),
+                    message_system_attribute_names: Vec::new(),
+                    receive_request_attempt_id: None,
                     visibility_timeout: None,
                     wait_time_seconds: None,
                 },

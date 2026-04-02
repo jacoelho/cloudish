@@ -1,7 +1,10 @@
 use crate::LambdaError;
 use aws::RegionId;
+use base64::Engine;
 use serde::Serialize;
-use sqs::{ReceivedMessage, SqsQueueIdentity, SqsService};
+use sqs::{
+    MessageAttributeValue, ReceivedMessage, SqsQueueIdentity, SqsService,
+};
 
 const DEFAULT_EVENT_SOURCE_MAPPING_BATCH_SIZE: u32 = 10;
 const DEFAULT_EVENT_SOURCE_MAPPING_WINDOW_SECONDS: u32 = 0;
@@ -214,7 +217,7 @@ pub(crate) fn build_sqs_event(
             "receiptHandle": message.receipt_handle,
             "body": message.body,
             "attributes": message.attributes,
-            "messageAttributes": {},
+            "messageAttributes": sqs_event_message_attributes(&message.message_attributes),
             "md5OfBody": message.md5_of_body,
             "eventSource": "aws:sqs",
             "eventSourceARN": event_source_arn,
@@ -222,6 +225,43 @@ pub(crate) fn build_sqs_event(
         })).collect::<Vec<_>>(),
     }))
     .map_err(|error| LambdaError::Internal { message: error.to_string() })
+}
+
+fn sqs_event_message_attributes(
+    attributes: &std::collections::BTreeMap<String, MessageAttributeValue>,
+) -> serde_json::Value {
+    serde_json::Value::Object(
+        attributes
+            .iter()
+            .map(|(name, value)| {
+                let mut attribute = serde_json::Map::from_iter([
+                    (
+                        "dataType".to_owned(),
+                        serde_json::json!(&value.data_type),
+                    ),
+                    ("stringListValues".to_owned(), serde_json::json!([])),
+                    ("binaryListValues".to_owned(), serde_json::json!([])),
+                ]);
+                if let Some(string_value) = value.string_value.as_deref() {
+                    attribute.insert(
+                        "stringValue".to_owned(),
+                        serde_json::json!(string_value),
+                    );
+                }
+                if let Some(binary_value) = value.binary_value.as_ref() {
+                    attribute.insert(
+                        "binaryValue".to_owned(),
+                        serde_json::json!(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(binary_value)
+                        ),
+                    );
+                }
+
+                (name.clone(), serde_json::Value::Object(attribute))
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -238,8 +278,8 @@ mod tests {
     use aws::{AccountId, RegionId};
     use serde_json::json;
     use sqs::{
-        CreateQueueInput, ReceivedMessage, SqsError, SqsQueueIdentity,
-        SqsScope, SqsService,
+        CreateQueueInput, MessageAttributeValue, ReceivedMessage, SqsError,
+        SqsQueueIdentity, SqsScope, SqsService,
     };
     use std::collections::BTreeMap;
 
@@ -455,6 +495,29 @@ mod tests {
                 )]),
                 body: r#"{"job":"run"}"#.to_owned(),
                 md5_of_body: "abc".to_owned(),
+                md5_of_message_attributes: None,
+                message_attributes: BTreeMap::from([
+                    (
+                        "store".to_owned(),
+                        MessageAttributeValue {
+                            binary_list_values: Vec::new(),
+                            binary_value: None,
+                            data_type: "String".to_owned(),
+                            string_list_values: Vec::new(),
+                            string_value: Some("eu-west".to_owned()),
+                        },
+                    ),
+                    (
+                        "blob".to_owned(),
+                        MessageAttributeValue {
+                            binary_list_values: Vec::new(),
+                            binary_value: Some(vec![0x01, 0x02]),
+                            data_type: "Binary".to_owned(),
+                            string_list_values: Vec::new(),
+                            string_value: None,
+                        },
+                    ),
+                ]),
                 message_id: "m-1".to_owned(),
                 receipt_handle: "r-1".to_owned(),
             }],
@@ -471,7 +534,20 @@ mod tests {
                     "attributes": {
                         "ApproximateReceiveCount": "1"
                     },
-                    "messageAttributes": {},
+                    "messageAttributes": {
+                        "blob": {
+                            "binaryListValues": [],
+                            "binaryValue": "AQI=",
+                            "dataType": "Binary",
+                            "stringListValues": []
+                        },
+                        "store": {
+                            "dataType": "String",
+                            "stringListValues": [],
+                            "binaryListValues": [],
+                            "stringValue": "eu-west"
+                        }
+                    },
                     "md5OfBody": "abc",
                     "eventSource": "aws:sqs",
                     "eventSourceARN": "arn:aws:sqs:eu-west-2:000000000000:source",
