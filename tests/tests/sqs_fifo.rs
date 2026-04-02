@@ -112,10 +112,12 @@ async fn sqs_fifo_batch_and_redrive_round_trips() {
     let sources = client
         .list_dead_letter_source_queues()
         .queue_url(&dlq_url)
+        .max_results(1)
         .send()
         .await
         .expect("dlq sources should list");
     assert_eq!(sources.queue_urls(), std::slice::from_ref(&source_url));
+    assert!(sources.next_token().is_none());
 
     let moved = client
         .start_message_move_task()
@@ -124,6 +126,15 @@ async fn sqs_fifo_batch_and_redrive_round_trips() {
         .await
         .expect("move task should succeed");
     assert!(moved.task_handle().is_some());
+    let tasks = client
+        .list_message_move_tasks()
+        .source_arn(&dlq_arn)
+        .max_results(1)
+        .send()
+        .await
+        .expect("move tasks should list");
+    assert_eq!(tasks.results().len(), 1);
+    assert_eq!(tasks.results()[0].status(), Some("COMPLETED"));
 
     let redriven = client
         .receive_message()
@@ -147,5 +158,134 @@ async fn sqs_fifo_batch_and_redrive_round_trips() {
     assert_eq!(error.code(), Some("MissingParameter"));
 
     assert!(runtime.state_directory().exists());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn sqs_fifo_receive_request_attempt_id_reuses_the_first_receive() {
+    let runtime = RuntimeServer::spawn("sdk-sqs-fifo-attempt").await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let client = Client::new(&config);
+
+    let queue_url = client
+        .create_queue()
+        .queue_name("attempts.fifo")
+        .attributes(QueueAttributeName::FifoQueue, "true")
+        .attributes(QueueAttributeName::ContentBasedDeduplication, "true")
+        .send()
+        .await
+        .expect("fifo queue should be created")
+        .queue_url()
+        .expect("queue URL should be returned")
+        .to_owned();
+
+    client
+        .send_message()
+        .queue_url(&queue_url)
+        .message_body("payload")
+        .message_group_id("group-1")
+        .send()
+        .await
+        .expect("fifo message should send");
+
+    let first = client
+        .receive_message()
+        .queue_url(&queue_url)
+        .receive_request_attempt_id("attempt-1")
+        .visibility_timeout(30)
+        .wait_time_seconds(0)
+        .send()
+        .await
+        .expect("first receive should succeed");
+    let second = client
+        .receive_message()
+        .queue_url(&queue_url)
+        .receive_request_attempt_id("attempt-1")
+        .visibility_timeout(30)
+        .wait_time_seconds(0)
+        .send()
+        .await
+        .expect("repeated receive should reuse the cached response");
+
+    let first_message =
+        first.messages().first().expect("first message should exist");
+    let second_message =
+        second.messages().first().expect("second message should exist");
+    assert_eq!(first_message.message_id(), second_message.message_id());
+    assert_eq!(
+        first_message.receipt_handle(),
+        second_message.receipt_handle()
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn sqs_fifo_receive_request_attempt_id_does_not_replay_deleted_messages()
+{
+    let runtime = RuntimeServer::spawn("sdk-sqs-fifo-attempt-delete").await;
+    let target = SdkSmokeTarget::new(
+        format!("http://{}", runtime.address()),
+        "eu-west-2",
+    );
+    let config = target.load().await;
+    let client = Client::new(&config);
+
+    let queue_url = client
+        .create_queue()
+        .queue_name("attempt-delete.fifo")
+        .attributes(QueueAttributeName::FifoQueue, "true")
+        .attributes(QueueAttributeName::ContentBasedDeduplication, "true")
+        .send()
+        .await
+        .expect("fifo queue should be created")
+        .queue_url()
+        .expect("queue URL should be returned")
+        .to_owned();
+
+    client
+        .send_message()
+        .queue_url(&queue_url)
+        .message_body("payload")
+        .message_group_id("group-1")
+        .send()
+        .await
+        .expect("fifo message should send");
+
+    let first = client
+        .receive_message()
+        .queue_url(&queue_url)
+        .receive_request_attempt_id("attempt-1")
+        .visibility_timeout(30)
+        .wait_time_seconds(0)
+        .send()
+        .await
+        .expect("first receive should succeed");
+    let receipt_handle = first.messages()[0]
+        .receipt_handle()
+        .expect("receipt handle should exist");
+    client
+        .delete_message()
+        .queue_url(&queue_url)
+        .receipt_handle(receipt_handle)
+        .send()
+        .await
+        .expect("message should delete");
+
+    let second = client
+        .receive_message()
+        .queue_url(&queue_url)
+        .receive_request_attempt_id("attempt-1")
+        .visibility_timeout(30)
+        .wait_time_seconds(0)
+        .send()
+        .await
+        .expect("retry after delete should succeed");
+    assert!(second.messages().is_empty());
+
     runtime.shutdown().await;
 }
