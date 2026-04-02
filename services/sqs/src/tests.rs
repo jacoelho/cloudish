@@ -1368,7 +1368,7 @@ fn sqs_add_permission_updates_queue_policy() {
         )
         .expect("permission should be added");
     let attributes = service
-        .get_queue_attributes(&queue, &[String::from("Policy")])
+        .get_queue_attributes(&queue, &["Policy"])
         .expect("policy should fetch");
     let policy = attributes.get("Policy").expect("policy should exist");
     let policy: serde_json::Value =
@@ -1389,7 +1389,7 @@ fn sqs_add_permission_updates_queue_policy() {
         )
         .expect("permission should remove");
     let attributes = service
-        .get_queue_attributes(&queue, &[String::from("Policy")])
+        .get_queue_attributes(&queue, &["Policy"])
         .expect("policy should fetch");
     let policy: serde_json::Value = serde_json::from_str(
         attributes.get("Policy").expect("policy should exist"),
@@ -2252,7 +2252,7 @@ fn sqs_standard_internal_attribute_validation_helpers_cover_remaining_edges() {
     let (identity, fifo_identity) = queue_identities();
 
     assert_eq!(
-        normalize_requested_attribute_names(&[])
+        normalize_requested_attribute_names(&[] as &[&str])
             .expect("empty requests should normalize"),
         Vec::<&str>::new()
     );
@@ -2702,12 +2702,12 @@ fn sqs_standard_internal_queue_metrics_and_wrapper_defaults_cover_remaining_edge
         .expect("receive should succeed");
     assert_eq!(received.len(), 1);
     let all_attributes = service
-        .get_queue_attributes(&queue, &[])
+        .get_queue_attributes(&queue, &[] as &[&str])
         .expect("all queue attributes should return");
     let filtered_attributes = service
         .get_queue_attributes(
             &queue,
-            &["ApproximateNumberOfMessagesNotVisible".to_owned()],
+            &["ApproximateNumberOfMessagesNotVisible"],
         )
         .expect("filtered queue attributes should return");
     assert_eq!(all_attributes["ApproximateNumberOfMessages"], "1");
@@ -2728,7 +2728,7 @@ fn sqs_standard_internal_queue_metrics_and_wrapper_defaults_cover_remaining_edge
     service.delete_queue(&queue).expect("queue deletes should succeed");
     assert_eq!(
         service
-            .get_queue_attributes(&queue, &[])
+            .get_queue_attributes(&queue, &[] as &[&str])
             .expect_err("deleted queues should not resolve"),
         SqsError::QueueDoesNotExist
     );

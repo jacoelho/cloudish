@@ -182,6 +182,15 @@ pub(crate) struct ReceiveSelectors {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedReceiveRequest {
+    pub(crate) max_number_of_messages: u32,
+    pub(crate) receive_request_attempt_id: Option<String>,
+    pub(crate) selectors: ReceiveSelectors,
+    pub(crate) visibility_timeout: u32,
+    pub(crate) wait_time_seconds: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReceiveAttemptRecord {
     pub(crate) expires_at_millis: u64,
     pub(crate) receipt_handles_by_message_id: BTreeMap<String, String>,
@@ -238,9 +247,14 @@ impl SqsService {
         let mut next_receipt_handle =
             || self.identifier_source.next_receipt_handle();
         let now_millis = timestamp_millis((self.time_source)());
+        let resolved = {
+            let state =
+                self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+            state.resolve_receive_request(queue, &input)?
+        };
         let first_attempt = self.receive_message_attempt(
             queue,
-            input.clone(),
+            &resolved,
             now_millis,
             &mut next_receipt_handle,
         )?;
@@ -275,7 +289,7 @@ impl SqsService {
 
             let attempt = self.receive_message_attempt(
                 queue,
-                input.clone(),
+                &resolved,
                 current_millis,
                 &mut next_receipt_handle,
             )?;
@@ -290,7 +304,7 @@ impl SqsService {
     fn receive_message_attempt(
         &self,
         queue: &SqsQueueIdentity,
-        input: ReceiveMessageInput,
+        input: &ResolvedReceiveRequest,
         now_millis: u64,
         next_receipt_handle: &mut dyn FnMut() -> String,
     ) -> Result<ReceiveMessageAttempt, SqsError> {
@@ -472,7 +486,7 @@ impl SqsWorld {
     pub(crate) fn receive_message(
         &mut self,
         queue: &SqsQueueIdentity,
-        input: ReceiveMessageInput,
+        input: &ResolvedReceiveRequest,
         now_millis: u64,
         next_receipt_handle: &mut dyn FnMut() -> String,
     ) -> Result<ReceiveMessageAttempt, SqsError> {
@@ -486,19 +500,6 @@ impl SqsWorld {
                 .queues
                 .get_mut(queue)
                 .ok_or(SqsError::QueueDoesNotExist)?;
-            let max_number_of_messages =
-                input.max_number_of_messages.unwrap_or(1);
-            validate_max_number_of_messages(max_number_of_messages)?;
-            let wait_time_seconds = input
-                .wait_time_seconds
-                .unwrap_or_else(|| queue.receive_wait_time());
-            validate_wait_time_seconds(wait_time_seconds)?;
-            let visibility_timeout = input
-                .visibility_timeout
-                .unwrap_or_else(|| queue.visibility_timeout());
-            validate_visibility_timeout(visibility_timeout)?;
-            let selectors = receive_selectors(&input)?;
-
             if queue.is_fifo()
                 && let Some(attempt_id) =
                     input.receive_request_attempt_id.as_deref()
@@ -507,10 +508,10 @@ impl SqsWorld {
                 if let Some(cached) = queue.replay_receive_attempt(
                     attempt_id,
                     now_millis,
-                    visibility_timeout,
+                    input.visibility_timeout,
                 ) {
                     return Ok(ReceiveMessageAttempt {
-                        effective_wait_time_seconds: wait_time_seconds,
+                        effective_wait_time_seconds: input.wait_time_seconds,
                         received: cached,
                     });
                 }
@@ -518,18 +519,18 @@ impl SqsWorld {
 
             let outcome = if queue.is_fifo() {
                 queue.receive_fifo_messages(
-                    max_number_of_messages,
+                    input.max_number_of_messages,
                     now_millis,
-                    &selectors,
-                    visibility_timeout,
+                    &input.selectors,
+                    input.visibility_timeout,
                     next_receipt_handle,
                 )
             } else {
                 queue.receive_standard_messages(
-                    max_number_of_messages,
+                    input.max_number_of_messages,
                     now_millis,
-                    &selectors,
-                    visibility_timeout,
+                    &input.selectors,
+                    input.visibility_timeout,
                     next_receipt_handle,
                 )
             };
@@ -563,7 +564,7 @@ impl SqsWorld {
             (
                 outcome.received,
                 outcome.dead_letter_messages,
-                wait_time_seconds,
+                input.wait_time_seconds,
                 queue
                     .redrive_policy_document()
                     .map(|policy| policy.dead_letter_target_arn),
@@ -590,6 +591,35 @@ impl SqsWorld {
         Ok(ReceiveMessageAttempt {
             effective_wait_time_seconds: wait_time_seconds,
             received,
+        })
+    }
+
+    pub(crate) fn resolve_receive_request(
+        &self,
+        queue: &SqsQueueIdentity,
+        input: &ReceiveMessageInput,
+    ) -> Result<ResolvedReceiveRequest, SqsError> {
+        let queue =
+            self.queues.get(queue).ok_or(SqsError::QueueDoesNotExist)?;
+        let max_number_of_messages = input.max_number_of_messages.unwrap_or(1);
+        validate_max_number_of_messages(max_number_of_messages)?;
+        let wait_time_seconds = input
+            .wait_time_seconds
+            .unwrap_or_else(|| queue.receive_wait_time());
+        validate_wait_time_seconds(wait_time_seconds)?;
+        let visibility_timeout = input
+            .visibility_timeout
+            .unwrap_or_else(|| queue.visibility_timeout());
+        validate_visibility_timeout(visibility_timeout)?;
+
+        Ok(ResolvedReceiveRequest {
+            max_number_of_messages,
+            receive_request_attempt_id: input
+                .receive_request_attempt_id
+                .clone(),
+            selectors: receive_selectors(input)?,
+            visibility_timeout,
+            wait_time_seconds,
         })
     }
 

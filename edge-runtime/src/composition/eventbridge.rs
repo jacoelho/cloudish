@@ -94,7 +94,7 @@ impl EventBridgeDeliveryDispatcher for EventBridgeDispatcher {
                 };
                 let queue = sqs::SqsQueueIdentity::from_arn(&target.arn)
                     .map_err(|_| missing_target_error(&target.arn))?;
-                sqs.get_queue_attributes(&queue, &[])
+                sqs.get_queue_attributes(&queue, &[] as &[&str])
                     .map(|_| ())
                     .map_err(|_| missing_target_error(&target.arn))
             }

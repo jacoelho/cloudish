@@ -116,7 +116,7 @@ impl SqsService {
     pub fn get_queue_attributes(
         &self,
         queue: &SqsQueueIdentity,
-        attribute_names: &[String],
+        attribute_names: &[impl AsRef<str>],
     ) -> Result<BTreeMap<String, String>, SqsError> {
         let state =
             self.state.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -246,7 +246,7 @@ impl SqsWorld {
     pub(crate) fn get_queue_attributes(
         &self,
         queue: &SqsQueueIdentity,
-        attribute_names: &[String],
+        attribute_names: &[impl AsRef<str>],
         now_seconds: u64,
     ) -> Result<BTreeMap<String, String>, SqsError> {
         let queue =
@@ -647,22 +647,23 @@ pub(crate) fn ensure_create_attributes_are_compatible(
 }
 
 pub(crate) fn normalize_requested_attribute_names(
-    attribute_names: &[String],
+    attribute_names: &[impl AsRef<str>],
 ) -> Result<Vec<&str>, SqsError> {
     if attribute_names.is_empty()
-        || attribute_names.iter().any(|name| name == "All")
+        || attribute_names.iter().any(|name| name.as_ref() == "All")
     {
         return Ok(Vec::new());
     }
 
     let mut requested = Vec::new();
     for name in attribute_names {
-        if !SUPPORTED_ATTRIBUTES.contains(&name.as_str()) {
+        let name = name.as_ref();
+        if !SUPPORTED_ATTRIBUTES.contains(&name) {
             return Err(SqsError::InvalidAttributeName {
-                attribute_name: name.clone(),
+                attribute_name: name.to_owned(),
             });
         }
-        requested.push(name.as_str());
+        requested.push(name);
     }
 
     Ok(requested)

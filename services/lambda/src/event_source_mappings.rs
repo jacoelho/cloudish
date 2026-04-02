@@ -154,7 +154,7 @@ pub(crate) fn validate_event_source_mapping_batch_size(
         });
     }
     let attributes = sqs
-        .get_queue_attributes(queue_identity, &[String::from("FifoQueue")])
+        .get_queue_attributes(queue_identity, &["FifoQueue"])
         .map_err(|error| LambdaError::InvalidParameterValue {
             message: error.to_string(),
         })?;
@@ -184,7 +184,7 @@ pub(crate) fn validate_event_source_mapping_window(
         });
     }
     let attributes = sqs
-        .get_queue_attributes(queue_identity, &[String::from("FifoQueue")])
+        .get_queue_attributes(queue_identity, &["FifoQueue"])
         .map_err(|error| LambdaError::InvalidParameterValue {
             message: error.to_string(),
         })?;

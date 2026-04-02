@@ -3612,9 +3612,11 @@ fn ensure_destination_queue_exists(
     sqs: &SqsService,
     queue_identity: &SqsQueueIdentity,
 ) -> Result<(), LambdaError> {
-    sqs.get_queue_attributes(queue_identity, &[]).map_err(|error| {
-        LambdaError::InvalidParameterValue { message: error.to_string() }
-    })?;
+    sqs.get_queue_attributes(queue_identity, &[] as &[&str]).map_err(
+        |error| LambdaError::InvalidParameterValue {
+            message: error.to_string(),
+        },
+    )?;
 
     Ok(())
 }
@@ -4057,7 +4059,7 @@ mod tests {
     }
 
     fn queue_arn(sqs: &SqsService, queue: &SqsQueueIdentity) -> String {
-        sqs.get_queue_attributes(queue, &[String::from("QueueArn")])
+        sqs.get_queue_attributes(queue, &["QueueArn"])
             .unwrap()
             .remove("QueueArn")
             .expect("queue ARN should be present")

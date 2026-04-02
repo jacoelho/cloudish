@@ -81,7 +81,7 @@ impl S3NotificationTransport for S3NotificationDispatcher {
                 let queue =
                     sqs::SqsQueueIdentity::from_arn(destination_arn)
                         .map_err(|_| invalid_destination(destination_arn))?;
-                sqs.get_queue_attributes(&queue, &Vec::new())
+                sqs.get_queue_attributes(&queue, &[] as &[&str])
                     .map(|_| ())
                     .map_err(|_| invalid_destination(destination_arn))
             }

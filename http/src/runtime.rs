@@ -4155,7 +4155,7 @@ mod tests {
             .expect("queue should be created");
         let queue_arn = runtime
             .sqs()
-            .get_queue_attributes(&queue, &["QueueArn".to_owned()])
+            .get_queue_attributes(&queue, &["QueueArn"])
             .expect("queue attributes should load")
             .get("QueueArn")
             .expect("queue arn should be present")
