@@ -1,5 +1,8 @@
 use crate::errors::SqsError;
-use crate::messages::PendingQueueMove;
+use crate::messages::{
+    ListDeadLetterSourceQueuesInput, PaginatedDeadLetterSourceQueues,
+    PendingQueueMove, timestamp_seconds,
+};
 use crate::queues::{QueueRecord, SqsService, SqsWorld};
 use crate::scope::SqsQueueIdentity;
 use aws::Arn;
@@ -17,6 +20,53 @@ pub struct StartMessageMoveTaskInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartMessageMoveTaskOutput {
     pub task_handle: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListMessageMoveTasksInput {
+    pub max_results: Option<i32>,
+    pub source_arn: Arn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListMessageMoveTasksOutput {
+    pub results: Vec<ListMessageMoveTasksResultEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListMessageMoveTasksResultEntry {
+    pub approximate_number_of_messages_moved: i64,
+    pub approximate_number_of_messages_to_move: Option<i64>,
+    pub destination_arn: Option<String>,
+    pub failure_reason: Option<String>,
+    pub max_number_of_messages_per_second: Option<i32>,
+    pub source_arn: String,
+    pub started_timestamp: i64,
+    pub status: String,
+    pub task_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelMessageMoveTaskInput {
+    pub task_handle: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelMessageMoveTaskOutput {
+    pub approximate_number_of_messages_moved: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessageMoveTaskRecord {
+    pub(crate) approximate_number_of_messages_moved: i64,
+    pub(crate) approximate_number_of_messages_to_move: Option<i64>,
+    pub(crate) destination_arn: Option<String>,
+    pub(crate) failure_reason: Option<String>,
+    pub(crate) max_number_of_messages_per_second: Option<i32>,
+    pub(crate) source_arn: String,
+    pub(crate) started_timestamp: i64,
+    pub(crate) status: String,
+    pub(crate) task_handle: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,7 +90,26 @@ impl SqsService {
         let state =
             self.state.lock().unwrap_or_else(|poison| poison.into_inner());
 
-        state.list_dead_letter_source_queues(queue)
+        Ok(state
+            .list_dead_letter_source_queues_page(
+                queue,
+                &ListDeadLetterSourceQueuesInput {
+                    max_results: None,
+                    next_token: None,
+                },
+            )?
+            .queue_urls)
+    }
+
+    pub fn list_dead_letter_source_queues_page(
+        &self,
+        queue: &SqsQueueIdentity,
+        input: &ListDeadLetterSourceQueuesInput,
+    ) -> Result<PaginatedDeadLetterSourceQueues, SqsError> {
+        let state =
+            self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        state.list_dead_letter_source_queues_page(queue, input)
     }
 
     /// Starts a dead-letter redrive task from the provided source queue ARN.
@@ -56,20 +125,43 @@ impl SqsService {
         let mut state =
             self.state.lock().unwrap_or_else(|poison| poison.into_inner());
 
-        state.start_message_move_task(input)
+        state.start_message_move_task(
+            input,
+            timestamp_seconds((self.time_source)()),
+        )
+    }
+
+    pub fn list_message_move_tasks(
+        &self,
+        input: ListMessageMoveTasksInput,
+    ) -> Result<ListMessageMoveTasksOutput, SqsError> {
+        let state =
+            self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        state.list_message_move_tasks(input)
+    }
+
+    pub fn cancel_message_move_task(
+        &self,
+        input: CancelMessageMoveTaskInput,
+    ) -> Result<CancelMessageMoveTaskOutput, SqsError> {
+        let mut state =
+            self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        state.cancel_message_move_task(input)
     }
 }
 
 impl SqsWorld {
-    pub(crate) fn list_dead_letter_source_queues(
+    pub(crate) fn list_dead_letter_source_queues_page(
         &self,
         queue: &SqsQueueIdentity,
-    ) -> Result<Vec<SqsQueueIdentity>, SqsError> {
+        input: &ListDeadLetterSourceQueuesInput,
+    ) -> Result<PaginatedDeadLetterSourceQueues, SqsError> {
         let target_queue =
             self.queues.get(queue).ok_or(SqsError::QueueDoesNotExist)?;
         let target_arn = target_queue.queue_arn();
-
-        Ok(self
+        let mut queue_urls = self
             .queues
             .values()
             .filter_map(|candidate| {
@@ -80,12 +172,26 @@ impl SqsWorld {
                     })
                     .map(|_| candidate.identity.clone())
             })
-            .collect())
+            .collect::<Vec<_>>();
+        queue_urls.sort();
+        let context = crate::queues::pagination_context(
+            "ListDeadLetterSourceQueues",
+            &serde_json::json!({ "queue": target_arn }),
+        );
+        let (queue_urls, next_token) = crate::queues::paginate_items(
+            &queue_urls,
+            input.max_results,
+            input.next_token.as_deref(),
+            &context,
+        )?;
+
+        Ok(PaginatedDeadLetterSourceQueues { next_token, queue_urls })
     }
 
     pub(crate) fn start_message_move_task(
         &mut self,
         input: StartMessageMoveTaskInput,
+        now_seconds: u64,
     ) -> Result<StartMessageMoveTaskOutput, SqsError> {
         if input.max_number_of_messages_per_second.is_some() {
             return Err(SqsError::UnsupportedOperation {
@@ -93,8 +199,8 @@ impl SqsWorld {
             });
         }
 
-        let source_identity =
-            parse_queue_identity_from_arn(&input.source_arn, "SourceArn")?;
+        let source_identity = self
+            .resolve_existing_queue_from_arn(&input.source_arn, "SourceArn")?;
         let source_is_dlq = self.queues.values().any(|queue| {
             queue.redrive_policy_document().is_some_and(|policy| {
                 policy.dead_letter_target_arn == input.source_arn.to_string()
@@ -108,30 +214,22 @@ impl SqsWorld {
             });
         }
 
-        let destination_arn = if let Some(destination_arn) =
-            input.destination_arn
-        {
-            parse_queue_identity_from_arn(&destination_arn, "DestinationArn")?;
-            if !self.queues.contains_key(&parse_queue_identity_from_arn(
-                &destination_arn,
-                "DestinationArn",
-            )?) {
-                return Err(SqsError::ResourceNotFound {
-                    message: "The resource that you specified for the DestinationArn parameter doesn't exist.".to_owned(),
-                });
-            }
-            Some(destination_arn)
-        } else {
-            None
-        };
+        let destination_arn =
+            if let Some(destination_arn) = input.destination_arn {
+                let _ = self.resolve_existing_queue_from_arn(
+                    &destination_arn,
+                    "DestinationArn",
+                )?;
+                Some(destination_arn)
+            } else {
+                None
+            };
 
         let staged_moves = {
             let queue = self
                 .queues
                 .get(&source_identity)
-                .ok_or_else(|| SqsError::ResourceNotFound {
-                    message: "The resource that you specified for the SourceArn parameter doesn't exist.".to_owned(),
-                })?;
+                .expect("existing source queue should already be resolved");
             queue.staged_messages_for_move_task()
         }
         .into_iter()
@@ -157,10 +255,92 @@ impl SqsWorld {
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+        let approximate_number_of_messages_to_move =
+            Some(i64::try_from(staged_moves.len()).unwrap_or(i64::MAX));
         self.commit_staged_message_moves(staged_moves)?;
+        let started_timestamp = i64::try_from(now_seconds).unwrap_or(i64::MAX);
+        let task_handle =
+            encode_move_task_handle(&input.source_arn, started_timestamp);
+        self.message_move_tasks.push(MessageMoveTaskRecord {
+            approximate_number_of_messages_moved:
+                approximate_number_of_messages_to_move.unwrap_or_default(),
+            approximate_number_of_messages_to_move,
+            destination_arn: destination_arn.as_ref().map(ToString::to_string),
+            failure_reason: None,
+            max_number_of_messages_per_second: input
+                .max_number_of_messages_per_second
+                .map(|value| i32::try_from(value).unwrap_or(i32::MAX)),
+            source_arn: input.source_arn.to_string(),
+            started_timestamp,
+            status: "COMPLETED".to_owned(),
+            task_handle: task_handle.clone(),
+        });
 
-        Ok(StartMessageMoveTaskOutput {
-            task_handle: encode_move_task_handle(&input.source_arn),
+        Ok(StartMessageMoveTaskOutput { task_handle })
+    }
+
+    pub(crate) fn list_message_move_tasks(
+        &self,
+        input: ListMessageMoveTasksInput,
+    ) -> Result<ListMessageMoveTasksOutput, SqsError> {
+        let _ = self
+            .resolve_existing_queue_from_arn(&input.source_arn, "SourceArn")?;
+        let source_arn = input.source_arn.to_string();
+        let results = self
+            .message_move_tasks
+            .iter()
+            .filter(|task| task.source_arn == source_arn)
+            .rev()
+            .take(validate_list_message_move_task_max_results(
+                input.max_results,
+            )?)
+            .map(MessageMoveTaskRecord::as_result_entry)
+            .collect();
+
+        Ok(ListMessageMoveTasksOutput { results })
+    }
+
+    fn resolve_existing_queue_from_arn(
+        &self,
+        arn: &Arn,
+        parameter_name: &str,
+    ) -> Result<SqsQueueIdentity, SqsError> {
+        let identity = parse_queue_identity_from_arn(arn, parameter_name)?;
+        if self.queues.contains_key(&identity) {
+            Ok(identity)
+        } else {
+            Err(SqsError::ResourceNotFound {
+                message: format!(
+                    "The resource that you specified for the {parameter_name} parameter doesn't exist."
+                ),
+            })
+        }
+    }
+
+    pub(crate) fn cancel_message_move_task(
+        &mut self,
+        input: CancelMessageMoveTaskInput,
+    ) -> Result<CancelMessageMoveTaskOutput, SqsError> {
+        let Some(task) = self
+            .message_move_tasks
+            .iter_mut()
+            .find(|task| task.task_handle == input.task_handle)
+        else {
+            return Err(SqsError::ResourceNotFound {
+                message: "The resource that you specified for the TaskHandle parameter doesn't exist.".to_owned(),
+            });
+        };
+        if task.status != "RUNNING" {
+            return Err(SqsError::UnsupportedOperation {
+                message: "Only running message move tasks can be cancelled."
+                    .to_owned(),
+            });
+        }
+
+        task.status = "CANCELLED".to_owned();
+        Ok(CancelMessageMoveTaskOutput {
+            approximate_number_of_messages_moved: task
+                .approximate_number_of_messages_moved,
         })
     }
 }
@@ -191,8 +371,32 @@ impl QueueRecord {
     }
 }
 
-pub(crate) fn encode_move_task_handle(source_arn: &Arn) -> String {
-    base64::engine::general_purpose::STANDARD.encode(source_arn.to_string())
+impl MessageMoveTaskRecord {
+    pub(crate) fn as_result_entry(&self) -> ListMessageMoveTasksResultEntry {
+        ListMessageMoveTasksResultEntry {
+            approximate_number_of_messages_moved: self
+                .approximate_number_of_messages_moved,
+            approximate_number_of_messages_to_move: self
+                .approximate_number_of_messages_to_move,
+            destination_arn: self.destination_arn.clone(),
+            failure_reason: self.failure_reason.clone(),
+            max_number_of_messages_per_second: self
+                .max_number_of_messages_per_second,
+            source_arn: self.source_arn.clone(),
+            started_timestamp: self.started_timestamp,
+            status: self.status.clone(),
+            task_handle: (self.status == "RUNNING")
+                .then(|| self.task_handle.clone()),
+        }
+    }
+}
+
+pub(crate) fn encode_move_task_handle(
+    source_arn: &Arn,
+    started_timestamp: i64,
+) -> String {
+    base64::engine::general_purpose::STANDARD
+        .encode(format!("{source_arn}|{started_timestamp}"))
 }
 
 pub(crate) fn parse_queue_identity_from_arn(
@@ -294,4 +498,23 @@ pub(crate) fn parse_redrive_policy(
     }
 
     Ok(RedrivePolicyDocument { dead_letter_target_arn, max_receive_count })
+}
+
+fn validate_list_message_move_task_max_results(
+    max_results: Option<i32>,
+) -> Result<usize, SqsError> {
+    let max_results = max_results.unwrap_or(1);
+    if !(1..=10).contains(&max_results) {
+        return Err(SqsError::InvalidParameterValue {
+            message: format!(
+                "Value {max_results} for parameter MaxResults is invalid."
+            ),
+        });
+    }
+
+    usize::try_from(max_results).map_err(|_| SqsError::InvalidParameterValue {
+        message: format!(
+            "Value {max_results} for parameter MaxResults is invalid."
+        ),
+    })
 }

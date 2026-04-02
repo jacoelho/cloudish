@@ -106,6 +106,17 @@ const DEFAULT_MEMORY_SIZE_MB: u32 = 128;
 const DEFAULT_TIMEOUT_SECONDS: u32 = 3;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 1_048_576;
 const MAX_REQUEST_RESPONSE_PAYLOAD_BYTES: usize = 6 * 1_048_576;
+const LAMBDA_SQS_MESSAGE_SYSTEM_ATTRIBUTE_NAMES: [&str; 9] = [
+    "AWSTraceHeader",
+    "ApproximateFirstReceiveTimestamp",
+    "ApproximateReceiveCount",
+    "DeadLetterQueueSourceArn",
+    "MessageDeduplicationId",
+    "MessageGroupId",
+    "SenderId",
+    "SentTimestamp",
+    "SequenceNumber",
+];
 const PRECONDITION_FAILED_MESSAGE: &str = "The Revision Id provided does not match the latest Revision Id. Call the \
      GetFunction/GetAlias API to retrieve the latest Revision Id";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2830,8 +2841,10 @@ impl LambdaService {
                         LambdaError::Internal { message: error.to_string() }
                     })?,
                     delay_seconds: None,
+                    message_attributes: BTreeMap::new(),
                     message_deduplication_id: None,
                     message_group_id: None,
+                    message_system_attributes: BTreeMap::new(),
                 },
             )
             .map_err(|error| LambdaError::InvalidParameterValue {
@@ -2856,8 +2869,10 @@ impl LambdaService {
                 SendMessageInput {
                     body: String::from_utf8_lossy(payload).into_owned(),
                     delay_seconds: None,
+                    message_attributes: BTreeMap::new(),
                     message_deduplication_id: None,
                     message_group_id: None,
+                    message_system_attributes: BTreeMap::new(),
                 },
             )
             .map_err(|error| LambdaError::InvalidParameterValue {
@@ -3007,11 +3022,7 @@ impl LambdaService {
         self.sqs
             .receive_message(
                 queue_identity,
-                ReceiveMessageInput {
-                    max_number_of_messages: Some(max_number_of_messages),
-                    visibility_timeout: None,
-                    wait_time_seconds: Some(0),
-                },
+                lambda_sqs_receive_input(max_number_of_messages),
             )
             .map_err(|error| LambdaError::InvalidParameterValue {
                 message: error.to_string(),
@@ -3129,6 +3140,24 @@ impl LambdaService {
             code_size: archive.len(),
             package: LambdaCodePackage::Zip { blob_key },
         })
+    }
+}
+
+fn lambda_sqs_receive_input(
+    max_number_of_messages: u32,
+) -> ReceiveMessageInput {
+    ReceiveMessageInput {
+        attribute_names: Vec::new(),
+        max_number_of_messages: Some(max_number_of_messages),
+        message_attribute_names: vec!["All".to_owned()],
+        message_system_attribute_names:
+            LAMBDA_SQS_MESSAGE_SYSTEM_ATTRIBUTE_NAMES
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        receive_request_attempt_id: None,
+        visibility_timeout: None,
+        wait_time_seconds: Some(0),
     }
 }
 
@@ -3583,9 +3612,11 @@ fn ensure_destination_queue_exists(
     sqs: &SqsService,
     queue_identity: &SqsQueueIdentity,
 ) -> Result<(), LambdaError> {
-    sqs.get_queue_attributes(queue_identity, &[]).map_err(|error| {
-        LambdaError::InvalidParameterValue { message: error.to_string() }
-    })?;
+    sqs.get_queue_attributes(queue_identity, &[] as &[&str]).map_err(
+        |error| LambdaError::InvalidParameterValue {
+            message: error.to_string(),
+        },
+    )?;
 
     Ok(())
 }
@@ -4028,7 +4059,7 @@ mod tests {
     }
 
     fn queue_arn(sqs: &SqsService, queue: &SqsQueueIdentity) -> String {
-        sqs.get_queue_attributes(queue, &[String::from("QueueArn")])
+        sqs.get_queue_attributes(queue, &["QueueArn"])
             .unwrap()
             .remove("QueueArn")
             .expect("queue ARN should be present")
@@ -4524,8 +4555,10 @@ mod tests {
             SendMessageInput {
                 body: r#"{"job":"first"}"#.to_owned(),
                 delay_seconds: None,
+                message_attributes: BTreeMap::new(),
                 message_deduplication_id: None,
                 message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -4541,8 +4574,10 @@ mod tests {
             SendMessageInput {
                 body: r#"{"job":"second"}"#.to_owned(),
                 delay_seconds: None,
+                message_attributes: BTreeMap::new(),
                 message_deduplication_id: None,
                 message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -4614,8 +4649,10 @@ mod tests {
             SendMessageInput {
                 body: r#"{"job":"first"}"#.to_owned(),
                 delay_seconds: None,
+                message_attributes: BTreeMap::new(),
                 message_deduplication_id: None,
                 message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -4714,8 +4751,10 @@ mod tests {
                 SendMessageInput {
                     body: body.to_owned(),
                     delay_seconds: None,
+                    message_attributes: BTreeMap::new(),
                     message_deduplication_id: None,
                     message_group_id: None,
+                    message_system_attributes: BTreeMap::new(),
                 },
             )
             .unwrap();
@@ -5338,7 +5377,11 @@ mod tests {
             .receive_message(
                 &failure_queue,
                 ReceiveMessageInput {
+                    attribute_names: Vec::new(),
                     max_number_of_messages: Some(1),
+                    message_attribute_names: Vec::new(),
+                    message_system_attribute_names: Vec::new(),
+                    receive_request_attempt_id: None,
                     visibility_timeout: Some(0),
                     wait_time_seconds: Some(0),
                 },
@@ -5364,7 +5407,11 @@ mod tests {
             .receive_message(
                 &dead_letter_queue,
                 ReceiveMessageInput {
+                    attribute_names: Vec::new(),
                     max_number_of_messages: Some(1),
+                    message_attribute_names: Vec::new(),
+                    message_system_attribute_names: Vec::new(),
+                    receive_request_attempt_id: None,
                     visibility_timeout: Some(0),
                     wait_time_seconds: Some(0),
                 },
@@ -5458,8 +5505,31 @@ mod tests {
             SendMessageInput {
                 body: r#"{"job":"run"}"#.to_owned(),
                 delay_seconds: None,
+                message_attributes: BTreeMap::from([
+                    (
+                        "store".to_owned(),
+                        sqs::MessageAttributeValue {
+                            binary_list_values: Vec::new(),
+                            binary_value: None,
+                            data_type: "String".to_owned(),
+                            string_list_values: Vec::new(),
+                            string_value: Some("eu-west".to_owned()),
+                        },
+                    ),
+                    (
+                        "blob".to_owned(),
+                        sqs::MessageAttributeValue {
+                            binary_list_values: Vec::new(),
+                            binary_value: Some(vec![0x01, 0x02]),
+                            data_type: "Binary".to_owned(),
+                            string_list_values: Vec::new(),
+                            string_value: None,
+                        },
+                    ),
+                ]),
                 message_deduplication_id: None,
                 message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -5471,11 +5541,40 @@ mod tests {
                 .unwrap();
         assert_eq!(event["Records"][0]["eventSource"], "aws:sqs");
         assert_eq!(event["Records"][0]["body"], r#"{"job":"run"}"#);
+        assert_eq!(
+            event["Records"][0]["attributes"]["ApproximateReceiveCount"],
+            "1"
+        );
+        assert!(
+            event["Records"][0]["attributes"]["SentTimestamp"]
+                .as_str()
+                .is_some()
+        );
+        assert_eq!(
+            event["Records"][0]["messageAttributes"]["store"]["stringValue"],
+            "eu-west"
+        );
+        assert_eq!(
+            event["Records"][0]["messageAttributes"]["store"]["dataType"],
+            "String"
+        );
+        assert_eq!(
+            event["Records"][0]["messageAttributes"]["blob"]["binaryValue"],
+            "AQI="
+        );
+        assert_eq!(
+            event["Records"][0]["messageAttributes"]["blob"]["dataType"],
+            "Binary"
+        );
         assert!(
             sqs.receive_message(
                 &source_queue,
                 ReceiveMessageInput {
+                    attribute_names: Vec::new(),
                     max_number_of_messages: Some(1),
+                    message_attribute_names: Vec::new(),
+                    message_system_attribute_names: Vec::new(),
+                    receive_request_attempt_id: None,
                     visibility_timeout: Some(0),
                     wait_time_seconds: Some(0),
                 },

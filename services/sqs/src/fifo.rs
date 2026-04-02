@@ -1,7 +1,7 @@
 use crate::errors::SqsError;
 use crate::messages::{
-    MessageRecord, PendingQueueMove, ReceiveOutcome, SendMessageInput,
-    SendMessageOutput,
+    MessageRecord, PendingQueueMove, ReceiveOutcome, ReceiveSelectors,
+    SendMessageInput, SendMessageOutput,
 };
 use crate::queues::QueueRecord;
 use std::collections::BTreeSet;
@@ -23,6 +23,8 @@ impl QueueRecord {
         now_millis: u64,
         message_id: String,
         md5_of_message_body: String,
+        md5_of_message_attributes: Option<String>,
+        md5_of_message_system_attributes: Option<String>,
     ) -> Result<SendMessageOutput, SqsError> {
         if input.delay_seconds.unwrap_or(0) > 0 {
             return Err(SqsError::InvalidParameterValue {
@@ -64,6 +66,8 @@ impl QueueRecord {
         {
             return Ok(SendMessageOutput {
                 md5_of_message_body,
+                md5_of_message_attributes,
+                md5_of_message_system_attributes,
                 message_id: existing.message_id.clone(),
                 sequence_number: existing.sequence_number.clone(),
             });
@@ -77,11 +81,15 @@ impl QueueRecord {
             dead_letter_source_arn: None,
             deleted: false,
             deduplication_id: Some(deduplication_id.clone()),
+            first_receive_timestamp_millis: None,
             issued_receipt_handles: BTreeSet::new(),
             latest_receipt_handle: None,
             md5_of_body: md5_of_message_body.clone(),
+            md5_of_message_attributes: md5_of_message_attributes.clone(),
+            message_attributes: input.message_attributes,
             message_group_id: Some(message_group_id),
             message_id: message_id.clone(),
+            message_system_attributes: input.message_system_attributes,
             receive_count: 0,
             sent_timestamp_millis: now_millis,
             sequence_number: sequence_number.clone(),
@@ -99,6 +107,8 @@ impl QueueRecord {
 
         Ok(SendMessageOutput {
             md5_of_message_body,
+            md5_of_message_attributes,
+            md5_of_message_system_attributes,
             message_id,
             sequence_number,
         })
@@ -108,12 +118,14 @@ impl QueueRecord {
         &mut self,
         max_number_of_messages: u32,
         now_millis: u64,
+        selectors: &ReceiveSelectors,
         visibility_timeout: u32,
         next_receipt_handle: &mut dyn FnMut() -> String,
     ) -> ReceiveOutcome {
         let mut outcome = ReceiveOutcome::default();
         let blocked_groups = self.blocked_fifo_groups(now_millis);
         let queue_arn = self.queue_arn();
+        let queue_identity = self.identity.clone();
         let max_receive_count = self
             .redrive_policy_document()
             .map(|policy| policy.max_receive_count);
@@ -169,6 +181,8 @@ impl QueueRecord {
 
                 outcome.received.push(message.receive(
                     now_millis,
+                    selectors,
+                    &queue_identity,
                     visibility_timeout,
                     next_receipt_handle(),
                 ));

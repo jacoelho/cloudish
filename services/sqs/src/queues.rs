@@ -3,10 +3,15 @@ use crate::attributes::{
 };
 use crate::errors::SqsError;
 use crate::fifo::DeduplicationRecord;
-use crate::messages::{MessageRecord, timestamp_seconds};
-use crate::redrive::validate_redrive_policy_target;
+use crate::messages::{
+    ListQueuesInput, MessageRecord, PaginatedQueues, ReceiveAttemptRecord,
+    timestamp_seconds,
+};
+use crate::redrive::{MessageMoveTaskRecord, validate_redrive_policy_target};
 use crate::scope::{SqsQueueIdentity, SqsScope};
 use aws::Arn;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -217,10 +222,22 @@ impl SqsService {
 
         state.list_queues(scope, queue_name_prefix)
     }
+
+    pub fn list_queues_page(
+        &self,
+        scope: &SqsScope,
+        input: &ListQueuesInput,
+    ) -> Result<PaginatedQueues, SqsError> {
+        let state =
+            self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        state.list_queues_page(scope, input)
+    }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct SqsWorld {
+    pub(crate) message_move_tasks: Vec<MessageMoveTaskRecord>,
     pub(crate) queues: BTreeMap<SqsQueueIdentity, QueueRecord>,
 }
 
@@ -310,6 +327,31 @@ impl SqsWorld {
             .collect()
     }
 
+    pub(crate) fn list_queues_page(
+        &self,
+        scope: &SqsScope,
+        input: &ListQueuesInput,
+    ) -> Result<PaginatedQueues, SqsError> {
+        let queues =
+            self.list_queues(scope, input.queue_name_prefix.as_deref());
+        let context = pagination_context(
+            "ListQueues",
+            &json!({
+                "account_id": scope.account_id().as_str(),
+                "region": scope.region().as_ref(),
+                "prefix": input.queue_name_prefix,
+            }),
+        );
+        let (queue_urls, next_token) = paginate_items(
+            &queues,
+            input.max_results,
+            input.next_token.as_deref(),
+            &context,
+        )?;
+
+        Ok(PaginatedQueues { next_token, queue_urls })
+    }
+
     pub(crate) fn stage_message_move(
         &self,
         source_queue: &SqsQueueIdentity,
@@ -358,15 +400,19 @@ impl SqsWorld {
                 .queues
                 .get_mut(&staged.source_queue)
                 .ok_or(SqsError::QueueDoesNotExist)?;
-            let deduplication_id = {
+            let (message_id, deduplication_id) = {
                 let Some(source_message) =
                     source_queue.messages.get_mut(staged.source_message_index)
                 else {
                     return Err(SqsError::QueueDoesNotExist);
                 };
                 source_message.deleted = true;
-                source_message.deduplication_id.clone()
+                (
+                    source_message.message_id.clone(),
+                    source_message.deduplication_id.clone(),
+                )
             };
+            source_queue.invalidate_receive_attempts_for_message(&message_id);
             if let Some(deduplication_id) = deduplication_id.as_ref() {
                 source_queue.deduplication_records.remove(deduplication_id);
             }
@@ -395,9 +441,11 @@ pub(crate) struct QueueRecord {
     pub(crate) created_timestamp: u64,
     pub(crate) deduplication_records: BTreeMap<String, DeduplicationRecord>,
     pub(crate) identity: SqsQueueIdentity,
+    pub(crate) last_purged_timestamp_millis: Option<u64>,
     pub(crate) last_modified_timestamp: u64,
     pub(crate) messages: VecDeque<MessageRecord>,
     pub(crate) next_sequence_number: u128,
+    pub(crate) receive_attempts: BTreeMap<String, ReceiveAttemptRecord>,
     pub(crate) tags: BTreeMap<String, String>,
 }
 
@@ -412,10 +460,106 @@ impl QueueRecord {
             created_timestamp: now_seconds,
             deduplication_records: BTreeMap::new(),
             identity,
+            last_purged_timestamp_millis: None,
             last_modified_timestamp: now_seconds,
             messages: VecDeque::new(),
             next_sequence_number: 0,
+            receive_attempts: BTreeMap::new(),
             tags: BTreeMap::new(),
         }
+    }
+}
+
+pub(crate) fn pagination_context(
+    operation: &'static str,
+    anchor: &Value,
+) -> Value {
+    json!({
+        "operation": operation,
+        "anchor": anchor,
+    })
+}
+
+pub(crate) fn paginate_items<T: Clone>(
+    items: &[T],
+    max_results: Option<u32>,
+    next_token: Option<&str>,
+    context: &Value,
+) -> Result<(Vec<T>, Option<String>), SqsError> {
+    let page_size = validate_paginated_max_results(max_results)?;
+    let start = decode_next_token(next_token, context)?;
+    if start > items.len() {
+        return Err(invalid_next_token());
+    }
+    let end = start.saturating_add(page_size).min(items.len());
+    let next_token = (end < items.len())
+        .then(|| encode_next_token(context, end))
+        .transpose()?;
+
+    Ok((items[start..end].to_vec(), next_token))
+}
+
+fn validate_paginated_max_results(
+    max_results: Option<u32>,
+) -> Result<usize, SqsError> {
+    let max_results = max_results.unwrap_or(1_000);
+    if !(1..=1_000).contains(&max_results) {
+        return Err(SqsError::InvalidParameterValue {
+            message: format!(
+                "Value {max_results} for parameter MaxResults is invalid."
+            ),
+        });
+    }
+
+    usize::try_from(max_results).map_err(|_| SqsError::InvalidParameterValue {
+        message: format!(
+            "Value {max_results} for parameter MaxResults is invalid."
+        ),
+    })
+}
+
+fn encode_next_token(
+    context: &Value,
+    start: usize,
+) -> Result<String, SqsError> {
+    let payload = json!({
+        "operation": context["operation"],
+        "anchor": context["anchor"],
+        "start": start,
+    });
+    let bytes =
+        serde_json::to_vec(&payload).map_err(|_| invalid_next_token())?;
+
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_next_token(
+    next_token: Option<&str>,
+    context: &Value,
+) -> Result<usize, SqsError> {
+    let Some(next_token) = next_token else {
+        return Ok(0);
+    };
+    let decoded = URL_SAFE_NO_PAD
+        .decode(next_token)
+        .map_err(|_| invalid_next_token())?;
+    let payload: Value =
+        serde_json::from_slice(&decoded).map_err(|_| invalid_next_token())?;
+    if payload.get("operation") != context.get("operation")
+        || payload.get("anchor") != context.get("anchor")
+    {
+        return Err(invalid_next_token());
+    }
+    let start = payload
+        .get("start")
+        .and_then(Value::as_u64)
+        .ok_or_else(invalid_next_token)?;
+
+    usize::try_from(start).map_err(|_| invalid_next_token())
+}
+
+fn invalid_next_token() -> SqsError {
+    SqsError::InvalidParameterValue {
+        message: "Invalid value for the parameter NextToken.".to_owned(),
     }
 }

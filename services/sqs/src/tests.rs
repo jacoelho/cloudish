@@ -1,3 +1,4 @@
+use super::MessageAttributeValue;
 use super::attributes::{
     AttributeMode, ensure_create_attributes_are_compatible,
     normalize_queue_attributes, normalize_requested_attribute_names,
@@ -8,11 +9,11 @@ use super::errors::SqsError;
 use super::fifo::validate_fifo_identifier;
 use super::messages::{
     ChangeMessageVisibilityBatchEntryInput, DeleteMessageBatchEntryInput,
-    MessageRecord, ReceiveMessageInput, SendMessageBatchEntryInput,
-    SendMessageInput, md5_hex, validate_batch_entry_id,
-    validate_batch_request, validate_delay_seconds,
-    validate_max_number_of_messages, validate_visibility_timeout,
-    validate_wait_time_seconds,
+    ListDeadLetterSourceQueuesInput, ListQueuesInput, MessageRecord,
+    ReceiveMessageInput, SendMessageBatchEntryInput, SendMessageInput,
+    md5_hex, validate_batch_entry_id, validate_batch_request,
+    validate_delay_seconds, validate_max_number_of_messages,
+    validate_visibility_timeout, validate_wait_time_seconds,
 };
 use super::queues::{
     CreateQueueInput, QueueRecord, SqsIdentifierSource,
@@ -20,6 +21,7 @@ use super::queues::{
     SqsService,
 };
 use super::redrive::{
+    CancelMessageMoveTaskInput, ListMessageMoveTasksInput,
     StartMessageMoveTaskInput, encode_move_task_handle,
     parse_queue_identity_from_arn, parse_redrive_policy,
 };
@@ -139,6 +141,56 @@ impl SqsReceiveWaiter for TestWaiter {
     }
 }
 
+#[derive(Clone)]
+struct ActionWaiter {
+    action: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
+    clock: ManualClock,
+    triggered: Arc<AtomicBool>,
+}
+
+impl ActionWaiter {
+    fn new(clock: ManualClock) -> Self {
+        Self {
+            action: Arc::new(Mutex::new(None)),
+            clock,
+            triggered: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn set_action(&self, action: impl Fn() + Send + Sync + 'static) {
+        let mut slot =
+            self.action.lock().unwrap_or_else(|poison| poison.into_inner());
+        *slot = Some(Box::new(action));
+    }
+}
+
+impl SqsReceiveWaiter for ActionWaiter {
+    fn wait(
+        &self,
+        duration: Duration,
+        cancellation: &dyn SqsReceiveCancellation,
+    ) -> SqsReceiveWaitOutcome {
+        if cancellation.is_cancelled() {
+            return SqsReceiveWaitOutcome::Cancelled;
+        }
+        if !self.triggered.swap(true, Ordering::SeqCst)
+            && let Some(action) = self
+                .action
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+        {
+            action();
+        }
+        self.clock.advance(duration);
+        if cancellation.is_cancelled() {
+            SqsReceiveWaitOutcome::Cancelled
+        } else {
+            SqsReceiveWaitOutcome::Completed
+        }
+    }
+}
+
 fn scope() -> SqsScope {
     SqsScope::new(
         "000000000000".parse::<AccountId>().expect("account should parse"),
@@ -157,8 +209,10 @@ fn send_input(body: &str, delay_seconds: Option<u32>) -> SendMessageInput {
     SendMessageInput {
         body: body.to_owned(),
         delay_seconds,
+        message_attributes: BTreeMap::new(),
         message_deduplication_id: None,
         message_group_id: None,
+        message_system_attributes: BTreeMap::new(),
     }
 }
 
@@ -170,8 +224,10 @@ fn fifo_send_input(
     SendMessageInput {
         body: body.to_owned(),
         delay_seconds: None,
+        message_attributes: BTreeMap::new(),
         message_deduplication_id: message_deduplication_id.map(str::to_owned),
         message_group_id: Some(message_group_id.to_owned()),
+        message_system_attributes: BTreeMap::new(),
     }
 }
 
@@ -187,15 +243,35 @@ fn message_record(
         dead_letter_source_arn: None,
         deleted,
         deduplication_id: None,
+        first_receive_timestamp_millis: None,
         issued_receipt_handles: BTreeSet::new(),
         latest_receipt_handle: None,
         md5_of_body: md5_hex(body),
+        md5_of_message_attributes: None,
+        message_attributes: BTreeMap::new(),
         message_group_id: None,
         message_id: message_id.to_owned(),
+        message_system_attributes: BTreeMap::new(),
         receive_count,
         sent_timestamp_millis: 0,
         sequence_number: None,
         visible_at_millis,
+    }
+}
+
+fn receive_input(
+    max_number_of_messages: Option<u32>,
+    visibility_timeout: Option<u32>,
+    wait_time_seconds: Option<u32>,
+) -> ReceiveMessageInput {
+    ReceiveMessageInput {
+        attribute_names: Vec::new(),
+        max_number_of_messages,
+        message_attribute_names: Vec::new(),
+        message_system_attribute_names: Vec::new(),
+        receive_request_attempt_id: None,
+        visibility_timeout,
+        wait_time_seconds,
     }
 }
 
@@ -342,9 +418,11 @@ fn sqs_standard_send_receive_change_visibility_delete_and_purge_flow() {
         .receive_message(
             &queue,
             ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: None,
-                wait_time_seconds: Some(0),
+                attribute_names: vec![
+                    "ApproximateReceiveCount".to_owned(),
+                    "SentTimestamp".to_owned(),
+                ],
+                ..receive_input(Some(1), None, Some(0))
             },
         )
         .expect("message should receive");
@@ -354,14 +432,7 @@ fn sqs_standard_send_receive_change_visibility_delete_and_purge_flow() {
     assert_eq!(received[0].attributes["ApproximateReceiveCount"], "1");
 
     let hidden = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: None,
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), None, Some(0)))
         .expect("hidden receive should succeed");
     assert!(hidden.is_empty());
 
@@ -370,14 +441,7 @@ fn sqs_standard_send_receive_change_visibility_delete_and_purge_flow() {
         .expect("visibility timeout should update");
     clock.advance(Duration::from_secs(44));
     let still_hidden = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: None,
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), None, Some(0)))
         .expect("receive should succeed while hidden");
     assert!(still_hidden.is_empty());
 
@@ -385,14 +449,7 @@ fn sqs_standard_send_receive_change_visibility_delete_and_purge_flow() {
         .delete_message(&queue, "handle-1")
         .expect("delete should remove the message");
     let deleted = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: Some(0),
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), Some(0), Some(0)))
         .expect("deleted queue should receive empty result");
     assert!(deleted.is_empty());
 
@@ -401,14 +458,7 @@ fn sqs_standard_send_receive_change_visibility_delete_and_purge_flow() {
         .expect("second message should send");
     service.purge_queue(&queue).expect("purge should succeed");
     let purged = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: Some(0),
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), Some(0), Some(0)))
         .expect("purged queue should be empty");
     assert!(purged.is_empty());
 }
@@ -434,25 +484,11 @@ fn sqs_standard_receipt_handles_are_renewed_and_invalid_handles_fail_explicitly(
         .expect("message should send");
 
     let first = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: Some(1),
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), Some(1), Some(0)))
         .expect("first receive should succeed");
     clock.advance(Duration::from_secs(2));
     let second = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: Some(1),
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), Some(1), Some(0)))
         .expect("second receive should succeed");
 
     let first_handle = first[0].receipt_handle.clone();
@@ -601,11 +637,7 @@ fn sqs_fifo_validation_rejects_invalid_fifo_inputs() {
         .and_then(|queue| {
             service.receive_message(
                 &queue,
-                ReceiveMessageInput {
-                    max_number_of_messages: Some(11),
-                    visibility_timeout: None,
-                    wait_time_seconds: Some(0),
-                },
+                receive_input(Some(11), None, Some(0)),
             )
         })
         .expect_err("invalid max message count should fail");
@@ -684,14 +716,7 @@ fn sqs_fifo_deduplicates_and_preserves_group_order() {
         .expect("third fifo send should succeed");
 
     let received = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(10),
-                visibility_timeout: Some(0),
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(10), Some(0), Some(0)))
         .expect("fifo receive should succeed");
 
     assert_eq!(duplicate.message_id, first.message_id);
@@ -740,15 +765,19 @@ fn sqs_fifo_batch_apis_report_partial_failures() {
                     body: "alpha".to_owned(),
                     delay_seconds: None,
                     id: "first".to_owned(),
+                    message_attributes: BTreeMap::new(),
                     message_deduplication_id: Some("dedup-1".to_owned()),
                     message_group_id: Some("group-1".to_owned()),
+                    message_system_attributes: BTreeMap::new(),
                 },
                 SendMessageBatchEntryInput {
                     body: "beta".to_owned(),
                     delay_seconds: None,
                     id: "second".to_owned(),
+                    message_attributes: BTreeMap::new(),
                     message_deduplication_id: Some("dedup-2".to_owned()),
                     message_group_id: None,
+                    message_system_attributes: BTreeMap::new(),
                 },
             ],
         )
@@ -760,14 +789,7 @@ fn sqs_fifo_batch_apis_report_partial_failures() {
     assert_eq!(sent.failed[0].code, "MissingParameter");
 
     let received = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: Some(0),
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), Some(0), Some(0)))
         .expect("message should receive");
     let receipt_handle = received[0].receipt_handle.clone();
 
@@ -797,14 +819,7 @@ fn sqs_fifo_batch_apis_report_partial_failures() {
         )
         .expect("follow-up fifo send should succeed");
     let received = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: Some(0),
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), Some(0), Some(0)))
         .expect("follow-up message should receive");
     let receipt_handle = received[0].receipt_handle.clone();
 
@@ -830,14 +845,7 @@ fn sqs_fifo_batch_apis_report_partial_failures() {
     assert_eq!(changed.failed[0].code, "ReceiptHandleIsInvalid");
     assert!(
         service
-            .receive_message(
-                &queue,
-                ReceiveMessageInput {
-                    max_number_of_messages: Some(1),
-                    visibility_timeout: Some(0),
-                    wait_time_seconds: Some(0),
-                },
-            )
+            .receive_message(&queue, receive_input(Some(1), Some(0), Some(0)),)
             .expect("hidden receive should succeed")
             .is_empty()
     );
@@ -881,11 +889,7 @@ fn sqs_standard_failed_automatic_redrive_keeps_source_message() {
         service
             .receive_message(
                 &source,
-                ReceiveMessageInput {
-                    max_number_of_messages: Some(1),
-                    visibility_timeout: Some(0),
-                    wait_time_seconds: Some(0),
-                },
+                receive_input(Some(1), Some(0), Some(0)),
             )
             .expect("first receive should succeed")
             .len(),
@@ -894,14 +898,7 @@ fn sqs_standard_failed_automatic_redrive_keeps_source_message() {
     service.delete_queue(&dlq).expect("deleting the DLQ should succeed");
 
     let error = service
-        .receive_message(
-            &source,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: Some(0),
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&source, receive_input(Some(1), Some(0), Some(0)))
         .expect_err("redrive should fail when the target queue is missing");
     assert_eq!(error, SqsError::QueueDoesNotExist);
 
@@ -972,11 +969,7 @@ fn sqs_move_task_default_destination_failure_keeps_dlq_message() {
         service
             .receive_message(
                 &source,
-                ReceiveMessageInput {
-                    max_number_of_messages: Some(1),
-                    visibility_timeout: Some(0),
-                    wait_time_seconds: Some(0),
-                },
+                receive_input(Some(1), Some(0), Some(0)),
             )
             .expect("first receive should succeed")
             .len(),
@@ -986,11 +979,7 @@ fn sqs_move_task_default_destination_failure_keeps_dlq_message() {
         service
             .receive_message(
                 &source,
-                ReceiveMessageInput {
-                    max_number_of_messages: Some(1),
-                    visibility_timeout: Some(0),
-                    wait_time_seconds: Some(0),
-                },
+                receive_input(Some(1), Some(0), Some(0)),
             )
             .expect("second receive should move to the dlq")
             .is_empty()
@@ -1085,11 +1074,7 @@ fn sqs_fifo_redrive_helpers_move_messages_from_dlq() {
         service
             .receive_message(
                 &source,
-                ReceiveMessageInput {
-                    max_number_of_messages: Some(1),
-                    visibility_timeout: Some(0),
-                    wait_time_seconds: Some(0),
-                },
+                receive_input(Some(1), Some(0), Some(0)),
             )
             .expect("first receive should succeed")
             .len(),
@@ -1099,25 +1084,14 @@ fn sqs_fifo_redrive_helpers_move_messages_from_dlq() {
         service
             .receive_message(
                 &source,
-                ReceiveMessageInput {
-                    max_number_of_messages: Some(1),
-                    visibility_timeout: Some(0),
-                    wait_time_seconds: Some(0),
-                },
+                receive_input(Some(1), Some(0), Some(0)),
             )
             .expect("second receive should move to the dlq")
             .is_empty()
     );
 
     let dlq_message = service
-        .receive_message(
-            &dlq,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: Some(0),
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&dlq, receive_input(Some(1), Some(0), Some(0)))
         .expect("dlq receive should succeed");
     assert_eq!(dlq_message[0].body, "payload");
 
@@ -1128,30 +1102,993 @@ fn sqs_fifo_redrive_helpers_move_messages_from_dlq() {
             source_arn: dlq_arn.clone(),
         })
         .expect("move task should succeed");
-    assert_eq!(moved.task_handle, encode_move_task_handle(&dlq_arn));
+    assert_eq!(moved.task_handle, encode_move_task_handle(&dlq_arn, 2_500));
+    let listed = service
+        .list_message_move_tasks(ListMessageMoveTasksInput {
+            max_results: Some(1),
+            source_arn: dlq_arn.clone(),
+        })
+        .expect("move tasks should list");
+    assert_eq!(listed.results.len(), 1);
+    assert_eq!(listed.results[0].status, "COMPLETED");
+    assert_eq!(listed.results[0].task_handle, None);
 
     let redriven = service
-        .receive_message(
-            &source,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: Some(0),
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&source, receive_input(Some(1), Some(0), Some(0)))
         .expect("redriven message should arrive");
     assert_eq!(redriven[0].body, "payload");
     assert_eq!(
         service
-            .start_message_move_task(StartMessageMoveTaskInput {
-                destination_arn: None,
-                max_number_of_messages_per_second: Some(1),
-                source_arn: dlq_arn,
+            .cancel_message_move_task(CancelMessageMoveTaskInput {
+                task_handle: moved.task_handle,
             })
-            .expect_err("unsupported move throughput should fail"),
+            .expect_err("completed move tasks cannot be cancelled"),
+        SqsError::UnsupportedOperation {
+            message: "Only running message move tasks can be cancelled."
+                .to_owned(),
+        }
+    );
+}
+
+#[test]
+fn sqs_fifo_receive_request_attempt_id_invalidates_after_delete() {
+    let clock = ManualClock::new(UNIX_EPOCH + Duration::from_secs(3_000));
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(
+            &["msg-1", "msg-2"],
+            &["handle-1", "handle-2", "handle-3"],
+        )),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(
+            &scope,
+            CreateQueueInput {
+                attributes: BTreeMap::from([
+                    ("FifoQueue".to_owned(), "true".to_owned()),
+                    (
+                        "ContentBasedDeduplication".to_owned(),
+                        "true".to_owned(),
+                    ),
+                ]),
+                queue_name: "attempts.fifo".to_owned(),
+            },
+        )
+        .expect("queue should be created");
+    service
+        .send_message(&queue, fifo_send_input("payload", "group-1", None))
+        .expect("message should send");
+
+    let mut first_input = receive_input(Some(1), Some(30), Some(0));
+    first_input.receive_request_attempt_id = Some("attempt-1".to_owned());
+    let first = service
+        .receive_message(&queue, first_input.clone())
+        .expect("first receive should succeed");
+    let receipt_handle = first[0].receipt_handle.clone();
+    service
+        .delete_message(&queue, &receipt_handle)
+        .expect("message should delete");
+
+    let second = service
+        .receive_message(&queue, first_input)
+        .expect("retry after delete should succeed");
+    assert!(second.is_empty());
+}
+
+#[test]
+fn sqs_fifo_receive_request_attempt_id_does_not_cache_empty_long_poll() {
+    let clock = ManualClock::new(UNIX_EPOCH + Duration::from_secs(3_100));
+    let waiter = ActionWaiter::new(clock.clone());
+    let identifier_source =
+        Arc::new(TestIdentifierSource::new(&["msg-1"], &["handle-1"]));
+    let service = SqsService::with_waiter_sources(
+        clock.source(),
+        identifier_source.clone(),
+        Arc::new(waiter.clone()),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(
+            &scope,
+            CreateQueueInput {
+                attributes: BTreeMap::from([
+                    ("FifoQueue".to_owned(), "true".to_owned()),
+                    (
+                        "ContentBasedDeduplication".to_owned(),
+                        "true".to_owned(),
+                    ),
+                ]),
+                queue_name: "attempt-long-poll.fifo".to_owned(),
+            },
+        )
+        .expect("queue should be created");
+    let state = service.state.clone();
+    let queue_for_wait = queue.clone();
+
+    waiter.set_action(move || {
+        let now_millis = clock.source()()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_millis() as u64;
+        state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .send_message(
+                &queue_for_wait,
+                fifo_send_input("payload", "group-1", None),
+                now_millis,
+                identifier_source.next_message_id(),
+            )
+            .expect("message should be staged during the wait");
+    });
+
+    let mut input = receive_input(Some(1), Some(30), Some(1));
+    input.receive_request_attempt_id = Some("attempt-1".to_owned());
+    let received = service
+        .receive_message(&queue, input)
+        .expect("long poll should receive the arrived message");
+
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].body, "payload");
+    assert_eq!(received[0].receipt_handle, "handle-1");
+}
+
+#[test]
+fn sqs_list_queue_pagination_rejects_invalid_max_results() {
+    let clock = ManualClock::new(UNIX_EPOCH);
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(&["m-1"], &["r-1"])),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(&scope, queue_input("orders"))
+        .expect("queue should be created");
+
+    let zero = service
+        .list_queues_page(
+            &scope,
+            &ListQueuesInput {
+                max_results: Some(0),
+                next_token: None,
+                queue_name_prefix: None,
+            },
+        )
+        .expect_err("zero max results should fail");
+    let too_large = service
+        .list_queues_page(
+            &scope,
+            &ListQueuesInput {
+                max_results: Some(1_001),
+                next_token: None,
+                queue_name_prefix: None,
+            },
+        )
+        .expect_err("oversized max results should fail");
+    let dlq_zero = service
+        .list_dead_letter_source_queues_page(
+            &queue,
+            &ListDeadLetterSourceQueuesInput {
+                max_results: Some(0),
+                next_token: None,
+            },
+        )
+        .expect_err("dlq zero max results should fail");
+
+    assert_eq!(
+        zero,
+        SqsError::InvalidParameterValue {
+            message: "Value 0 for parameter MaxResults is invalid.".to_owned(),
+        }
+    );
+    assert_eq!(
+        too_large,
+        SqsError::InvalidParameterValue {
+            message: "Value 1001 for parameter MaxResults is invalid."
+                .to_owned(),
+        }
+    );
+    assert_eq!(
+        dlq_zero,
+        SqsError::InvalidParameterValue {
+            message: "Value 0 for parameter MaxResults is invalid.".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn sqs_message_attributes_reject_list_values() {
+    let clock = ManualClock::new(UNIX_EPOCH);
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(&["m-1"], &["r-1"])),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(&scope, queue_input("attributes"))
+        .expect("queue should be created");
+
+    let error = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::from([(
+                    "example".to_owned(),
+                    MessageAttributeValue {
+                        binary_list_values: Vec::new(),
+                        binary_value: None,
+                        data_type: "String".to_owned(),
+                        string_list_values: vec!["bad\u{0}value".to_owned()],
+                        string_value: None,
+                    },
+                )]),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
+            },
+        )
+        .expect_err("invalid string-list contents should fail");
+
+    assert_eq!(
+        error,
+        SqsError::InvalidParameterValue {
+            message:
+                "StringListValues and BinaryListValues are not supported."
+                    .to_owned(),
+        }
+    );
+}
+
+#[test]
+fn sqs_add_permission_updates_queue_policy() {
+    let clock = ManualClock::new(UNIX_EPOCH);
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(
+            &["msg-1", "msg-2"],
+            &["handle-1"],
+        )),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(&scope, queue_input("policy"))
+        .expect("queue should be created");
+
+    service
+        .add_permission(
+            &queue,
+            super::attributes::AddPermissionInput {
+                actions: vec!["SendMessage".to_owned()],
+                aws_account_ids: vec!["111122223333".to_owned()],
+                label: "AllowSend".to_owned(),
+            },
+        )
+        .expect("permission should be added");
+    let attributes = service
+        .get_queue_attributes(&queue, &["Policy"])
+        .expect("policy should fetch");
+    let policy = attributes.get("Policy").expect("policy should exist");
+    let policy: serde_json::Value =
+        serde_json::from_str(policy).expect("policy JSON should parse");
+    assert_eq!(policy["Statement"][0]["Sid"], "AllowSend");
+    assert_eq!(policy["Statement"][0]["Action"][0], "SQS:SendMessage");
+    assert_eq!(
+        policy["Statement"][0]["Principal"]["AWS"][0],
+        "arn:aws:iam::111122223333:root"
+    );
+
+    service
+        .remove_permission(
+            &queue,
+            super::attributes::RemovePermissionInput {
+                label: "AllowSend".to_owned(),
+            },
+        )
+        .expect("permission should remove");
+    let attributes = service
+        .get_queue_attributes(&queue, &["Policy"])
+        .expect("policy should fetch");
+    let policy: serde_json::Value = serde_json::from_str(
+        attributes.get("Policy").expect("policy should exist"),
+    )
+    .expect("policy JSON should parse");
+    assert_eq!(policy["Statement"], serde_json::json!([]));
+}
+
+#[test]
+fn sqs_add_permission_rejects_unsupported_action_names() {
+    let clock = ManualClock::new(UNIX_EPOCH);
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(
+            &["msg-1", "msg-2"],
+            &["handle-1"],
+        )),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(&scope, queue_input("policy"))
+        .expect("queue should be created");
+
+    let error = service
+        .add_permission(
+            &queue,
+            super::attributes::AddPermissionInput {
+                actions: vec!["FlyMessage".to_owned()],
+                aws_account_ids: vec!["111122223333".to_owned()],
+                label: "AllowSend".to_owned(),
+            },
+        )
+        .expect_err("unsupported permission actions should fail");
+
+    assert_eq!(
+        error,
+        SqsError::InvalidParameterValue {
+            message: "Value FlyMessage for parameter ActionName is invalid."
+                .to_owned(),
+        }
+    );
+}
+
+#[test]
+fn sqs_start_message_move_task_rejects_unsupported_throughput_without_side_effects()
+ {
+    let clock = ManualClock::new(UNIX_EPOCH + Duration::from_secs(2_500));
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(
+            &["msg-1", "msg-2"],
+            &["handle-1", "handle-2"],
+        )),
+    );
+    let scope = scope();
+    let dlq = service
+        .create_queue(
+            &scope,
+            CreateQueueInput {
+                attributes: BTreeMap::from([
+                    ("FifoQueue".to_owned(), "true".to_owned()),
+                    (
+                        "ContentBasedDeduplication".to_owned(),
+                        "true".to_owned(),
+                    ),
+                ]),
+                queue_name: "orders-dlq.fifo".to_owned(),
+            },
+        )
+        .expect("dlq should be created");
+    let dlq_arn: Arn =
+        format!("arn:aws:sqs:eu-west-2:000000000000:{}", dlq.queue_name())
+            .parse()
+            .expect("DLQ ARN should parse");
+    let source = service
+        .create_queue(
+            &scope,
+            CreateQueueInput {
+                attributes: BTreeMap::from([
+                    ("FifoQueue".to_owned(), "true".to_owned()),
+                    (
+                        "ContentBasedDeduplication".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        "RedrivePolicy".to_owned(),
+                        format!(
+                            r#"{{"deadLetterTargetArn":"{dlq_arn}","maxReceiveCount":1}}"#
+                        ),
+                    ),
+                ]),
+                queue_name: "orders-source.fifo".to_owned(),
+            },
+        )
+        .expect("source queue should be created");
+    service
+        .send_message(&source, fifo_send_input("payload", "group-1", None))
+        .expect("message should send");
+    assert_eq!(
+        service
+            .receive_message(&source, receive_input(Some(1), Some(0), Some(0)))
+            .expect("first receive should succeed")
+            .len(),
+        1
+    );
+    assert!(
+        service
+            .receive_message(&source, receive_input(Some(1), Some(0), Some(0)))
+            .expect("second receive should move to dlq")
+            .is_empty()
+    );
+
+    let error = service
+        .start_message_move_task(StartMessageMoveTaskInput {
+            destination_arn: None,
+            max_number_of_messages_per_second: Some(1),
+            source_arn: dlq_arn.clone(),
+        })
+        .expect_err("unsupported move throughput should fail");
+    assert_eq!(
+        error,
         SqsError::UnsupportedOperation {
             message: "StartMessageMoveTask does not support MaxNumberOfMessagesPerSecond in this Cloudish subset.".to_owned(),
         }
+    );
+    let listed = service
+        .list_message_move_tasks(ListMessageMoveTasksInput {
+            max_results: Some(10),
+            source_arn: dlq_arn.clone(),
+        })
+        .expect("move tasks should list");
+    assert!(listed.results.is_empty());
+    let dlq_messages = service
+        .receive_message(&dlq, receive_input(Some(1), Some(0), Some(0)))
+        .expect("dlq receive should succeed");
+    assert_eq!(dlq_messages.len(), 1);
+    assert_eq!(dlq_messages[0].body, "payload");
+}
+
+#[test]
+fn sqs_start_message_move_task_returns_resource_not_found_for_missing_source()
+{
+    let clock = ManualClock::new(UNIX_EPOCH + Duration::from_secs(2_500));
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(&["msg-1"], &["handle-1"])),
+    );
+    let source_arn: Arn = "arn:aws:sqs:eu-west-2:000000000000:missing-dlq"
+        .parse()
+        .expect("source arn should parse");
+
+    let error = service
+        .start_message_move_task(StartMessageMoveTaskInput {
+            destination_arn: None,
+            max_number_of_messages_per_second: None,
+            source_arn,
+        })
+        .expect_err("missing move-task sources should fail");
+
+    assert_eq!(
+        error,
+        SqsError::ResourceNotFound {
+            message:
+                "The resource that you specified for the SourceArn parameter doesn't exist."
+                    .to_owned(),
+        }
+    );
+}
+
+#[test]
+fn sqs_message_attributes_reject_reserved_prefixes() {
+    let clock = ManualClock::new(UNIX_EPOCH);
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(
+            &["msg-1", "msg-2"],
+            &["handle-1"],
+        )),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(&scope, queue_input("reserved-attributes"))
+        .expect("queue should be created");
+    let attribute = MessageAttributeValue {
+        binary_list_values: Vec::new(),
+        binary_value: None,
+        data_type: "String".to_owned(),
+        string_list_values: Vec::new(),
+        string_value: Some("value".to_owned()),
+    };
+
+    let aws_prefix = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::from([(
+                    "AWS.TraceId".to_owned(),
+                    attribute.clone(),
+                )]),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
+            },
+        )
+        .expect_err("AWS-prefixed attributes should fail");
+    let amazon_prefix = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::from([(
+                    "amazon.TraceId".to_owned(),
+                    attribute,
+                )]),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
+            },
+        )
+        .expect_err("Amazon-prefixed attributes should fail");
+
+    assert_eq!(
+        aws_prefix,
+        SqsError::InvalidParameterValue {
+            message:
+                "Value AWS.TraceId for parameter MessageAttributeName is invalid."
+                    .to_owned(),
+        }
+    );
+    assert_eq!(
+        amazon_prefix,
+        SqsError::InvalidParameterValue {
+            message:
+                "Value amazon.TraceId for parameter MessageAttributeName is invalid."
+                    .to_owned(),
+        }
+    );
+}
+
+#[test]
+fn sqs_message_system_attributes_require_string_trace_headers() {
+    let clock = ManualClock::new(UNIX_EPOCH);
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(
+            &["msg-1", "msg-2"],
+            &["handle-1"],
+        )),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(&scope, queue_input("trace-headers"))
+        .expect("queue should be created");
+
+    let binary_error = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::new(),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::from([(
+                    "AWSTraceHeader".to_owned(),
+                    MessageAttributeValue {
+                        binary_list_values: Vec::new(),
+                        binary_value: Some(vec![0x01, 0x02]),
+                        data_type: "Binary".to_owned(),
+                        string_list_values: Vec::new(),
+                        string_value: None,
+                    },
+                )]),
+            },
+        )
+        .expect_err("binary trace headers should fail");
+    let invalid_format = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::new(),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::from([(
+                    "AWSTraceHeader".to_owned(),
+                    MessageAttributeValue {
+                        binary_list_values: Vec::new(),
+                        binary_value: None,
+                        data_type: "String".to_owned(),
+                        string_list_values: Vec::new(),
+                        string_value: Some("Root=1-abc".to_owned()),
+                    },
+                )]),
+            },
+        )
+        .expect_err("malformed trace headers should fail");
+
+    assert_eq!(
+        binary_error,
+        SqsError::InvalidParameterValue {
+            message:
+                "Value AWSTraceHeader for parameter MessageSystemAttributes is invalid."
+                    .to_owned(),
+        }
+    );
+    assert_eq!(
+        invalid_format,
+        SqsError::InvalidParameterValue {
+            message:
+                "Value AWSTraceHeader for parameter MessageSystemAttributes is invalid."
+                    .to_owned(),
+        }
+    );
+}
+
+#[test]
+fn sqs_message_system_attributes_do_not_count_toward_message_size() {
+    let clock = ManualClock::new(UNIX_EPOCH);
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(&["msg-1"], &["handle-1"])),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(
+            &scope,
+            CreateQueueInput {
+                attributes: BTreeMap::from([(
+                    "MaximumMessageSize".to_owned(),
+                    "1024".to_owned(),
+                )]),
+                queue_name: "message-size".to_owned(),
+            },
+        )
+        .expect("queue should be created");
+
+    let result = service.send_message(
+        &queue,
+        SendMessageInput {
+            body: "a".repeat(1024),
+            delay_seconds: None,
+            message_attributes: BTreeMap::new(),
+            message_deduplication_id: None,
+            message_group_id: None,
+            message_system_attributes: BTreeMap::from([(
+                "AWSTraceHeader".to_owned(),
+                MessageAttributeValue {
+                    binary_list_values: Vec::new(),
+                    binary_value: None,
+                    data_type: "String".to_owned(),
+                    string_list_values: Vec::new(),
+                    string_value: Some(
+                        "Root=1-67891233-abcdef012345678912345678".to_owned(),
+                    ),
+                },
+            )]),
+        },
+    );
+
+    assert!(result.is_ok());
+}
+
+#[test]
+fn sqs_send_message_returns_md5_of_message_system_attributes() {
+    let clock = ManualClock::new(UNIX_EPOCH);
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(&["msg-1"], &["handle-1"])),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(&scope, queue_input("trace-header-digest"))
+        .expect("queue should be created");
+
+    let sent = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::new(),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::from([(
+                    "AWSTraceHeader".to_owned(),
+                    MessageAttributeValue {
+                        binary_list_values: Vec::new(),
+                        binary_value: None,
+                        data_type: "String".to_owned(),
+                        string_list_values: Vec::new(),
+                        string_value: Some(
+                            "Root=1-67891233-abcdef012345678912345678"
+                                .to_owned(),
+                        ),
+                    },
+                )]),
+            },
+        )
+        .expect("send should succeed");
+
+    assert!(sent.md5_of_message_system_attributes.is_some());
+}
+
+#[test]
+fn sqs_send_message_batch_returns_md5_of_message_system_attributes() {
+    let clock = ManualClock::new(UNIX_EPOCH);
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(
+            &["msg-1", "msg-2"],
+            &["handle-1", "handle-2"],
+        )),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(&scope, queue_input("trace-header-batch-digest"))
+        .expect("queue should be created");
+
+    let sent = service
+        .send_message_batch(
+            &queue,
+            vec![SendMessageBatchEntryInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                id: "entry-1".to_owned(),
+                message_attributes: BTreeMap::new(),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::from([(
+                    "AWSTraceHeader".to_owned(),
+                    MessageAttributeValue {
+                        binary_list_values: Vec::new(),
+                        binary_value: None,
+                        data_type: "String".to_owned(),
+                        string_list_values: Vec::new(),
+                        string_value: Some(
+                            "Root=1-67891233-abcdef012345678912345678"
+                                .to_owned(),
+                        ),
+                    },
+                )]),
+            }],
+        )
+        .expect("batch send should succeed");
+
+    assert_eq!(sent.successful.len(), 1);
+    assert!(
+        sent.successful[0]
+            .md5_of_message_system_attributes
+            .as_deref()
+            .is_some()
+    );
+}
+
+#[test]
+fn sqs_message_attributes_reject_invalid_data_types_and_value_pairings() {
+    let clock = ManualClock::new(UNIX_EPOCH);
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(
+            &["msg-1", "msg-2", "msg-3", "msg-4", "msg-5", "msg-6"],
+            &["handle-1"],
+        )),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(&scope, queue_input("attribute-types"))
+        .expect("queue should be created");
+
+    let bogus_type = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::from([(
+                    "example".to_owned(),
+                    MessageAttributeValue {
+                        binary_list_values: Vec::new(),
+                        binary_value: None,
+                        data_type: "Bogus".to_owned(),
+                        string_list_values: Vec::new(),
+                        string_value: Some("value".to_owned()),
+                    },
+                )]),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
+            },
+        )
+        .expect_err("unknown logical types should fail");
+    let binary_with_string = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::from([(
+                    "example".to_owned(),
+                    MessageAttributeValue {
+                        binary_list_values: Vec::new(),
+                        binary_value: None,
+                        data_type: "Binary".to_owned(),
+                        string_list_values: Vec::new(),
+                        string_value: Some("value".to_owned()),
+                    },
+                )]),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
+            },
+        )
+        .expect_err("binary types require BinaryValue");
+    let number_with_binary = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::from([(
+                    "example".to_owned(),
+                    MessageAttributeValue {
+                        binary_list_values: Vec::new(),
+                        binary_value: Some(vec![0x01]),
+                        data_type: "Number.int".to_owned(),
+                        string_list_values: Vec::new(),
+                        string_value: None,
+                    },
+                )]),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
+            },
+        )
+        .expect_err("number types require StringValue");
+    let invalid_number = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::from([(
+                    "example".to_owned(),
+                    MessageAttributeValue {
+                        binary_list_values: Vec::new(),
+                        binary_value: None,
+                        data_type: "Number".to_owned(),
+                        string_list_values: Vec::new(),
+                        string_value: Some("12x".to_owned()),
+                    },
+                )]),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
+            },
+        )
+        .expect_err("invalid numeric strings should fail");
+    let invalid_label = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::from([(
+                    "example".to_owned(),
+                    MessageAttributeValue {
+                        binary_list_values: Vec::new(),
+                        binary_value: None,
+                        data_type: "String.!".to_owned(),
+                        string_list_values: Vec::new(),
+                        string_value: Some("value".to_owned()),
+                    },
+                )]),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
+            },
+        )
+        .expect_err("invalid custom labels should fail");
+    let invalid_label_whitespace = service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::from([(
+                    "example".to_owned(),
+                    MessageAttributeValue {
+                        binary_list_values: Vec::new(),
+                        binary_value: None,
+                        data_type: "Number.foo bar".to_owned(),
+                        string_list_values: Vec::new(),
+                        string_value: Some("123".to_owned()),
+                    },
+                )]),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
+            },
+        )
+        .expect_err("whitespace in custom labels should fail");
+
+    assert_eq!(
+        bogus_type,
+        SqsError::InvalidParameterValue {
+            message: "Value Bogus for parameter DataType is invalid."
+                .to_owned(),
+        }
+    );
+    assert_eq!(
+        binary_with_string,
+        SqsError::InvalidParameterValue {
+            message: "Value Binary for parameter DataType is invalid."
+                .to_owned(),
+        }
+    );
+    assert_eq!(
+        number_with_binary,
+        SqsError::InvalidParameterValue {
+            message: "Value Number.int for parameter DataType is invalid."
+                .to_owned(),
+        }
+    );
+    assert_eq!(
+        invalid_number,
+        SqsError::InvalidParameterValue {
+            message: "Value 12x for parameter StringValue is invalid."
+                .to_owned(),
+        }
+    );
+    assert_eq!(
+        invalid_label,
+        SqsError::InvalidParameterValue {
+            message: "Value String.! for parameter DataType is invalid."
+                .to_owned(),
+        }
+    );
+    assert_eq!(
+        invalid_label_whitespace,
+        SqsError::InvalidParameterValue {
+            message: "Value Number.foo bar for parameter DataType is invalid."
+                .to_owned(),
+        }
+    );
+}
+
+#[test]
+fn sqs_message_attribute_wildcards_match_only_dotted_namespaces() {
+    let clock = ManualClock::new(UNIX_EPOCH);
+    let service = SqsService::with_sources(
+        clock.source(),
+        Arc::new(TestIdentifierSource::new(&["msg-1"], &["handle-1"])),
+    );
+    let scope = scope();
+    let queue = service
+        .create_queue(&scope, queue_input("selectors"))
+        .expect("queue should be created");
+    let attribute = |value: &str| MessageAttributeValue {
+        binary_list_values: Vec::new(),
+        binary_value: None,
+        data_type: "String".to_owned(),
+        string_list_values: Vec::new(),
+        string_value: Some(value.to_owned()),
+    };
+    service
+        .send_message(
+            &queue,
+            SendMessageInput {
+                body: "payload".to_owned(),
+                delay_seconds: None,
+                message_attributes: BTreeMap::from([
+                    ("foo".to_owned(), attribute("root")),
+                    ("foo.bar".to_owned(), attribute("child")),
+                    ("foobar".to_owned(), attribute("sibling")),
+                ]),
+                message_deduplication_id: None,
+                message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
+            },
+        )
+        .expect("message should send");
+
+    let received = service
+        .receive_message(
+            &queue,
+            ReceiveMessageInput {
+                message_attribute_names: vec!["foo.*".to_owned()],
+                ..receive_input(Some(1), Some(0), Some(0))
+            },
+        )
+        .expect("message should receive");
+    assert_eq!(
+        received[0].message_attributes,
+        BTreeMap::from([("foo.bar".to_owned(), attribute("child"))])
     );
 }
 
@@ -1179,14 +2116,7 @@ fn sqs_receive_message_uses_queue_default_wait_time_when_request_omits_it() {
         .expect("queue should be created");
 
     let received = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: None,
-                wait_time_seconds: None,
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), None, None))
         .expect("receive should succeed");
 
     assert!(received.is_empty());
@@ -1217,14 +2147,7 @@ fn sqs_receive_message_request_wait_time_overrides_queue_default() {
         .expect("queue should be created");
 
     let received = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: None,
-                wait_time_seconds: Some(1),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), None, Some(1)))
         .expect("receive should succeed");
 
     assert!(received.is_empty());
@@ -1248,11 +2171,7 @@ fn sqs_receive_message_cancellation_is_scoped_to_the_current_receive() {
         let received = request_runtime
             .receive_message(
                 &receive_queue,
-                ReceiveMessageInput {
-                    max_number_of_messages: Some(1),
-                    visibility_timeout: None,
-                    wait_time_seconds: Some(5),
-                },
+                receive_input(Some(1), None, Some(5)),
                 &is_cancelled,
             )
             .expect("receive should succeed");
@@ -1270,14 +2189,7 @@ fn sqs_receive_message_cancellation_is_scoped_to_the_current_receive() {
 
     let started_at = Instant::now();
     let received = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: None,
-                wait_time_seconds: Some(1),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), None, Some(1)))
         .expect("ordinary receive should still succeed");
 
     assert!(received.is_empty());
@@ -1310,14 +2222,7 @@ fn sqs_receive_message_returns_messages_arriving_during_wait_window() {
     });
 
     let received = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: None,
-                wait_time_seconds: None,
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), None, None))
         .expect("receive should succeed");
     delayed_send.join().expect("delayed sender should finish");
 
@@ -1347,7 +2252,7 @@ fn sqs_standard_internal_attribute_validation_helpers_cover_remaining_edges() {
     let (identity, fifo_identity) = queue_identities();
 
     assert_eq!(
-        normalize_requested_attribute_names(&[])
+        normalize_requested_attribute_names(&[] as &[&str])
             .expect("empty requests should normalize"),
         Vec::<&str>::new()
     );
@@ -1553,15 +2458,19 @@ fn sqs_standard_internal_request_validation_helpers_cover_remaining_edges() {
                 body: "a".to_owned(),
                 delay_seconds: None,
                 id: "dup".to_owned(),
+                message_attributes: BTreeMap::new(),
                 message_deduplication_id: None,
                 message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
             },
             SendMessageBatchEntryInput {
                 body: "b".to_owned(),
                 delay_seconds: None,
                 id: "dup".to_owned(),
+                message_attributes: BTreeMap::new(),
                 message_deduplication_id: None,
                 message_group_id: None,
+                message_system_attributes: BTreeMap::new(),
             },
         ])
         .expect_err("duplicate batch ids should fail"),
@@ -1694,7 +2603,10 @@ fn sqs_standard_internal_error_mapping_covers_remaining_edges() {
     let unsupported =
         SqsError::UnsupportedOperation { message: "unsupported".to_owned() }
             .to_aws_error();
-    assert_eq!(unsupported.code(), "UnsupportedOperation");
+    assert_eq!(
+        unsupported.code(),
+        "AWS.SimpleQueueService.UnsupportedOperation"
+    );
     assert_eq!(unsupported.message(), "unsupported");
 
     let batch_ids_not_distinct = SqsError::BatchEntryIdsNotDistinct {
@@ -1786,23 +2698,16 @@ fn sqs_standard_internal_queue_metrics_and_wrapper_defaults_cover_remaining_edge
         .expect("second message should send");
 
     let received = service
-        .receive_message(
-            &queue,
-            ReceiveMessageInput {
-                max_number_of_messages: Some(1),
-                visibility_timeout: Some(1),
-                wait_time_seconds: Some(0),
-            },
-        )
+        .receive_message(&queue, receive_input(Some(1), Some(1), Some(0)))
         .expect("receive should succeed");
     assert_eq!(received.len(), 1);
     let all_attributes = service
-        .get_queue_attributes(&queue, &[])
+        .get_queue_attributes(&queue, &[] as &[&str])
         .expect("all queue attributes should return");
     let filtered_attributes = service
         .get_queue_attributes(
             &queue,
-            &["ApproximateNumberOfMessagesNotVisible".to_owned()],
+            &["ApproximateNumberOfMessagesNotVisible"],
         )
         .expect("filtered queue attributes should return");
     assert_eq!(all_attributes["ApproximateNumberOfMessages"], "1");
@@ -1823,7 +2728,7 @@ fn sqs_standard_internal_queue_metrics_and_wrapper_defaults_cover_remaining_edge
     service.delete_queue(&queue).expect("queue deletes should succeed");
     assert_eq!(
         service
-            .get_queue_attributes(&queue, &[])
+            .get_queue_attributes(&queue, &[] as &[&str])
             .expect_err("deleted queues should not resolve"),
         SqsError::QueueDoesNotExist
     );

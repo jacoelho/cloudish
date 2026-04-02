@@ -847,7 +847,7 @@ mod tests {
         )
         .expect("queue identity should parse");
         let attributes = sqs
-            .get_queue_attributes(&queue_identity, &[])
+            .get_queue_attributes(&queue_identity, &[] as &[&str])
             .expect("queue should exist downstream");
         assert_eq!(
             attributes.get("QueueArn"),
@@ -923,7 +923,7 @@ mod tests {
                     queue_name,
                 )
                 .expect("queue identity should build"),
-                &[],
+                &[] as &[&str],
             )
             .expect("updated queue should exist");
         assert_eq!(

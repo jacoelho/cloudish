@@ -94,7 +94,7 @@ impl EventBridgeDeliveryDispatcher for EventBridgeDispatcher {
                 };
                 let queue = sqs::SqsQueueIdentity::from_arn(&target.arn)
                     .map_err(|_| missing_target_error(&target.arn))?;
-                sqs.get_queue_attributes(&queue, &[])
+                sqs.get_queue_attributes(&queue, &[] as &[&str])
                     .map(|_| ())
                     .map_err(|_| missing_target_error(&target.arn))
             }
@@ -167,8 +167,10 @@ fn dispatch_eventbridge_delivery(
                     body: String::from_utf8_lossy(&delivery.payload)
                         .into_owned(),
                     delay_seconds: None,
+                    message_attributes: BTreeMap::new(),
                     message_deduplication_id: None,
                     message_group_id: None,
+                    message_system_attributes: BTreeMap::new(),
                 },
             );
         }

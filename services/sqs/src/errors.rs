@@ -7,15 +7,25 @@ pub enum SqsError {
     #[error("unsupported attribute {attribute_name}")]
     InvalidAttributeName { attribute_name: String },
     #[error("{message}")]
+    InvalidAddress { message: String },
+    #[error("{message}")]
     BatchEntryIdsNotDistinct { message: String },
+    #[error("{message}")]
+    BatchRequestTooLong { message: String },
     #[error("{message}")]
     EmptyBatchRequest { message: String },
     #[error("{message}")]
     InvalidBatchEntryId { message: String },
     #[error("{message}")]
+    InvalidMessageContents { message: String },
+    #[error("{message}")]
     InvalidParameterValue { message: String },
     #[error("{message}")]
     MissingParameter { message: String },
+    #[error("{message}")]
+    OverLimit { message: String },
+    #[error("{message}")]
+    PurgeQueueInProgress { message: String },
     #[error("{message}")]
     QueueAlreadyExists { message: String },
     #[error("The specified queue does not exist.")]
@@ -28,6 +38,8 @@ pub enum SqsError {
         "Value {receipt_handle} for parameter ReceiptHandle is invalid. Reason: Message does not exist or is not available for visibility timeout change."
     )]
     InvalidReceiptHandleForVisibility { receipt_handle: String },
+    #[error("{message}")]
+    MessageNotInflight { message: String },
     #[error("{message}")]
     ResourceNotFound { message: String },
     #[error("{message}")]
@@ -46,6 +58,14 @@ impl SqsError {
                 true,
             )
             .expect("SQS InvalidAttributeName must build"),
+            Self::InvalidAddress { message } => AwsError::custom(
+                AwsErrorFamily::Validation,
+                "InvalidAddress",
+                message.clone(),
+                400,
+                true,
+            )
+            .expect("SQS InvalidAddress must build"),
             Self::BatchEntryIdsNotDistinct { message } => AwsError::custom(
                 AwsErrorFamily::Validation,
                 "AWS.SimpleQueueService.BatchEntryIdsNotDistinct",
@@ -54,6 +74,14 @@ impl SqsError {
                 true,
             )
             .expect("SQS BatchEntryIdsNotDistinct must build"),
+            Self::BatchRequestTooLong { message } => AwsError::custom(
+                AwsErrorFamily::Validation,
+                "BatchRequestTooLong",
+                message.clone(),
+                400,
+                true,
+            )
+            .expect("SQS BatchRequestTooLong must build"),
             Self::EmptyBatchRequest { message } => AwsError::custom(
                 AwsErrorFamily::Validation,
                 "AWS.SimpleQueueService.EmptyBatchRequest",
@@ -70,6 +98,14 @@ impl SqsError {
                 true,
             )
             .expect("SQS InvalidBatchEntryId must build"),
+            Self::InvalidMessageContents { message } => AwsError::custom(
+                AwsErrorFamily::Validation,
+                "InvalidMessageContents",
+                message.clone(),
+                400,
+                true,
+            )
+            .expect("SQS InvalidMessageContents must build"),
             Self::InvalidParameterValue { message } => AwsError::custom(
                 AwsErrorFamily::Validation,
                 "InvalidParameterValue",
@@ -86,6 +122,22 @@ impl SqsError {
                 true,
             )
             .expect("SQS MissingParameter must build"),
+            Self::OverLimit { message } => AwsError::custom(
+                AwsErrorFamily::Validation,
+                "OverLimit",
+                message.clone(),
+                400,
+                true,
+            )
+            .expect("SQS OverLimit must build"),
+            Self::PurgeQueueInProgress { message } => AwsError::custom(
+                AwsErrorFamily::Validation,
+                "AWS.SimpleQueueService.PurgeQueueInProgress",
+                message.clone(),
+                400,
+                true,
+            )
+            .expect("SQS PurgeQueueInProgress must build"),
             Self::QueueAlreadyExists { message } => AwsError::custom(
                 AwsErrorFamily::AlreadyExists,
                 "QueueAlreadyExists",
@@ -134,9 +186,17 @@ impl SqsError {
                 true,
             )
             .expect("SQS ResourceNotFoundException must build"),
+            Self::MessageNotInflight { message } => AwsError::custom(
+                AwsErrorFamily::Validation,
+                "MessageNotInflight",
+                message.clone(),
+                400,
+                true,
+            )
+            .expect("SQS MessageNotInflight must build"),
             Self::UnsupportedOperation { message } => AwsError::custom(
                 AwsErrorFamily::UnsupportedOperation,
-                "UnsupportedOperation",
+                "AWS.SimpleQueueService.UnsupportedOperation",
                 message.clone(),
                 400,
                 true,

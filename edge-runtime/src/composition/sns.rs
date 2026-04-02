@@ -9,6 +9,7 @@ use sns::{
     SnsService,
 };
 use sqs::{SendMessageInput, SqsService};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
@@ -224,6 +225,7 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
                             self.http_signer().as_ref(),
                         ),
                         delay_seconds: None,
+                        message_attributes: BTreeMap::new(),
                         message_deduplication_id: delivery
                             .payload
                             .message_deduplication_id
@@ -232,6 +234,7 @@ impl SnsDeliveryTransport for SnsDeliveryDispatcher {
                             .payload
                             .message_group_id
                             .clone(),
+                        message_system_attributes: BTreeMap::new(),
                     },
                 );
             }
