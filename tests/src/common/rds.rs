@@ -275,7 +275,7 @@ fn hash_hex(bytes: &[u8]) -> String {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
         write!(&mut encoded, "{byte:02x}")
             .expect("hex encoding should write to String");

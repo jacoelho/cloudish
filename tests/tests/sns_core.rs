@@ -73,7 +73,7 @@ impl CaptureHttpServer {
         let body_start = request
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
-            .map(|index| index + 4)
+            .map(|index| index.saturating_add(4))
             .expect("fixture request should contain headers");
 
         String::from_utf8(

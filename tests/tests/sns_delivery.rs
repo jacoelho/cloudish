@@ -107,7 +107,7 @@ impl CaptureHttpServer {
             })
             .collect();
         let body_start = request
-            .get(header_end + 4..)
+            .get(header_end.saturating_add(4)..)
             .expect("fixture request should contain a body");
 
         CapturedHttpRequest {

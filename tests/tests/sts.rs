@@ -88,7 +88,11 @@ fn split_response(response: &str) -> (&str, Vec<(&str, &str)>, &str) {
         parsed_headers.push((name, value.trim()));
     }
 
-    (status, parsed_headers, &response[header_end + 4..])
+    (
+        status,
+        parsed_headers,
+        &response[header_end.saturating_add(4)..],
+    )
 }
 
 fn header_value<'a>(

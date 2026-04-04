@@ -170,7 +170,9 @@ fn runtime_defaults_for_state_directory(
 }
 
 async fn wait_until_ready(address: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .unwrap_or_else(Instant::now);
 
     while Instant::now() < deadline {
         if health_check(address).await {
