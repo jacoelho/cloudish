@@ -20,17 +20,15 @@ fn encode_select_object_content_body(
     output: &services::SelectObjectContentOutput,
 ) -> Result<Vec<u8>, AwsError> {
     let mut body = Vec::new();
-    for chunk in [output.records.as_bytes()] {
-        write_message_to(
-            &event_stream_message(
-                "Records",
-                Some("application/octet-stream"),
-                chunk.to_vec(),
-            ),
-            &mut body,
-        )
-        .map_err(select_object_content_encode_error)?;
-    }
+    write_message_to(
+        &event_stream_message(
+            "Records",
+            Some("application/octet-stream"),
+            output.records.as_bytes().to_vec(),
+        ),
+        &mut body,
+    )
+    .map_err(select_object_content_encode_error)?;
 
     write_message_to(
         &event_stream_message(

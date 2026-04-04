@@ -117,20 +117,33 @@ impl RandomSource for SequenceRandomSource {
     fn fill_bytes(&self, bytes: &mut [u8]) -> Result<(), InfrastructureError> {
         let mut cursor = recover(self.cursor.lock());
         let pattern_len = self.pattern.len();
+        if pattern_len == 0 {
+            return Err(InfrastructureError::random_source(
+                "sequence-random",
+                io::Error::other("sequence random pattern must not be empty"),
+            ));
+        }
 
         for byte in bytes {
-            *byte =
-                self.pattern.get(*cursor % pattern_len).copied().ok_or_else(
-                    || {
-                        InfrastructureError::random_source(
-                            "sequence-random",
-                            io::Error::other(
-                                "sequence random pattern must not be empty",
-                            ),
-                        )
-                    },
-                )?;
-            *cursor += 1;
+            let pattern_index = (*cursor).checked_rem(pattern_len).ok_or_else(
+                || {
+                    InfrastructureError::random_source(
+                        "sequence-random",
+                        io::Error::other(
+                            "sequence random pattern must not be empty",
+                        ),
+                    )
+                },
+            )?;
+            *byte = self.pattern.get(pattern_index).copied().ok_or_else(|| {
+                InfrastructureError::random_source(
+                    "sequence-random",
+                    io::Error::other(
+                        "sequence random pattern must not be empty",
+                    ),
+                )
+            })?;
+            *cursor = cursor.saturating_add(1);
         }
 
         Ok(())
@@ -182,7 +195,7 @@ impl BackgroundScheduler for ManualBackgroundScheduler {
         let id = {
             let mut state = recover(self.inner.lock());
             let id = state.next_id;
-            state.next_id += 1;
+            state.next_id = state.next_id.saturating_add(1);
             state.tasks.insert(id, ManualTask { cancelled: false, task });
             id
         };

@@ -52,21 +52,30 @@ fn percent_decode_tag_component(value: &str) -> Result<String, AwsError> {
         match byte {
             b'+' => {
                 decoded.push(b' ');
-                index += 1;
+                index =
+                    index.checked_add(1).ok_or_else(malformed_xml_error)?;
             }
             b'%' => {
-                let Some(&high_byte) = bytes.get(index + 1) else {
+                let Some(high_index) = index.checked_add(1) else {
                     return Err(malformed_xml_error());
                 };
-                let Some(&low_byte) = bytes.get(index + 2) else {
+                let Some(&high_byte) = bytes.get(high_index) else {
+                    return Err(malformed_xml_error());
+                };
+                let Some(low_index) = index.checked_add(2) else {
+                    return Err(malformed_xml_error());
+                };
+                let Some(&low_byte) = bytes.get(low_index) else {
                     return Err(malformed_xml_error());
                 };
                 decoded.push((hex(high_byte)? << 4) | hex(low_byte)?);
-                index += 3;
+                index =
+                    index.checked_add(3).ok_or_else(malformed_xml_error)?;
             }
             other => {
                 decoded.push(other);
-                index += 1;
+                index =
+                    index.checked_add(1).ok_or_else(malformed_xml_error)?;
             }
         }
     }
@@ -75,10 +84,8 @@ fn percent_decode_tag_component(value: &str) -> Result<String, AwsError> {
 }
 
 fn hex(value: u8) -> Result<u8, AwsError> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err(malformed_xml_error()),
-    }
+    char::from(value)
+        .to_digit(16)
+        .and_then(|digit| u8::try_from(digit).ok())
+        .ok_or_else(malformed_xml_error)
 }

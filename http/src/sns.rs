@@ -349,8 +349,10 @@ pub(crate) fn handle_json(
                 .map(|topic_arn| json!({ "TopicArn": topic_arn }))
                 .collect::<Vec<_>>()
             });
-            if let Some(next_token) = topics.next_token {
-                response["NextToken"] = json!(next_token);
+            if let Some(next_token) = topics.next_token
+                && let Some(response) = response.as_object_mut()
+            {
+                response.insert("NextToken".to_owned(), json!(next_token));
             }
 
             response
@@ -405,8 +407,10 @@ pub(crate) fn handle_json(
                 )
                 .map_err(|error| error.to_aws_error())?;
             let mut response = json!({ "Subscriptions": json_subscriptions(&subscriptions.items) });
-            if let Some(next_token) = subscriptions.next_token {
-                response["NextToken"] = json!(next_token);
+            if let Some(next_token) = subscriptions.next_token
+                && let Some(response) = response.as_object_mut()
+            {
+                response.insert("NextToken".to_owned(), json!(next_token));
             }
 
             response
@@ -420,8 +424,10 @@ pub(crate) fn handle_json(
                 .map_err(|error| error.to_aws_error())?;
 
             let mut response = json!({ "Subscriptions": json_subscriptions(&subscriptions.items) });
-            if let Some(next_token) = subscriptions.next_token {
-                response["NextToken"] = json!(next_token);
+            if let Some(next_token) = subscriptions.next_token
+                && let Some(response) = response.as_object_mut()
+            {
+                response.insert("NextToken".to_owned(), json!(next_token));
             }
 
             response

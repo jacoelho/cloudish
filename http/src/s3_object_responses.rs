@@ -162,5 +162,8 @@ pub(crate) fn head_invalid_range_response(size: u64) -> EdgeResponse {
 }
 
 fn http_timestamp(epoch_seconds: u64) -> String {
-    httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(epoch_seconds))
+    let timestamp = UNIX_EPOCH
+        .checked_add(Duration::from_secs(epoch_seconds))
+        .unwrap_or(UNIX_EPOCH);
+    httpdate::fmt_http_date(timestamp)
 }

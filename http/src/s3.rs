@@ -1,9 +1,12 @@
 pub(crate) use crate::aws_error_shape::AwsErrorShape;
 use crate::query::QueryParameters;
-use crate::request::{EdgeRequest, HttpRequest};
+use crate::request::HttpRequest;
+#[cfg(test)]
+pub(crate) use crate::request::EdgeRequest;
 use crate::runtime::EdgeResponse;
 use crate::s3_bucket_encoding::list_buckets_response;
 use crate::s3_bucket_routes::handle_bucket_request;
+#[cfg(test)]
 pub(crate) use crate::s3_copy_parsing::parse_copy_source;
 use crate::s3_error_encoding::s3_edge_target_error;
 use crate::s3_object_routes::handle_object_request;

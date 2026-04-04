@@ -205,7 +205,9 @@ fn connect_stream(
             ),
         ));
     }
-    let deadline = Instant::now() + HTTP_FORWARD_CONNECT_TIMEOUT;
+    let deadline = Instant::now()
+        .checked_add(HTTP_FORWARD_CONNECT_TIMEOUT)
+        .unwrap_or_else(Instant::now);
     let mut last_retryable_error = None;
 
     while Instant::now() < deadline {
@@ -267,7 +269,9 @@ fn write_with_cancellation(
     bytes: &[u8],
     is_cancelled: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<(), InfrastructureError> {
-    let mut idle_deadline = Instant::now() + HTTP_FORWARD_IDLE_TIMEOUT;
+    let mut idle_deadline = Instant::now()
+        .checked_add(HTTP_FORWARD_IDLE_TIMEOUT)
+        .unwrap_or_else(Instant::now);
     let mut written = 0;
     while written < bytes.len() {
         let remaining = bytes.get(written..).ok_or_else(|| {
@@ -296,8 +300,10 @@ fn write_with_cancellation(
                 ));
             }
             Ok(count) => {
-                written += count;
-                idle_deadline = Instant::now() + HTTP_FORWARD_IDLE_TIMEOUT;
+                written = written.saturating_add(count);
+                idle_deadline = Instant::now()
+                    .checked_add(HTTP_FORWARD_IDLE_TIMEOUT)
+                    .unwrap_or_else(Instant::now);
             }
             Err(source) if is_retryable_forward_error(&source) => {
                 if Instant::now() >= idle_deadline {
@@ -327,7 +333,9 @@ fn read_response(
     endpoint: &Endpoint,
     is_cancelled: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<HttpForwardResponse, InfrastructureError> {
-    let mut idle_deadline = Instant::now() + HTTP_FORWARD_IDLE_TIMEOUT;
+    let mut idle_deadline = Instant::now()
+        .checked_add(HTTP_FORWARD_IDLE_TIMEOUT)
+        .unwrap_or_else(Instant::now);
     let mut response = Vec::new();
     let mut chunk = [0_u8; 8 * 1024];
     loop {
@@ -349,7 +357,9 @@ fn read_response(
                     )
                 })?;
                 response.extend_from_slice(bytes);
-                idle_deadline = Instant::now() + HTTP_FORWARD_IDLE_TIMEOUT;
+                idle_deadline = Instant::now()
+                    .checked_add(HTTP_FORWARD_IDLE_TIMEOUT)
+                    .unwrap_or_else(Instant::now);
             }
             Err(source) if is_retryable_forward_error(&source) => {
                 if Instant::now() >= idle_deadline {
@@ -446,7 +456,7 @@ fn header_end(buffer: &[u8]) -> Option<usize> {
     buffer
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4)
+        .map(|index| index.saturating_add(4))
 }
 
 fn join_copy_thread(join: JoinHandle<io::Result<()>>) -> io::Result<()> {

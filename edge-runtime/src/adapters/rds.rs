@@ -666,7 +666,7 @@ fn split_select_list(select: &str) -> Vec<String> {
             b'\'' => in_single_quote = !in_single_quote,
             b',' if !in_single_quote => {
                 parts.push(select[start..index].trim().to_owned());
-                start = index + 1;
+                start = index.saturating_add(1);
             }
             _ => {}
         }
@@ -825,7 +825,9 @@ mod tests {
         body.push(0);
 
         let mut message = Vec::new();
-        message.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        message.extend_from_slice(
+            &(body.len().saturating_add(4) as u32).to_be_bytes(),
+        );
         message.extend_from_slice(&body);
         message
     }
@@ -834,7 +836,9 @@ mod tests {
         let mut message = Vec::new();
         message.push(b'p');
         message
-            .extend_from_slice(&((password.len() + 5) as u32).to_be_bytes());
+            .extend_from_slice(
+                &(password.len().saturating_add(5) as u32).to_be_bytes(),
+            );
         message.extend_from_slice(password.as_bytes());
         message.push(0);
         message

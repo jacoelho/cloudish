@@ -44,16 +44,21 @@ pub(crate) fn parse_create_bucket_region(
     let body = std::str::from_utf8(body).map_err(|_| malformed_xml_error())?;
     let start_tag = "<LocationConstraint>";
     let end_tag = "</LocationConstraint>";
-    let Some(start) =
-        body.find(start_tag).map(|index| index + start_tag.len())
+    let Some(start) = body
+        .find(start_tag)
+        .and_then(|index| index.checked_add(start_tag.len()))
     else {
         return default_create_bucket_region(scope);
     };
-    let Some(end) = body[start..].find(end_tag).map(|index| start + index)
+    let Some(body_tail) = body.get(start..) else {
+        return Err(malformed_xml_error());
+    };
+    let Some(end) =
+        body_tail.find(end_tag).and_then(|index| start.checked_add(index))
     else {
         return Err(malformed_xml_error());
     };
-    let region = body[start..end].trim();
+    let region = body.get(start..end).ok_or_else(malformed_xml_error)?.trim();
 
     if region.is_empty() {
         return default_create_bucket_region(scope);
