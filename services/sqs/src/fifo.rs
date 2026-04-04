@@ -74,8 +74,9 @@ impl QueueRecord {
         }
 
         let sequence_number = Some(self.next_sequence_number());
-        let visible_at_millis = now_millis
-            + u64::from(self.queue_delay_seconds()).saturating_mul(1_000);
+        let visible_at_millis = now_millis.saturating_add(
+            u64::from(self.queue_delay_seconds()).saturating_mul(1_000),
+        );
         self.messages.push_back(MessageRecord {
             body: input.body,
             dead_letter_source_arn: None,
@@ -168,9 +169,14 @@ impl QueueRecord {
                     continue;
                 }
 
-                if max_receive_count
-                    .is_some_and(|limit| message.receive_count + 1 > limit)
-                {
+                let would_exceed_receive_limit = max_receive_count
+                    .is_some_and(|limit| {
+                        message
+                            .receive_count
+                            .checked_add(1)
+                            .is_none_or(|count| count > limit)
+                    });
+                if would_exceed_receive_limit {
                     outcome.dead_letter_messages.push(PendingQueueMove {
                         message: message
                             .staged_for_queue_move(Some(queue_arn.clone())),
@@ -226,7 +232,8 @@ impl QueueRecord {
     }
 
     pub(crate) fn next_sequence_number(&mut self) -> String {
-        self.next_sequence_number += 1;
+        self.next_sequence_number =
+            self.next_sequence_number.saturating_add(1);
         self.next_sequence_number.to_string()
     }
 }

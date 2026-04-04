@@ -1186,7 +1186,8 @@ impl IamWorld {
 
     fn next_access_key_material(&mut self) -> (String, String) {
         let value = self.next_access_key_sequence;
-        self.next_access_key_sequence += 1;
+        self.next_access_key_sequence =
+            self.next_access_key_sequence.saturating_add(1);
         (format!("AKIA{value:016X}"), format!("cloudishsecret{value:024X}"))
     }
 }
@@ -1892,7 +1893,8 @@ impl ScopedIamState {
             });
         }
         let version_id = format!("v{}", policy.next_version_number);
-        policy.next_version_number += 1;
+        policy.next_version_number =
+            policy.next_version_number.saturating_add(1);
         if input.set_as_default {
             policy.default_version_id = version_id.clone();
         }
@@ -2310,20 +2312,24 @@ impl ScopedIamState {
     }
 
     fn attachment_count(&self, policy_arn: &str) -> usize {
-        self.users
+        [
+            self.users
             .values()
             .filter(|user| user.attached_policies.contains(policy_arn))
-            .count()
-            + self
+            .count(),
+            self
                 .groups
                 .values()
                 .filter(|group| group.attached_policies.contains(policy_arn))
-                .count()
-            + self
+                .count(),
+            self
                 .roles
                 .values()
                 .filter(|role| role.attached_policies.contains(policy_arn))
-                .count()
+                .count(),
+        ]
+        .into_iter()
+        .sum()
     }
 
     fn policy_view(&self, policy: &StoredPolicy) -> IamPolicy {
@@ -2433,7 +2439,7 @@ impl ScopedIamState {
 
     fn next_identifier(&mut self, prefix: &str) -> String {
         let value = self.next_identifier;
-        self.next_identifier += 1;
+        self.next_identifier = self.next_identifier.saturating_add(1);
         format!("{prefix}{value:016X}")
     }
 }
@@ -2693,7 +2699,7 @@ fn merge_tags(
     let keys: BTreeSet<_> = tags.iter().map(|tag| tag.key.as_str()).collect();
     let retained =
         target.keys().filter(|key| !keys.contains(key.as_str())).count();
-    if retained + tags.len() > MAX_TAGS {
+    if retained.saturating_add(tags.len()) > MAX_TAGS {
         return Err(IamError::LimitExceeded {
             message: format!(
                 "Cannot exceed quota for TagsPerResource: {MAX_TAGS}."

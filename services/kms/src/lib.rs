@@ -1,3 +1,8 @@
+#![cfg_attr(
+    test,
+    allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)
+)]
+
 mod aliases;
 mod crypto;
 mod errors;
@@ -89,7 +94,11 @@ impl KmsService {
             },
         };
         let tags = validate_tags(&input.tags)?;
-        let sequence = self.key_store.scan(&scope_filter(scope)).len() + 1;
+        let sequence = self
+            .key_store
+            .scan(&scope_filter(scope))
+            .len()
+            .saturating_add(1);
         let key_id = generated_key_id(scope, sequence)?;
         let now = current_epoch_seconds(&*self.clock);
         let stored = StoredKmsKey {
@@ -191,7 +200,7 @@ impl KmsService {
         }
 
         let deletion_date = current_epoch_seconds(&*self.clock)
-            .saturating_add(u64::from(pending_window_in_days) * 86_400);
+            .saturating_add(u64::from(pending_window_in_days).saturating_mul(86_400));
         key.key_state = KmsKeyState::PendingDeletion;
         key.deletion_date = Some(deletion_date);
         key.pending_deletion_window_in_days = Some(pending_window_in_days);

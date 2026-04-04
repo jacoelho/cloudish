@@ -41,7 +41,7 @@ impl EdgeRequest {
         let header_end = request
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
-            .map(|index| index + 4)
+            .and_then(|index| index.checked_add(4))
             .unwrap_or(request.len());
         let (head, body) = request.split_at(header_end);
         let head = if head.ends_with(b"\r\n\r\n") {

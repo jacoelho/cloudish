@@ -54,7 +54,7 @@ pub(crate) fn parse_schedule_expression(
         });
     }
 
-    let multiplier = match (value, unit) {
+    let multiplier: u64 = match (value, unit) {
         (1, "minute") => 60,
         (_, "minutes") if value > 1 => 60,
         (1, "hour") => 60 * 60,
@@ -70,8 +70,16 @@ pub(crate) fn parse_schedule_expression(
         }
     };
 
+    let interval_seconds = multiplier.checked_mul(value).ok_or_else(|| {
+        EventBridgeError::Validation {
+            message: format!(
+                "ScheduleExpression {expression} is invalid."
+            ),
+        }
+    })?;
+
     Ok(ParsedScheduleExpression {
-        interval_seconds: multiplier * value,
+        interval_seconds,
         original: expression.to_owned(),
     })
 }

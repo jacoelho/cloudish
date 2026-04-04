@@ -1,3 +1,8 @@
+#![cfg_attr(
+    test,
+    allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)
+)]
+
 pub use aws::{BlobKey, BlobStore, Clock, InfrastructureError};
 
 pub mod bucket;

@@ -68,6 +68,20 @@ pub struct CopyObjectOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewStoredObject {
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) content_type: String,
+    pub(crate) etag: String,
+    pub(crate) last_modified_epoch_seconds: u64,
+    pub(crate) metadata: BTreeMap<String, String>,
+    pub(crate) tags: BTreeMap<String, String>,
+    pub(crate) version_id: Option<String>,
+    pub(crate) object_lock: ObjectLockWriteOptions,
+    pub(crate) size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListObjectsInput {
     pub bucket: String,
     pub delimiter: Option<String>,
@@ -235,34 +249,24 @@ impl ListedVersionEntry {
 }
 
 impl ObjectRecord {
-    pub(crate) fn new_stored_object(
-        bucket: String,
-        key: String,
-        content_type: String,
-        etag: String,
-        last_modified_epoch_seconds: u64,
-        metadata: BTreeMap<String, String>,
-        tags: BTreeMap<String, String>,
-        version_id: Option<String>,
-        object_lock: ObjectLockWriteOptions,
-        size: u64,
-    ) -> Self {
+    pub(crate) fn new_stored_object(input: NewStoredObject) -> Self {
         Self {
-            bucket,
-            content_type,
+            bucket: input.bucket,
+            content_type: input.content_type,
             delete_marker: false,
-            etag,
+            etag: input.etag,
             is_latest: true,
-            key,
-            last_modified_epoch_seconds,
-            legal_hold_status: object_lock.legal_hold_status,
-            metadata,
-            object_lock_mode: object_lock.mode,
-            object_lock_retain_until_epoch_seconds: object_lock
+            key: input.key,
+            last_modified_epoch_seconds: input.last_modified_epoch_seconds,
+            legal_hold_status: input.object_lock.legal_hold_status,
+            metadata: input.metadata,
+            object_lock_mode: input.object_lock.mode,
+            object_lock_retain_until_epoch_seconds: input
+                .object_lock
                 .retain_until_epoch_seconds,
-            size,
-            tags,
-            version_id,
+            size: input.size,
+            tags: input.tags,
+            version_id: input.version_id,
         }
     }
 
@@ -336,10 +340,12 @@ impl ObjectRecord {
             Some(range) => Some(resolve_object_range(range, size)?),
             None => None,
         };
+        let content_length = range
+            .as_ref()
+            .map(ResolvedObjectRange::content_length)
+            .unwrap_or(size);
 
-        Ok(self.into_head_with_range(
-            range.as_ref().map_or(size, ResolvedObjectRange::content_length),
-        ))
+        Ok(self.into_head_with_range(content_length))
     }
 
     pub(crate) fn into_head_with_range(

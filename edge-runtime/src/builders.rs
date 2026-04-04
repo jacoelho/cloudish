@@ -913,19 +913,19 @@ fn percent_decode(value: &str) -> Result<String, String> {
         })? {
             b'+' => {
                 decoded.push(b' ');
-                index += 1;
+                index = index.saturating_add(1);
             }
-            b'%' if index + 2 < bytes.len() => {
-                let high = *bytes.get(index + 1).ok_or_else(|| {
+            b'%' if index.saturating_add(2) < bytes.len() => {
+                let high = *bytes.get(index.saturating_add(1)).ok_or_else(|| {
                     "IAM auth token contains malformed percent-encoding."
                         .to_owned()
                 })?;
-                let low = *bytes.get(index + 2).ok_or_else(|| {
+                let low = *bytes.get(index.saturating_add(2)).ok_or_else(|| {
                     "IAM auth token contains malformed percent-encoding."
                         .to_owned()
                 })?;
                 decoded.push((hex_value(high)? << 4) | hex_value(low)?);
-                index += 3;
+                index = index.saturating_add(3);
             }
             b'%' => {
                 return Err(
@@ -935,7 +935,7 @@ fn percent_decode(value: &str) -> Result<String, String> {
             }
             byte => {
                 decoded.push(byte);
-                index += 1;
+                index = index.saturating_add(1);
             }
         }
     }
@@ -946,9 +946,9 @@ fn percent_decode(value: &str) -> Result<String, String> {
 
 fn hex_value(byte: u8) -> Result<u8, String> {
     match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        b'0'..=b'9' => Ok(byte.saturating_sub(b'0')),
+        b'a'..=b'f' => Ok(byte.saturating_sub(b'a').saturating_add(10)),
+        b'A'..=b'F' => Ok(byte.saturating_sub(b'A').saturating_add(10)),
         _ => {
             Err("IAM auth token contains malformed percent-encoding."
                 .to_owned())

@@ -411,23 +411,37 @@ fn percent_decode_path(
     while let Some(&byte) = bytes.get(index) {
         match byte {
             b'%' => {
-                let Some(&high_byte) = bytes.get(index + 1) else {
+                let Some(high_index) = index.checked_add(1) else {
                     return Err(
                         S3EdgeRequestTargetError::InvalidPercentEncoding,
                     );
                 };
-                let Some(&low_byte) = bytes.get(index + 2) else {
+                let Some(&high_byte) = bytes.get(high_index) else {
+                    return Err(
+                        S3EdgeRequestTargetError::InvalidPercentEncoding,
+                    );
+                };
+                let Some(low_index) = index.checked_add(2) else {
+                    return Err(
+                        S3EdgeRequestTargetError::InvalidPercentEncoding,
+                    );
+                };
+                let Some(&low_byte) = bytes.get(low_index) else {
                     return Err(
                         S3EdgeRequestTargetError::InvalidPercentEncoding,
                     );
                 };
                 decoded
                     .push((hex_value(high_byte)? << 4) | hex_value(low_byte)?);
-                index += 3;
+                index = index
+                    .checked_add(3)
+                    .ok_or(S3EdgeRequestTargetError::InvalidPercentEncoding)?;
             }
             other => {
                 decoded.push(other);
-                index += 1;
+                index = index
+                    .checked_add(1)
+                    .ok_or(S3EdgeRequestTargetError::InvalidPercentEncoding)?;
             }
         }
     }
@@ -437,12 +451,10 @@ fn percent_decode_path(
 }
 
 fn hex_value(byte: u8) -> Result<u8, S3EdgeRequestTargetError> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(S3EdgeRequestTargetError::InvalidPercentEncoding),
-    }
+    char::from(byte)
+        .to_digit(16)
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or(S3EdgeRequestTargetError::InvalidPercentEncoding)
 }
 
 #[cfg(test)]

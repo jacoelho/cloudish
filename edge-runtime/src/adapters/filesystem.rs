@@ -216,7 +216,8 @@ impl LogSink for FileLogSink {
 }
 
 fn encode_component(component: &str) -> String {
-    let mut encoded = String::with_capacity(component.len() * 2);
+    let mut encoded =
+        String::with_capacity(component.len().saturating_mul(2));
     for byte in component.bytes() {
         encoded.push(hex_digit(byte >> 4));
         encoded.push(hex_digit(byte & 0x0f));
@@ -226,8 +227,10 @@ fn encode_component(component: &str) -> String {
 
 fn hex_digit(value: u8) -> char {
     match value {
-        0..=9 => (b'0' + value) as char,
-        10..=15 => (b'a' + (value - 10)) as char,
+        0..=9 => char::from(b'0'.saturating_add(value)),
+        10..=15 => {
+            char::from(b'a'.saturating_add(value.saturating_sub(10)))
+        }
         _ => '0',
     }
 }

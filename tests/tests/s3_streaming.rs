@@ -244,11 +244,11 @@ fn aws_chunked_body(
 ) -> Vec<u8> {
     let signing_key = signing_key(secret_access_key, date, region, service);
     let mut previous_signature = seed_signature.to_owned();
-    let mut payload_offset = 0;
+    let mut payload_offset = 0usize;
     let mut encoded = Vec::new();
 
     for chunk_size in chunk_sizes {
-        let next_offset = payload_offset + *chunk_size;
+        let next_offset = payload_offset.saturating_add(*chunk_size);
         let chunk_data = payload
             .get(payload_offset..next_offset)
             .expect("chunk size should stay within payload bounds");
@@ -280,8 +280,8 @@ fn aws_chunked_body_length(chunk_sizes: &[usize]) -> usize {
         .map(|chunk_size| {
             format!("{chunk_size:x};chunk-signature={}\r\n", "0".repeat(64))
                 .len()
-                + chunk_size
-                + 2
+                .saturating_add(*chunk_size)
+                .saturating_add(2)
         })
         .sum()
 }
@@ -352,7 +352,7 @@ fn hash_hex(bytes: &[u8]) -> String {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
         write!(&mut encoded, "{byte:02x}")
             .expect("hex encoding should write to String");

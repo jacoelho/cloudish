@@ -20,7 +20,9 @@ pub(crate) fn next_parameter_version(
     existing: Option<&StoredParameter>,
 ) -> Result<u64, SsmError> {
     existing
-        .map(|stored| Ok(current_version(stored)?.version + 1))
+        .map(|stored| {
+            Ok(current_version(stored)?.version.saturating_add(1))
+        })
         .unwrap_or(Ok(1))
 }
 
@@ -45,7 +47,8 @@ pub(crate) fn trim_parameter_history(
     max_history: usize,
 ) {
     if history.len() > max_history {
-        history.drain(..history.len() - max_history);
+        let to_drop = history.len().saturating_sub(max_history);
+        history.drain(..to_drop);
     }
 }
 

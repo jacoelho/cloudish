@@ -372,7 +372,7 @@ impl CloudWatchService {
             None => filtered.len().saturating_sub(limit),
         };
         let start = offset.min(filtered.len());
-        let end = (start + limit).min(filtered.len());
+        let end = start.saturating_add(limit).min(filtered.len());
         let events = match filtered.get(start..end) {
             Some(page) => page.to_vec(),
             None => Vec::new(),
@@ -489,7 +489,7 @@ impl CloudWatchService {
             .transpose()?
             .unwrap_or(0)
             .min(matching.len());
-        let end = (start + limit).min(matching.len());
+        let end = start.saturating_add(limit).min(matching.len());
 
         Ok(FilterLogEventsOutput {
             events: match matching.get(start..end) {
@@ -861,7 +861,7 @@ impl CloudWatchService {
             .max_records
             .map(|count| validate_positive_i32("MaxRecords", count))
             .transpose()?
-            .map(|count| start + count as usize)
+                .map(|count| start.saturating_add(count as usize))
             .unwrap_or(alarms.len())
             .min(alarms.len());
 
@@ -1005,7 +1005,7 @@ impl CloudWatchService {
             max_len = max_len.max(datapoints.len());
 
             let start = offset.min(datapoints.len());
-            let end = (start + page_size).min(datapoints.len());
+            let end = start.saturating_add(page_size).min(datapoints.len());
             let label = query.label.unwrap_or(metric_name);
             let statistic = statistics.first().ok_or_else(|| {
                 CloudWatchMetricsError::InternalServiceError {
@@ -1040,8 +1040,9 @@ impl CloudWatchService {
             });
         }
 
-        let next_token = (offset + page_size < max_len)
-            .then(|| (offset + page_size).to_string());
+        let next_offset = offset.saturating_add(page_size);
+        let next_token =
+            (next_offset < max_len).then(|| next_offset.to_string());
 
         Ok(GetMetricDataOutput { metric_data_results: results, next_token })
     }

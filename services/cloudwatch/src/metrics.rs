@@ -763,6 +763,9 @@ pub(crate) fn aggregate_statistics(
     statistics: &[String],
 ) -> Vec<MetricDatapoint> {
     let period_millis = (period_seconds as u64).saturating_mul(1_000);
+    if period_millis == 0 {
+        return Vec::new();
+    }
     let mut buckets = BTreeMap::<u64, Bucket>::new();
 
     for sample in samples {
@@ -776,8 +779,11 @@ pub(crate) fn aggregate_statistics(
         {
             continue;
         }
-        let bucket_start =
-            (sample.timestamp_millis / period_millis) * period_millis;
+        let bucket_start = sample
+            .timestamp_millis
+            .checked_div(period_millis)
+            .unwrap_or(0)
+            .saturating_mul(period_millis);
         let bucket = buckets.entry(bucket_start).or_insert_with(|| Bucket {
             max: sample.max,
             min: sample.min,

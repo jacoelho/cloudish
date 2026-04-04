@@ -435,9 +435,9 @@ impl QueueRecord {
     ) -> (usize, usize, usize) {
         let now_millis = now_seconds.saturating_mul(1_000);
         let blocked_groups = self.blocked_fifo_groups(now_millis);
-        let mut visible = 0;
-        let mut delayed = 0;
-        let mut in_flight = 0;
+        let mut visible: usize = 0;
+        let mut delayed: usize = 0;
+        let mut in_flight: usize = 0;
 
         for message in &self.messages {
             if message.deleted {
@@ -446,9 +446,9 @@ impl QueueRecord {
 
             if message.visible_at_millis > now_millis {
                 if message.receive_count == 0 {
-                    delayed += 1;
+                    delayed = delayed.saturating_add(1);
                 } else {
-                    in_flight += 1;
+                    in_flight = in_flight.saturating_add(1);
                 }
                 continue;
             }
@@ -459,9 +459,9 @@ impl QueueRecord {
                     .as_ref()
                     .is_some_and(|group| blocked_groups.contains(group))
             {
-                in_flight += 1;
+                in_flight = in_flight.saturating_add(1);
             } else {
-                visible += 1;
+                visible = visible.saturating_add(1);
             }
         }
 

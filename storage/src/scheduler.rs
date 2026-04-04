@@ -116,7 +116,7 @@ impl Scheduler for ManualScheduler {
         let id = {
             let mut state = recover(self.inner.lock());
             let id = state.next_id;
-            state.next_id += 1;
+            state.next_id = state.next_id.saturating_add(1);
             state.tasks.insert(id, ManualTask { cancelled: false, task });
             id
         };

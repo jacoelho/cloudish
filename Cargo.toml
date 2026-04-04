@@ -58,8 +58,10 @@ unused_qualifications = "warn"
 
 [workspace.lints.clippy]
 # Deny
+arithmetic_side_effects = "deny"
 dbg_macro = "deny"
 disallowed_methods = "deny"
+indexing_slicing = "deny"
 print_stderr = "deny"
 print_stdout = "deny"
 missing_safety_doc = "deny"
@@ -132,7 +134,6 @@ unwrap_used = "warn"
 verbose_file_reads = "warn"
 wildcard_imports = "warn"
 zero_sized_map_values = "warn"
-indexing_slicing = "warn"
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 module_inception = "warn"

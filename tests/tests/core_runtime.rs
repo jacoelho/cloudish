@@ -47,7 +47,7 @@ fn split_response(response: &[u8]) -> (&str, Vec<(&str, &str)>, &[u8]) {
         status,
         parsed_headers,
         response
-            .get(header_end + 4..)
+            .get(header_end.saturating_add(4)..)
             .expect("response should contain a body slice"),
     )
 }

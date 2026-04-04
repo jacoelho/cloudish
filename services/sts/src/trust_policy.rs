@@ -488,31 +488,31 @@ fn glob_matches_bytes(actual: &[u8], pattern: &[u8]) -> bool {
     while actual_index < actual.len() {
         match pattern.get(pattern_index) {
             Some(b'?') => {
-                actual_index += 1;
-                pattern_index += 1;
+                actual_index = actual_index.saturating_add(1);
+                pattern_index = pattern_index.saturating_add(1);
             }
             Some(b'*') => {
                 star_index = Some(pattern_index);
-                pattern_index += 1;
+                pattern_index = pattern_index.saturating_add(1);
                 star_match_index = actual_index;
             }
             Some(expected) if actual.get(actual_index) == Some(expected) => {
-                actual_index += 1;
-                pattern_index += 1;
+                actual_index = actual_index.saturating_add(1);
+                pattern_index = pattern_index.saturating_add(1);
             }
             _ => {
                 let Some(star_index) = star_index else {
                     return false;
                 };
-                pattern_index = star_index + 1;
-                star_match_index += 1;
+                pattern_index = star_index.saturating_add(1);
+                star_match_index = star_match_index.saturating_add(1);
                 actual_index = star_match_index;
             }
         }
     }
 
     while matches!(pattern.get(pattern_index), Some(b'*')) {
-        pattern_index += 1;
+        pattern_index = pattern_index.saturating_add(1);
     }
 
     pattern_index == pattern.len()

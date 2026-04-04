@@ -413,27 +413,33 @@ fn validate_hello_command(
             .as_str()
         {
             "auth" => {
-                if index + 2 >= command.len() {
+                if index.saturating_add(2) >= command.len() {
                     client.write_all(WRONG_HELLO_ARGS_RESPONSE)?;
                     client.flush()?;
                     return Ok(false);
                 }
                 username =
-                    Some(bytes_to_string(command_part(command, index + 1)?)?);
+                    Some(bytes_to_string(command_part(
+                        command,
+                        index.saturating_add(1),
+                    )?)?);
                 password =
-                    Some(bytes_to_string(command_part(command, index + 2)?)?);
-                index += 3;
+                    Some(bytes_to_string(command_part(
+                        command,
+                        index.saturating_add(2),
+                    )?)?);
+                index = index.saturating_add(3);
             }
             "setname" => {
-                if index + 1 >= command.len() {
+                if index.saturating_add(1) >= command.len() {
                     client.write_all(WRONG_HELLO_ARGS_RESPONSE)?;
                     client.flush()?;
                     return Ok(false);
                 }
-                index += 2;
+                index = index.saturating_add(2);
             }
             _ => {
-                index += 1;
+                index = index.saturating_add(1);
             }
         }
     }
@@ -554,7 +560,7 @@ fn handle_del(
     let mut values = recover(state.lock());
     for key in command.iter().skip(1) {
         if values.remove(key).is_some() {
-            deleted += 1;
+            deleted = deleted.saturating_add(1);
         }
     }
     Ok(integer_response(deleted))
@@ -633,7 +639,7 @@ fn command_name(command: &[Vec<u8>]) -> Option<String> {
 }
 
 fn error_response(message: &str) -> Vec<u8> {
-    let mut response = Vec::with_capacity(message.len() + 3);
+    let mut response = Vec::with_capacity(message.len().saturating_add(3));
     response.push(b'-');
     response.extend_from_slice(message.as_bytes());
     response.extend_from_slice(b"\r\n");

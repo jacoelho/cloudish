@@ -37,7 +37,9 @@ impl FromStr for Partition {
             return Err(PartitionError::Empty);
         }
 
-        let last_index = value.len() - 1;
+        let Some((last_index, _)) = value.char_indices().last() else {
+            return Err(PartitionError::Empty);
+        };
         let mut previous_was_separator = false;
 
         for (index, character) in value.char_indices() {

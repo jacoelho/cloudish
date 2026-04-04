@@ -1886,7 +1886,7 @@ mod tests {
         let header_end = response
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
-            .map(|index| index + 4)
+            .map(|index| index.saturating_add(4))
             .expect("response should contain a header terminator");
 
         &response[header_end..]

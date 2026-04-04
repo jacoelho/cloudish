@@ -1689,13 +1689,23 @@ fn evaluate_sub(
 
     while let Some(start) = remaining.find("${") {
         rendered.push_str(&remaining[..start]);
-        let token_start = start + 2;
-        let Some(end) = remaining[token_start..].find('}') else {
+        let token_start = start.saturating_add(2);
+        let Some(token_tail) = remaining.get(token_start..) else {
             return Err(template_validation_error(format!(
                 "Fn::Sub at {path} contains an unterminated token"
             )));
         };
-        let token = &remaining[token_start..token_start + end];
+        let Some(end) = token_tail.find('}') else {
+            return Err(template_validation_error(format!(
+                "Fn::Sub at {path} contains an unterminated token"
+            )));
+        };
+        let token_end = token_start.saturating_add(end);
+        let token = remaining.get(token_start..token_end).ok_or_else(|| {
+            template_validation_error(format!(
+                "Fn::Sub at {path} contains an unterminated token"
+            ))
+        })?;
         let value = if let Some(variable) =
             variables.and_then(|variables| variables.get(token))
         {
@@ -1710,7 +1720,12 @@ fn evaluate_sub(
                 .to_string_value(path)?
         };
         rendered.push_str(&value);
-        remaining = &remaining[token_start + end + 1..];
+        let next_start = token_end.saturating_add(1);
+        remaining = remaining.get(next_start..).ok_or_else(|| {
+            template_validation_error(format!(
+                "Fn::Sub at {path} contains an unterminated token"
+            ))
+        })?;
     }
 
     rendered.push_str(remaining);
@@ -2158,12 +2173,24 @@ pub(crate) fn sub_tokens(template: &str) -> Vec<&str> {
     let mut remaining = template;
 
     while let Some(start) = remaining.find("${") {
-        let token_start = start + 2;
-        let Some(end) = remaining[token_start..].find('}') else {
+        let token_start = start.saturating_add(2);
+        let Some(token_tail) = remaining.get(token_start..) else {
             break;
         };
-        tokens.push(&remaining[token_start..token_start + end]);
-        remaining = &remaining[token_start + end + 1..];
+        let Some(end) = token_tail.find('}') else {
+            break;
+        };
+        let token_end = token_start.saturating_add(end);
+        if let Some(token) = remaining.get(token_start..token_end) {
+            tokens.push(token);
+        } else {
+            break;
+        }
+        let next_start = token_end.saturating_add(1);
+        let Some(next_remaining) = remaining.get(next_start..) else {
+            break;
+        };
+        remaining = next_remaining;
     }
 
     tokens
@@ -5069,13 +5096,23 @@ fn evaluate_runtime_sub(
     let mut remaining = template;
     while let Some(start) = remaining.find("${") {
         rendered.push_str(&remaining[..start]);
-        let token_start = start + 2;
-        let Some(end) = remaining[token_start..].find('}') else {
+        let token_start = start.saturating_add(2);
+        let Some(token_tail) = remaining.get(token_start..) else {
             return Err(template_validation_error(format!(
                 "Fn::Sub at {path} contains an unterminated token"
             )));
         };
-        let token = &remaining[token_start..token_start + end];
+        let Some(end) = token_tail.find('}') else {
+            return Err(template_validation_error(format!(
+                "Fn::Sub at {path} contains an unterminated token"
+            )));
+        };
+        let token_end = token_start.saturating_add(end);
+        let token = remaining.get(token_start..token_end).ok_or_else(|| {
+            template_validation_error(format!(
+                "Fn::Sub at {path} contains an unterminated token"
+            ))
+        })?;
         let value = if let Some(variable) =
             variables.and_then(|variables| variables.get(token))
         {
@@ -5104,7 +5141,12 @@ fn evaluate_runtime_sub(
             .to_string_value(path)?
         };
         rendered.push_str(&value);
-        remaining = &remaining[token_start + end + 1..];
+        let next_start = token_end.saturating_add(1);
+        remaining = remaining.get(next_start..).ok_or_else(|| {
+            template_validation_error(format!(
+                "Fn::Sub at {path} contains an unterminated token"
+            ))
+        })?;
     }
     rendered.push_str(remaining);
     Ok(ResolvedValue::String(rendered))
@@ -5139,7 +5181,7 @@ fn push_stack_event(
     resource_status_reason: Option<String>,
     timestamp_epoch_seconds: u64,
 ) {
-    stack.event_counter += 1;
+    stack.event_counter = stack.event_counter.saturating_add(1);
     stack.events.push(StoredStackEvent {
         event_id: format!(
             "{}-{:08}",
@@ -6082,7 +6124,8 @@ mod tests {
     use crate::{CloudFormationS3Port, CloudFormationSqsPort};
     use aws::{AccountId, RegionId};
     use s3::{
-        CreateBucketInput, GetObjectOutput, HeadObjectOutput, S3Error, S3Scope,
+        CreateBucketInput, GetObjectOutput, ObjectReadMetadata, S3Error,
+        S3Scope,
     };
     use serde_json::json;
     use sqs::{
@@ -6148,7 +6191,7 @@ mod tests {
                 content_length: size,
                 content_range: None,
                 is_partial: false,
-                metadata: services::ObjectReadMetadata {
+                metadata: ObjectReadMetadata {
                     content_type: "text/yaml".to_owned(),
                     delete_marker: false,
                     etag: "etag".to_owned(),

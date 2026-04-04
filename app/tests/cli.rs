@@ -161,7 +161,9 @@ fn wait_for_status_response(address: SocketAddr) -> String {
 }
 
 fn wait_for_internal_response(address: SocketAddr, request: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .unwrap_or_else(Instant::now);
     let mut last_error = None;
 
     while Instant::now() < deadline {
@@ -183,7 +185,9 @@ fn wait_for_ready_address(
     child: &mut std::process::Child,
     path: &Path,
 ) -> SocketAddr {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(15))
+        .unwrap_or_else(Instant::now);
     let mut last_error = None;
 
     while Instant::now() < deadline {

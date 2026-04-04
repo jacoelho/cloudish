@@ -89,7 +89,7 @@ pub(crate) fn issue_session(
         .saturating_add(u64::from(input.duration_seconds));
     let expiration = format_timestamp(expires_at_epoch_seconds)?;
     let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
-    guard.next_session_id += 1;
+    guard.next_session_id = guard.next_session_id.saturating_add(1);
     let session_id = guard.next_session_id;
     let access_key_id = format!("ASIA{session_id:016}");
     let secret_access_key = format!("cloudishsessionsecret{session_id:020}");

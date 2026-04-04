@@ -78,7 +78,10 @@ pub(crate) fn apply_range_to_head_object_output(
     };
     let size = object.content_length;
     let (start, end) = resolve_range_bounds(range, size)?;
-    object.content_length = end - start + 1;
+    object.content_length = end
+        .checked_sub(start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(invalid_range_error)?;
     Ok(())
 }
 
@@ -93,9 +96,18 @@ pub(crate) fn apply_range_to_get_object_output(
     let (start, end) = resolve_range_bounds(range, size)?;
     let start = usize::try_from(start).map_err(|_| invalid_range_error())?;
     let end = usize::try_from(end).map_err(|_| invalid_range_error())?;
-    object.body = object.body[start..=end].to_vec();
-    object.content_length = (end - start + 1) as u64;
-    object.content_range = Some(format!("bytes {}-{}/{size}", start, end));
+    let Some(body_end) = end.checked_add(1) else {
+        return Err(invalid_range_error());
+    };
+    let body =
+        object.body.get(start..body_end).ok_or_else(invalid_range_error)?;
+    object.body = body.to_vec();
+    object.content_length = end
+        .checked_sub(start)
+        .and_then(|length| length.checked_add(1))
+        .and_then(|length| u64::try_from(length).ok())
+        .ok_or_else(invalid_range_error)?;
+    object.content_range = Some(format!("bytes {start}-{end}/{size}"));
     object.is_partial = true;
     Ok(())
 }
@@ -176,16 +188,16 @@ fn resolve_range_bounds(
     }
     match range {
         ObjectRange::Start { start } if *start < size => {
-            Ok((*start, size - 1))
+            Ok((*start, size.saturating_sub(1)))
         }
         ObjectRange::StartEnd { start, end }
             if start <= end && *start < size =>
         {
-            Ok((*start, (*end).min(size - 1)))
+            Ok((*start, (*end).min(size.saturating_sub(1))))
         }
         ObjectRange::Suffix { length } if *length > 0 => {
             let content_length = (*length).min(size);
-            Ok((size - content_length, size - 1))
+            Ok((size.saturating_sub(content_length), size.saturating_sub(1)))
         }
         _ => Err(invalid_range_error()),
     }
@@ -275,5 +287,8 @@ fn reject_unsupported_query_parameter(
 }
 
 fn http_timestamp(epoch_seconds: u64) -> String {
-    httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(epoch_seconds))
+    let timestamp = UNIX_EPOCH
+        .checked_add(Duration::from_secs(epoch_seconds))
+        .unwrap_or(UNIX_EPOCH);
+    httpdate::fmt_http_date(timestamp)
 }

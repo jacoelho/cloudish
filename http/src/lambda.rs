@@ -1016,14 +1016,28 @@ fn percent_decode(value: &str) -> Result<String, LambdaError> {
     while let Some(&byte) = bytes.get(index) {
         match byte {
             b'%' => {
-                let Some(&high_byte) = bytes.get(index + 1) else {
+                let Some(high_index) = index.checked_add(1) else {
                     return Err(LambdaError::Validation {
                         message:
                             "Invalid percent-encoding in Lambda request path."
                                 .to_owned(),
                     });
                 };
-                let Some(&low_byte) = bytes.get(index + 2) else {
+                let Some(&high_byte) = bytes.get(high_index) else {
+                    return Err(LambdaError::Validation {
+                        message:
+                            "Invalid percent-encoding in Lambda request path."
+                                .to_owned(),
+                    });
+                };
+                let Some(low_index) = index.checked_add(2) else {
+                    return Err(LambdaError::Validation {
+                        message:
+                            "Invalid percent-encoding in Lambda request path."
+                                .to_owned(),
+                    });
+                };
+                let Some(&low_byte) = bytes.get(low_index) else {
                     return Err(LambdaError::Validation {
                         message:
                             "Invalid percent-encoding in Lambda request path."
@@ -1033,11 +1047,23 @@ fn percent_decode(value: &str) -> Result<String, LambdaError> {
                 let high = decode_hex(high_byte)?;
                 let low = decode_hex(low_byte)?;
                 decoded.push((high << 4) | low);
-                index += 3;
+                index = index.checked_add(3).ok_or_else(|| {
+                    LambdaError::Validation {
+                        message:
+                            "Invalid percent-encoding in Lambda request path."
+                                .to_owned(),
+                    }
+                })?;
             }
             other => {
                 decoded.push(other);
-                index += 1;
+                index = index.checked_add(1).ok_or_else(|| {
+                    LambdaError::Validation {
+                        message:
+                            "Invalid percent-encoding in Lambda request path."
+                                .to_owned(),
+                    }
+                })?;
             }
         }
     }
@@ -1048,15 +1074,13 @@ fn percent_decode(value: &str) -> Result<String, LambdaError> {
 }
 
 fn decode_hex(byte: u8) -> Result<u8, LambdaError> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(LambdaError::Validation {
+    char::from(byte)
+        .to_digit(16)
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or_else(|| LambdaError::Validation {
             message: "Invalid percent-encoding in Lambda request path."
                 .to_owned(),
-        }),
-    }
+        })
 }
 
 fn decode_zip_blob(value: &str) -> Result<Vec<u8>, LambdaError> {

@@ -164,7 +164,7 @@ pub(crate) fn apply_new_version(
             version_stages,
         },
     );
-    secret.next_version_number += 1;
+    secret.next_version_number = secret.next_version_number.saturating_add(1);
 }
 
 pub(crate) fn detach_stage(

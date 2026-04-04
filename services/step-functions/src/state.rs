@@ -127,7 +127,9 @@ impl StepFunctionsService {
         let creation_date = self.now_epoch_seconds()?;
         let state_machine_arn = state_machine_arn(scope, &input.name);
         let state_machine_instance_id = state.next_state_machine_instance_id;
-        state.next_state_machine_instance_id += 1;
+        state.next_state_machine_instance_id = state
+            .next_state_machine_instance_id
+            .saturating_add(1);
         self.state_machine_store.put(
             key,
             StoredStateMachine {
@@ -1005,7 +1007,7 @@ impl StepFunctionsService {
         mut event: HistoryEvent,
     ) -> Result<(), StepFunctionsError> {
         self.with_execution_mut(key, |execution| {
-            let next_id = execution.history.len() as u64 + 1;
+            let next_id = (execution.history.len() as u64).saturating_add(1);
             event.id = next_id;
             event.previous_event_id = next_id.checked_sub(1);
             execution.history.push(event);
@@ -1048,7 +1050,7 @@ impl StepFunctionsService {
             })
             .len();
 
-        let mut suffix = count + 1;
+        let mut suffix = count.saturating_add(1);
         loop {
             let name = format!("execution-{suffix}");
             let key =
@@ -1058,7 +1060,7 @@ impl StepFunctionsService {
             {
                 return name;
             }
-            suffix += 1;
+            suffix = suffix.saturating_add(1);
         }
     }
 
@@ -2660,7 +2662,12 @@ pub(crate) fn parse_json_path(
                     });
                 };
                 tokens.push(PathToken::Field(next[..end].to_owned()));
-                rest = &next[end + 2..];
+                let suffix_start = end.saturating_add(2);
+                rest = next.get(suffix_start..).ok_or_else(|| {
+                    StepFunctionsError::InvalidDefinition {
+                        message: format!("Unsupported JSONPath `{path}`."),
+                    }
+                })?;
                 continue;
             }
             if let Some(next) = next.strip_prefix('"') {
@@ -2670,7 +2677,12 @@ pub(crate) fn parse_json_path(
                     });
                 };
                 tokens.push(PathToken::Field(next[..end].to_owned()));
-                rest = &next[end + 2..];
+                let suffix_start = end.saturating_add(2);
+                rest = next.get(suffix_start..).ok_or_else(|| {
+                    StepFunctionsError::InvalidDefinition {
+                        message: format!("Unsupported JSONPath `{path}`."),
+                    }
+                })?;
                 continue;
             }
             let Some(end) = next.find(']') else {
@@ -2684,7 +2696,12 @@ pub(crate) fn parse_json_path(
                 }
             })?;
             tokens.push(PathToken::Index(index));
-            rest = &next[end + 1..];
+            let suffix_start = end.saturating_add(1);
+            rest = next.get(suffix_start..).ok_or_else(|| {
+                StepFunctionsError::InvalidDefinition {
+                    message: format!("Unsupported JSONPath `{path}`."),
+                }
+            })?;
             continue;
         }
 

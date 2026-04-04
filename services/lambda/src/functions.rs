@@ -177,7 +177,7 @@ pub(crate) fn format_last_modified(epoch_millis: u64) -> String {
     const FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00.000+0000";
 
     let Ok(timestamp) = OffsetDateTime::from_unix_timestamp_nanos(
-        i128::from(epoch_millis) * 1_000_000,
+        i128::from(epoch_millis).saturating_mul(1_000_000),
     ) else {
         return FALLBACK_TIMESTAMP.to_owned();
     };

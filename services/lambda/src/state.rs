@@ -2066,7 +2066,7 @@ impl LambdaService {
         description_override: Option<String>,
     ) -> Result<LambdaVersionState, LambdaError> {
         let version = state.next_version.to_string();
-        state.next_version += 1;
+        state.next_version = state.next_version.saturating_add(1);
         let mut published = state.latest.clone();
         published.version = version.clone();
         if let Some(description) = description_override {
@@ -2599,7 +2599,8 @@ impl LambdaService {
             .as_ref()
             .and_then(|config| config.maximum_retry_attempts)
             .unwrap_or(DEFAULT_ASYNC_MAX_RETRY_ATTEMPTS);
-        let approximate_invoke_count = pending.attempt_count + 1;
+        let approximate_invoke_count =
+            pending.attempt_count.saturating_add(1);
         let now_epoch_seconds = self.now_epoch_seconds().map_err(|error| {
             AsyncInvocationCycleFailure::new(&pending, error)
         })?;
@@ -2757,7 +2758,10 @@ impl LambdaService {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut restored = VecDeque::with_capacity(
-            1 + remaining.len() + background_state.async_invocations.len(),
+            remaining
+                .len()
+                .saturating_add(background_state.async_invocations.len())
+                .saturating_add(1),
         );
         restored.push_back(pending);
         restored.append(&mut remaining);
@@ -3006,7 +3010,8 @@ impl LambdaService {
                 deadline_epoch_millis: self
                     .now_epoch_millis()?
                     .saturating_add(
-                        u64::from(maximum_batching_window_in_seconds) * 1_000,
+                        u64::from(maximum_batching_window_in_seconds)
+                            .saturating_mul(1_000),
                     ),
                 messages,
             },

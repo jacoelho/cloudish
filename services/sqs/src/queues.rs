@@ -103,12 +103,24 @@ pub struct SequentialSqsIdentifierSource {
 
 impl SqsIdentifierSource for SequentialSqsIdentifierSource {
     fn next_message_id(&self) -> String {
-        let id = self.next_message_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = self
+            .next_message_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
         format!("00000000-0000-0000-0000-{id:012}")
     }
 
     fn next_receipt_handle(&self) -> String {
-        let id = self.next_receipt_handle.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = self
+            .next_receipt_handle
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
         format!("AQEB{id:020}")
     }
 }
@@ -223,6 +235,12 @@ impl SqsService {
         state.list_queues(scope, queue_name_prefix)
     }
 
+    /// Returns one page of queue identities for the provided list request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqsError`] when the requested pagination token or limits are
+    /// invalid.
     pub fn list_queues_page(
         &self,
         scope: &SqsScope,
@@ -495,8 +513,9 @@ pub(crate) fn paginate_items<T: Clone>(
     let next_token = (end < items.len())
         .then(|| encode_next_token(context, end))
         .transpose()?;
+    let page = items.get(start..end).ok_or_else(invalid_next_token)?;
 
-    Ok((items[start..end].to_vec(), next_token))
+    Ok((page.to_vec(), next_token))
 }
 
 fn validate_paginated_max_results(

@@ -143,7 +143,7 @@ fn find_sequence_position(
         });
     };
 
-    Ok(index + usize::from(after))
+    Ok(index.saturating_add(usize::from(after)))
 }
 
 pub(crate) fn encode_iterator_token(token: &IteratorToken) -> String {

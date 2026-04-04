@@ -217,7 +217,7 @@ impl S3Service {
                 object_lock: None,
                 tags: upload.tags.clone(),
             },
-            Some(composite_etag.clone()),
+            Some(composite_etag),
         )?;
         self.cleanup_multipart_upload(&upload.upload_id, &upload)?;
         self.emit_object_created_notification(

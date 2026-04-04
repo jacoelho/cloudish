@@ -1,10 +1,13 @@
+#![deny(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![cfg_attr(
     test,
     allow(
         clippy::unreachable,
         clippy::assertions_on_constants,
         clippy::missing_panics_doc,
-        clippy::missing_errors_doc
+        clippy::missing_errors_doc,
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing
     )
 )]
 

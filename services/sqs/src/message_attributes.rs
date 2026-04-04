@@ -88,7 +88,7 @@ pub(crate) fn message_attribute_size(
     name: &str,
     value: &MessageAttributeValue,
 ) -> usize {
-    let mut size = name.len() + value.data_type.len();
+    let mut size = name.len().saturating_add(value.data_type.len());
     if let Some(string_value) = value.string_value.as_deref() {
         size = size.saturating_add(string_value.len());
     }
@@ -110,7 +110,7 @@ pub(crate) fn selected_message_attributes(
     if selectors.is_empty() {
         return BTreeMap::new();
     }
-    if selectors.len() == 1 && selectors[0] == "All" {
+    if matches!(selectors.first(), Some(selector) if selector == "All") {
         return attributes.clone();
     }
 
@@ -187,10 +187,15 @@ fn validate_message_attribute_value(
 ) -> Result<ParsedMessageAttributeDataType, SqsError> {
     let parsed =
         parse_message_attribute_data_type(&value.data_type, validate_string)?;
-    let value_count = usize::from(value.string_value.is_some())
-        + usize::from(value.binary_value.is_some())
-        + usize::from(!value.string_list_values.is_empty())
-        + usize::from(!value.binary_list_values.is_empty());
+    let value_count = [
+        value.string_value.is_some(),
+        value.binary_value.is_some(),
+        !value.string_list_values.is_empty(),
+        !value.binary_list_values.is_empty(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
     if value_count != 1 {
         return Err(SqsError::InvalidParameterValue {
             message: "Exactly one message attribute value field must be set."
@@ -318,7 +323,17 @@ fn validate_data_type_custom_label(
 
 fn validate_number_attribute_value(value: &str) -> Result<(), SqsError> {
     let (mantissa, exponent) = match value.find(['e', 'E']) {
-        Some(index) => (&value[..index], Some(&value[index + 1..])),
+        Some(index) => {
+            let exponent = index
+                .checked_add(1)
+                .and_then(|start| value.get(start..))
+                .ok_or_else(|| SqsError::InvalidParameterValue {
+                    message: format!(
+                        "Value {value} for parameter StringValue is invalid."
+                    ),
+                })?;
+            (&value[..index], Some(exponent))
+        }
         None => (value, None),
     };
     let mantissa = mantissa.strip_prefix(['+', '-']).unwrap_or(mantissa);

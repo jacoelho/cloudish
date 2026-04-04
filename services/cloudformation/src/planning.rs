@@ -237,7 +237,7 @@ where
                     "dependency graph is missing indegree for {candidate}"
                 ))
             })?;
-            *degree -= 1;
+            *degree = degree.saturating_sub(1);
             if *degree == 0 {
                 ready.insert(candidate.clone());
             }

@@ -1,3 +1,8 @@
+#![cfg_attr(
+    test,
+    allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)
+)]
+
 mod errors;
 mod lifecycle;
 mod scope;
@@ -418,7 +423,10 @@ impl SecretsManagerService {
             .recovery_window_in_days
             .unwrap_or(DEFAULT_RECOVERY_WINDOW_DAYS);
         secret.deleted_date = Some(
-            deletion_date + u64::from(recovery_window_in_days) * 24 * 60 * 60,
+            deletion_date.saturating_add(
+                u64::from(recovery_window_in_days)
+                    .saturating_mul(24 * 60 * 60),
+            ),
         );
         let scheduled_deletion_date =
             secret.deleted_date.ok_or_else(|| {
@@ -606,7 +614,7 @@ impl SecretsManagerService {
                 version_stages: BTreeSet::from([CURRENT_STAGE.to_owned()]),
             },
         );
-        secret.next_version_number += 1;
+        secret.next_version_number = secret.next_version_number.saturating_add(1);
 
         Ok(version_id)
     }

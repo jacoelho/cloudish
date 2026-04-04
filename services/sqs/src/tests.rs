@@ -141,9 +141,11 @@ impl SqsReceiveWaiter for TestWaiter {
     }
 }
 
+type TestAction = Box<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 struct ActionWaiter {
-    action: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
+    action: Arc<Mutex<Option<TestAction>>>,
     clock: ManualClock,
     triggered: Arc<AtomicBool>,
 }
@@ -1106,7 +1108,7 @@ fn sqs_fifo_redrive_helpers_move_messages_from_dlq() {
     let listed = service
         .list_message_move_tasks(ListMessageMoveTasksInput {
             max_results: Some(1),
-            source_arn: dlq_arn.clone(),
+            source_arn: dlq_arn,
         })
         .expect("move tasks should list");
     assert_eq!(listed.results.len(), 1);
@@ -1518,7 +1520,7 @@ fn sqs_start_message_move_task_rejects_unsupported_throughput_without_side_effec
     let listed = service
         .list_message_move_tasks(ListMessageMoveTasksInput {
             max_results: Some(10),
-            source_arn: dlq_arn.clone(),
+            source_arn: dlq_arn,
         })
         .expect("move tasks should list");
     assert!(listed.results.is_empty());

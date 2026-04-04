@@ -828,7 +828,10 @@ impl EventBridgeService {
     }
 
     fn next_event_id(&self) -> String {
-        let id = self.next_event_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = self
+            .next_event_id
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         format!("00000000-0000-0000-0000-{id:012}")
     }
 
@@ -848,7 +851,7 @@ fn page_items<T: Clone>(
         });
     }
 
-    let end = (start + limit).min(items.len());
+    let end = start.saturating_add(limit).min(items.len());
     let next_token = (end < items.len()).then(|| end.to_string());
     let page =
         items.get(start..end).ok_or_else(|| EventBridgeError::Validation {

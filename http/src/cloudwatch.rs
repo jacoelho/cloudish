@@ -2840,12 +2840,11 @@ fn timestamp_seconds(timestamp_millis: u64) -> f64 {
 }
 
 fn format_query_timestamp(timestamp_millis: u64) -> String {
-    OffsetDateTime::from_unix_timestamp_nanos(
-        i128::from(timestamp_millis) * 1_000_000,
-    )
-    .ok()
-    .and_then(|timestamp| timestamp.format(&Rfc3339).ok())
-    .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
+    let nanos = i128::from(timestamp_millis).saturating_mul(1_000_000);
+    OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .ok()
+        .and_then(|timestamp| timestamp.format(&Rfc3339).ok())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
 }
 
 fn format_f64(value: f64) -> String {

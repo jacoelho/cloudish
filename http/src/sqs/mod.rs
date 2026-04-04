@@ -2,6 +2,7 @@ pub(crate) use crate::aws_error_shape::AwsErrorShape;
 use crate::query::{
     QueryParameters, malformed_query_error, missing_action_error,
 };
+
 use crate::request::HttpRequest;
 use crate::xml::XmlBuilder;
 use aws::{

@@ -96,7 +96,11 @@ impl AwsChunkedSigningContext {
             })?;
             let (chunk_size, chunk_signature) =
                 parse_chunk_header(header_line)?;
-            offset = header_end + 2;
+            offset = header_end.checked_add(2).ok_or_else(|| {
+                incomplete_signature_error(
+                    "aws-chunked chunk metadata overflowed the payload bounds.",
+                )
+            })?;
 
             let chunk_end = offset
                 .checked_add(chunk_size)
@@ -107,13 +111,13 @@ impl AwsChunkedSigningContext {
                     )
                 })?;
             let chunk_data = encoded_body
-                .get(offset..offset + chunk_size)
+                .get(offset..offset.saturating_add(chunk_size))
                 .ok_or_else(|| {
                     incomplete_signature_error(
                         "aws-chunked payload ended before chunk data completed.",
                     )
                 })?;
-            if encoded_body.get(offset + chunk_size..chunk_end)
+            if encoded_body.get(offset.saturating_add(chunk_size)..chunk_end)
                 != Some(b"\r\n")
             {
                 return Err(incomplete_signature_error(
@@ -279,7 +283,7 @@ fn parse_trailing_headers(
     let trailer_end = trailing_bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4)
+        .and_then(|index| index.checked_add(4))
         .ok_or_else(|| {
             incomplete_signature_error(
                 "aws-chunked trailing headers must end with CRLF CRLF.",
@@ -366,7 +370,7 @@ fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
         remaining
             .windows(2)
             .position(|window| window == b"\r\n")
-            .map(|offset| start + offset)
+            .and_then(|offset| start.checked_add(offset))
     })
 }
 

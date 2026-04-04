@@ -205,7 +205,7 @@ impl KinesisService {
                 .binary_search_by(|stream| {
                     stream.as_str().cmp(exclusive_start.as_str())
                 })
-                .map(|index| index + 1)
+                .map(|index| index.saturating_add(1))
                 .unwrap_or_else(|index| index)
         } else {
             0
@@ -216,7 +216,7 @@ impl KinesisService {
             });
         }
 
-        let end = (start + page_size).min(stream_names.len());
+        let end = start.saturating_add(page_size).min(stream_names.len());
         let page = paged_items(&stream_names, start, end);
 
         Ok(ListStreamsOutput {
@@ -244,7 +244,7 @@ impl KinesisService {
             &shards,
             input.exclusive_start_shard_id.as_deref(),
         )?;
-        let end = (start + page_size).min(shards.len());
+        let end = start.saturating_add(page_size).min(shards.len());
 
         Ok(KinesisStreamDescription {
             encryption_type: stream.encryption_type,
@@ -368,7 +368,7 @@ impl KinesisService {
             });
         }
 
-        let end = (start + page_size).min(shards.len());
+        let end = start.saturating_add(page_size).min(shards.len());
         Ok(ListShardsOutput {
             next_token: (end < shards.len()).then(|| {
                 encode_scoped_token(TOKEN_KIND_SHARDS, &key.stream_arn(), end)
@@ -583,7 +583,10 @@ impl KinesisService {
             });
         }
 
-        let end = (token.position + limit).min(shard.records.len());
+        let end = token
+            .position
+            .saturating_add(limit)
+            .min(shard.records.len());
         Ok(GetRecordsOutput {
             millis_behind_latest: 0,
             next_shard_iterator: Some(encode_iterator_token(&IteratorToken {
@@ -764,7 +767,7 @@ impl KinesisService {
             });
         }
 
-        let end = (start + page_size).min(consumers.len());
+        let end = start.saturating_add(page_size).min(consumers.len());
         Ok(ListStreamConsumersOutput {
             consumers: paged_items(&consumers, start, end),
             next_token: (end < consumers.len()).then(|| {
@@ -1107,12 +1110,12 @@ impl KinesisService {
             input.exclusive_start_tag_key.as_deref()
         {
             tags.binary_search_by(|tag| tag.key.as_str().cmp(exclusive_start))
-                .map(|index| index + 1)
+                .map(|index| index.saturating_add(1))
                 .unwrap_or_else(|index| index)
         } else {
             0
         };
-        let end = (start + page_size).min(tags.len());
+        let end = start.saturating_add(page_size).min(tags.len());
 
         Ok(ListTagsForStreamOutput {
             has_more_tags: end < tags.len(),
@@ -1372,7 +1375,9 @@ mod tests {
     }
 
     fn seconds(value: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(value)
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(value))
+            .unwrap_or(UNIX_EPOCH)
     }
 
     fn scope(region: &str) -> KinesisScope {

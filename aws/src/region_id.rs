@@ -37,7 +37,9 @@ impl FromStr for RegionId {
             return Err(RegionIdError::Empty);
         }
 
-        let last_index = value.len() - 1;
+        let Some((last_index, _)) = value.char_indices().last() else {
+            return Err(RegionIdError::Empty);
+        };
         let mut saw_separator = false;
         let mut previous_was_separator = false;
 
