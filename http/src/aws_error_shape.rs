@@ -925,6 +925,20 @@ impl AwsErrorShape for S3Error {
                 404,
                 true,
             ),
+            Self::CurrentVersionIsDeleteMarker { .. } => trusted_aws_error(
+                AwsErrorFamily::NotFound,
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+                true,
+            ),
+            Self::RequestedVersionIsDeleteMarker { .. } => trusted_aws_error(
+                AwsErrorFamily::Conflict,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.",
+                405,
+                true,
+            ),
             Self::NoSuchObjectLockConfiguration { .. } => trusted_aws_error(
                 AwsErrorFamily::NotFound,
                 "NoSuchObjectLockConfiguration",
