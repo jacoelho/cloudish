@@ -52,6 +52,13 @@ pub enum S3Error {
     NoSuchTagSet { bucket: String },
     #[error("key `{key}` does not exist")]
     NoSuchKey { key: String },
+    #[error("the current version is a delete marker")]
+    CurrentVersionIsDeleteMarker { version_id: Option<String> },
+    #[error("the requested version is a delete marker")]
+    RequestedVersionIsDeleteMarker {
+        last_modified_epoch_seconds: u64,
+        version_id: String,
+    },
     #[error("object `{key}` has no object lock configuration")]
     NoSuchObjectLockConfiguration { key: String },
     #[error("multipart upload `{upload_id}` does not exist")]

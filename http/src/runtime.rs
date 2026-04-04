@@ -920,6 +920,18 @@ impl EdgeResponse {
         }
     }
 
+    pub(crate) fn empty(status_code: u16) -> Self {
+        Self {
+            status_code,
+            headers: vec![
+                ("Date".to_owned(), fmt_http_date(SystemTime::now())),
+                ("Content-Length".to_owned(), "0".to_owned()),
+                ("Connection".to_owned(), "close".to_owned()),
+            ],
+            body: Vec::new(),
+        }
+    }
+
     pub(crate) fn json(status_code: u16, body: Value) -> Self {
         match serde_json::to_vec(&body) {
             Ok(body) => Self::bytes(status_code, "application/json", body),

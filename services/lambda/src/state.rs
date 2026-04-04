@@ -12,7 +12,7 @@ use aws::{
     LambdaFunctionTarget, RandomSource, RegionId, ServiceName,
 };
 use iam::{IamScope, IamService};
-use s3::{S3Scope, S3Service};
+use s3::{ObjectReadRequest, S3Scope, S3Service};
 use serde::{Deserialize, Serialize};
 use sqs::{
     ReceiveMessageInput, ReceivedMessage, SendMessageInput, SqsQueueIdentity,
@@ -3088,9 +3088,12 @@ impl LambdaService {
                             input.scope.account_id().clone(),
                             input.scope.region().clone(),
                         ),
-                        bucket,
-                        key,
-                        object_version.as_deref(),
+                        &ObjectReadRequest {
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            version_id: object_version.clone(),
+                            ..ObjectReadRequest::default()
+                        },
                     )
                     .map_err(|_| LambdaError::InvalidParameterValue {
                         message: "Could not load deployment package from S3. Please verify the bucket and key, then try again.".to_owned(),

@@ -14,7 +14,7 @@ use kms::{
     KmsScope, KmsService, ScheduleKmsKeyDeletionInput,
 };
 use lambda::{CreateFunctionInput, LambdaError, LambdaScope, LambdaService};
-use s3::{CreateBucketInput, S3Error, S3Scope, S3Service};
+use s3::{CreateBucketInput, ObjectReadRequest, S3Error, S3Scope, S3Service};
 use secrets_manager::{
     CreateSecretInput, DeleteSecretInput, SecretsManagerError,
     SecretsManagerScope, SecretsManagerService, UpdateSecretInput,
@@ -79,7 +79,15 @@ impl CloudFormationS3Port for S3Service {
         key: &str,
         version_id: Option<&str>,
     ) -> Result<s3::GetObjectOutput, S3Error> {
-        self.get_object(scope, bucket, key, version_id)
+        self.get_object(
+            scope,
+            &ObjectReadRequest {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                version_id: version_id.map(str::to_owned),
+                ..ObjectReadRequest::default()
+            },
+        )
     }
 
     #[doc = "# Errors\n\nReturns the downstream service error when the provider operation fails or the referenced resource identifiers are invalid."]

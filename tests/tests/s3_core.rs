@@ -133,6 +133,48 @@ async fn s3_core_put_get_head_copy_and_list_objects() {
 }
 
 #[tokio::test]
+async fn s3_core_head_bucket_and_delimiter_key_count_match_sdk_expectations() {
+    let runtime = shared_runtime().await;
+    let target = s3_target(&runtime, "us-east-1");
+    let client = s3_client(&target).await;
+
+    client
+        .create_bucket()
+        .bucket("sdk-s3-core-head-bucket")
+        .send()
+        .await
+        .expect("bucket should be created");
+    for key in ["logs/2026/a.txt", "logs/2027/b.txt"] {
+        client
+            .put_object()
+            .bucket("sdk-s3-core-head-bucket")
+            .key(key)
+            .body(ByteStream::from_static(b"payload"))
+            .send()
+            .await
+            .expect("object should be written");
+    }
+
+    client
+        .head_bucket()
+        .bucket("sdk-s3-core-head-bucket")
+        .send()
+        .await
+        .expect("head bucket should succeed");
+    let listed = client
+        .list_objects_v2()
+        .bucket("sdk-s3-core-head-bucket")
+        .prefix("logs/")
+        .delimiter("/")
+        .send()
+        .await
+        .expect("delimiter list should succeed");
+
+    assert_eq!(listed.common_prefixes().len(), 2);
+    assert_eq!(listed.key_count(), Some(2));
+}
+
+#[tokio::test]
 async fn s3_core_missing_key_and_non_empty_bucket_errors_are_shaped() {
     let runtime = shared_runtime().await;
     assert!(runtime.state_directory().exists());
