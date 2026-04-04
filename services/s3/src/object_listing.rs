@@ -102,7 +102,9 @@ impl S3Service {
             input.max_keys,
             anchor,
         )?;
-        let key_count = page.contents.len() + page.common_prefixes.len();
+        let key_count = page.contents.len().saturating_add(
+            page.common_prefixes.len(),
+        );
 
         Ok(ListObjectsV2Output {
             bucket: input.bucket,
@@ -193,11 +195,18 @@ impl S3Service {
             }
 
             if let Some(delimiter) = delimiter.as_deref() {
-                let remainder = &object.key()[prefix.len()..];
+                let Some(remainder) = object.key().get(prefix.len()..) else {
+                    continue;
+                };
                 if let Some(index) = remainder.find(delimiter) {
+                    let Some(prefix_end) =
+                        index.checked_add(delimiter.len())
+                    else {
+                        continue;
+                    };
                     let common_prefix = format!(
                         "{prefix}{}",
-                        &remainder[..index + delimiter.len()]
+                        remainder.get(..prefix_end).unwrap_or_default()
                     );
                     common_prefixes
                         .entry(common_prefix.clone())

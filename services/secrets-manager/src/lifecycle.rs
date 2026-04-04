@@ -310,7 +310,11 @@ pub(crate) fn next_rotation_date(
 ) -> Option<u64> {
     rotation_rules
         .automatically_after_days
-        .map(|days| now + u64::from(days) * 24 * 60 * 60)
+        .map(|days| {
+            now.saturating_add(
+                u64::from(days).saturating_mul(24 * 60 * 60),
+            )
+        })
 }
 
 pub(crate) fn matches_filters(
@@ -440,7 +444,7 @@ pub(crate) fn paginate<T>(
     }
 
     let total_items = items.len();
-    let end = (start + max_results).min(total_items);
+    let end = start.saturating_add(max_results).min(total_items);
     let paged =
         items.into_iter().skip(start).take(max_results).collect::<Vec<_>>();
     let next_token = (end < total_items).then(|| end.to_string());

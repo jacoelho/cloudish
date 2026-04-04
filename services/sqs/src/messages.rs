@@ -276,7 +276,9 @@ impl SqsService {
 
         while current_millis < deadline_millis {
             if self.receive_waiter.wait(
-                long_poll_wait_duration(deadline_millis - current_millis),
+                long_poll_wait_duration(
+                    deadline_millis.saturating_sub(current_millis),
+                ),
                 &cancellation,
             ) == SqsReceiveWaitOutcome::Cancelled
             {
@@ -695,8 +697,9 @@ impl SqsWorld {
         }
 
         let message_id = message.message_id.clone();
-        message.visible_at_millis =
-            now_millis + u64::from(visibility_timeout).saturating_mul(1_000);
+        message.visible_at_millis = now_millis.saturating_add(
+            u64::from(visibility_timeout).saturating_mul(1_000),
+        );
         queue.invalidate_receive_attempts_for_message(&message_id);
 
         Ok(())
@@ -807,8 +810,9 @@ impl QueueRecord {
             receive_count: 0,
             sent_timestamp_millis: now_millis,
             sequence_number: None,
-            visible_at_millis: now_millis
-                + u64::from(delay_seconds).saturating_mul(1_000),
+            visible_at_millis: now_millis.saturating_add(
+                u64::from(delay_seconds).saturating_mul(1_000),
+            ),
         });
 
         Ok(SendMessageOutput {
@@ -843,9 +847,14 @@ impl QueueRecord {
                 continue;
             }
 
-            if max_receive_count
-                .is_some_and(|limit| message.receive_count + 1 > limit)
-            {
+            let would_exceed_receive_limit =
+                max_receive_count.is_some_and(|limit| {
+                    message
+                        .receive_count
+                        .checked_add(1)
+                        .is_none_or(|count| count > limit)
+                });
+            if would_exceed_receive_limit {
                 outcome.dead_letter_messages.push(PendingQueueMove {
                     message: message
                         .staged_for_queue_move(Some(queue_arn.clone())),
@@ -904,8 +913,9 @@ impl QueueRecord {
             }
         }
 
-        let visible_at_millis =
-            now_millis + u64::from(visibility_timeout).saturating_mul(1_000);
+        let visible_at_millis = now_millis.saturating_add(
+            u64::from(visibility_timeout).saturating_mul(1_000),
+        );
         for message_id in cached.receipt_handles_by_message_id.keys() {
             let Some(message) = self
                 .messages
@@ -957,10 +967,11 @@ impl MessageRecord {
         visibility_timeout: u32,
         receipt_handle: String,
     ) -> ReceivedMessage {
-        self.receive_count += 1;
+        self.receive_count = self.receive_count.saturating_add(1);
         self.first_receive_timestamp_millis.get_or_insert(now_millis);
-        self.visible_at_millis =
-            now_millis + u64::from(visibility_timeout).saturating_mul(1_000);
+        self.visible_at_millis = now_millis.saturating_add(
+            u64::from(visibility_timeout).saturating_mul(1_000),
+        );
         self.issued_receipt_handles.clear();
         self.issued_receipt_handles.insert(receipt_handle.clone());
         self.latest_receipt_handle = Some(receipt_handle.clone());

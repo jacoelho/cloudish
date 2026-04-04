@@ -326,8 +326,8 @@ fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
                 pattern_byte == candidate_byte
             })
         {
-            pattern_index += 1;
-            candidate_index += 1;
+            pattern_index = pattern_index.saturating_add(1);
+            candidate_index = candidate_index.saturating_add(1);
             continue;
         }
 
@@ -336,14 +336,14 @@ fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
             .is_some_and(|pattern_byte| *pattern_byte == b'*')
         {
             star_index = Some(pattern_index);
-            pattern_index += 1;
+            pattern_index = pattern_index.saturating_add(1);
             match_index = candidate_index;
             continue;
         }
 
         if let Some(star_index) = star_index {
-            pattern_index = star_index + 1;
-            match_index += 1;
+            pattern_index = star_index.saturating_add(1);
+            match_index = match_index.saturating_add(1);
             candidate_index = match_index;
             continue;
         }
@@ -355,7 +355,7 @@ fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
         .get(pattern_index)
         .is_some_and(|pattern_byte| *pattern_byte == b'*')
     {
-        pattern_index += 1;
+        pattern_index = pattern_index.saturating_add(1);
     }
 
     pattern_index == pattern.len()

@@ -77,21 +77,26 @@ pub(crate) fn parse_choice_rule(
                 .to_owned(),
         });
     }
-    let operator_count = usize::from(raw.and.is_some())
-        + usize::from(raw.or.is_some())
-        + usize::from(raw.not.is_some())
-        + usize::from(raw.string_equals.is_some())
-        + usize::from(raw.numeric_equals.is_some())
-        + usize::from(raw.numeric_less_than.is_some())
-        + usize::from(raw.numeric_less_than_equals.is_some())
-        + usize::from(raw.numeric_greater_than.is_some())
-        + usize::from(raw.numeric_greater_than_equals.is_some())
-        + usize::from(raw.boolean_equals.is_some())
-        + usize::from(raw.is_null.is_some())
-        + usize::from(raw.is_present.is_some())
-        + usize::from(raw.is_string.is_some())
-        + usize::from(raw.is_numeric.is_some())
-        + usize::from(raw.is_boolean.is_some());
+    let operator_count = [
+        raw.and.is_some(),
+        raw.or.is_some(),
+        raw.not.is_some(),
+        raw.string_equals.is_some(),
+        raw.numeric_equals.is_some(),
+        raw.numeric_less_than.is_some(),
+        raw.numeric_less_than_equals.is_some(),
+        raw.numeric_greater_than.is_some(),
+        raw.numeric_greater_than_equals.is_some(),
+        raw.boolean_equals.is_some(),
+        raw.is_null.is_some(),
+        raw.is_present.is_some(),
+        raw.is_string.is_some(),
+        raw.is_numeric.is_some(),
+        raw.is_boolean.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
     if operator_count != 1 {
         return Err(StepFunctionsError::InvalidDefinition {
             message:

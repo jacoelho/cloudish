@@ -247,7 +247,7 @@ fn normalize_route_path_pattern(
     for (index, segment) in segments.iter().enumerate() {
         let parsed = parse_route_segment(segment)?;
         if matches!(parsed, RouteSegment::Greedy(_))
-            && index + 1 != segments.len()
+            && index.saturating_add(1) != segments.len()
         {
             return Err(ApiGatewayError::Validation {
                 message: format!("invalid routeKey {path:?}"),
@@ -396,7 +396,7 @@ fn match_route_segments(
                 if request_segments.get(index)? != expected {
                     return None;
                 }
-                static_segments += 1;
+                static_segments = static_segments.saturating_add(1);
             }
             RouteSegment::Variable(name) => {
                 path_parameters.insert(

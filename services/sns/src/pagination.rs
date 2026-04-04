@@ -78,8 +78,9 @@ pub(crate) fn paginate<T: Clone>(
     let next_token = (end < items.len())
         .then(|| encode_next_token(context, end))
         .transpose()?;
+    let page = items.get(start..end).ok_or_else(invalid_next_token)?;
 
-    Ok(PaginatedList { items: items[start..end].to_vec(), next_token })
+    Ok(PaginatedList { items: page.to_vec(), next_token })
 }
 
 fn encode_next_token(

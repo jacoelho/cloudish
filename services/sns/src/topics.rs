@@ -380,9 +380,9 @@ impl SnsRegistry {
                     subscription.state,
                     SubscriptionRecordState::Confirmed
                 ) {
-                    (confirmed + 1, pending)
+                    (confirmed.saturating_add(1), pending)
                 } else {
-                    (confirmed, pending + 1)
+                    (confirmed, pending.saturating_add(1))
                 }
             })
     }

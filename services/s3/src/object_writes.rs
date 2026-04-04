@@ -3,8 +3,9 @@ use crate::{
     errors::S3Error,
     object::{
         CopyObjectInput, CopyObjectOutput, DeleteObjectInput,
-        DeleteObjectOutput, NULL_VERSION_ID, ObjectRecord, PutObjectInput,
-        PutObjectOutput, normalize_metadata, normalized_content_type,
+        DeleteObjectOutput, NULL_VERSION_ID, NewStoredObject, ObjectRecord,
+        PutObjectInput, PutObjectOutput, normalize_metadata,
+        normalized_content_type,
     },
     retention::{ensure_object_version_deletable, resolve_object_lock_write},
     scope::S3Scope,
@@ -79,7 +80,7 @@ impl S3Service {
                         "object-version:{bucket}:{key}"
                     ))?
                 );
-                ObjectRecord::new_stored_object(
+                ObjectRecord::new_stored_object(NewStoredObject {
                     bucket,
                     key,
                     content_type,
@@ -87,10 +88,10 @@ impl S3Service {
                     last_modified_epoch_seconds,
                     metadata,
                     tags,
-                    Some(generated),
+                    version_id: Some(generated),
                     object_lock,
-                    body_len,
-                )
+                    size: body_len,
+                })
             }
             Some(BucketVersioningStatus::Suspended) => {
                 if let Some(mut current) =
@@ -106,7 +107,7 @@ impl S3Service {
                     NULL_VERSION_ID,
                 );
 
-                let record = ObjectRecord::new_stored_object(
+                let record = ObjectRecord::new_stored_object(NewStoredObject {
                     bucket,
                     key,
                     content_type,
@@ -114,10 +115,10 @@ impl S3Service {
                     last_modified_epoch_seconds,
                     metadata,
                     tags,
-                    Some(NULL_VERSION_ID.to_owned()),
+                    version_id: Some(NULL_VERSION_ID.to_owned()),
                     object_lock,
-                    body_len,
-                );
+                    size: body_len,
+                });
                 if let Some(previous) = previous {
                     self.remove_object_payload(&previous)?;
                 }
@@ -129,7 +130,7 @@ impl S3Service {
                 {
                     self.remove_object_record(&previous)?;
                 }
-                ObjectRecord::new_stored_object(
+                ObjectRecord::new_stored_object(NewStoredObject {
                     bucket,
                     key,
                     content_type,
@@ -137,10 +138,10 @@ impl S3Service {
                     last_modified_epoch_seconds,
                     metadata,
                     tags,
-                    None,
+                    version_id: None,
                     object_lock,
-                    body_len,
-                )
+                    size: body_len,
+                })
             }
         };
 

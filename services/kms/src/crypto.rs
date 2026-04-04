@@ -277,7 +277,7 @@ pub(crate) fn hash_bytes(labels: &[&str]) -> [u8; 32] {
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    let mut hex = String::with_capacity(bytes.len() * 2);
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
         let _ =
             std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));

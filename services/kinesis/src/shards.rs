@@ -94,7 +94,7 @@ pub(crate) fn shard_start_index(
         Some(shard_id) => shards
             .iter()
             .position(|shard| shard.shard_id == shard_id)
-            .map(|index| index + 1)
+            .map(|index| index.saturating_add(1))
             .ok_or_else(|| KinesisError::InvalidArgument {
                 message: format!(
                     "Shard {shard_id} was not found for pagination."
@@ -143,22 +143,33 @@ pub(crate) fn split_hash_key_space(
     }
 
     let divisor = shard_count as u128;
-    let quotient = u128::MAX / divisor;
-    let remainder = u128::MAX % divisor;
-    let (base_size, extra_segments) = if remainder + 1 == divisor {
-        (quotient + 1, 0)
+    let quotient = u128::MAX.checked_div(divisor).ok_or_else(|| {
+        KinesisError::InvalidArgument {
+            message: "ShardCount must be greater than zero.".to_owned(),
+        }
+    })?;
+    let remainder = u128::MAX.checked_rem(divisor).ok_or_else(|| {
+        KinesisError::InvalidArgument {
+            message: "ShardCount must be greater than zero.".to_owned(),
+        }
+    })?;
+    let remainder_plus_one = remainder.saturating_add(1);
+    let (base_size, extra_segments) = if remainder_plus_one == divisor {
+        (quotient.saturating_add(1), 0)
     } else {
-        (quotient, remainder + 1)
+        (quotient, remainder_plus_one)
     };
     let mut next_start = 0_u128;
     let mut ranges = Vec::with_capacity(shard_count);
 
     for index in 0..shard_count {
-        let size = base_size + u128::from((index as u128) < extra_segments);
-        let end = if index + 1 == shard_count {
+        let size = base_size.saturating_add(
+            u128::from((index as u128) < extra_segments),
+        );
+        let end = if index.saturating_add(1) == shard_count {
             u128::MAX
         } else {
-            next_start + size - 1
+            next_start.saturating_add(size).saturating_sub(1)
         };
         ranges.push(KinesisHashKeyRange {
             ending_hash_key: end.to_string(),
@@ -187,7 +198,7 @@ pub(crate) fn split_hash_key_range(
 
     Ok((
         KinesisHashKeyRange {
-            ending_hash_key: (split - 1).to_string(),
+            ending_hash_key: split.saturating_sub(1).to_string(),
             starting_hash_key: start.to_string(),
         },
         KinesisHashKeyRange {

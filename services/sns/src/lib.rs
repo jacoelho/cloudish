@@ -50,18 +50,35 @@ pub struct SequentialSnsIdentifierSource {
 
 impl SnsIdentifierSource for SequentialSnsIdentifierSource {
     fn next_confirmation_token(&self) -> String {
-        let id =
-            self.next_confirmation_token.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = self
+            .next_confirmation_token
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
         format!("{id:032x}")
     }
 
     fn next_message_id(&self) -> String {
-        let id = self.next_message_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = self
+            .next_message_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
         format!("00000000-0000-0000-0000-{id:012}")
     }
 
     fn next_subscription_id(&self) -> String {
-        let id = self.next_subscription_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = self
+            .next_subscription_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
         format!("00000000-0000-0000-0000-{id:012}")
     }
 }
@@ -139,6 +156,12 @@ impl SnsService {
         state.list_topics(scope)
     }
 
+    /// Returns one page of topics visible within the provided scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnsError`] when `next_token` is invalid for the current topic
+    /// listing.
     pub fn list_topics_page(
         &self,
         scope: &SnsScope,
@@ -265,6 +288,12 @@ impl SnsService {
         state.list_subscriptions(scope)
     }
 
+    /// Returns one page of subscriptions visible within the provided scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnsError`] when `next_token` is invalid for the current
+    /// subscription listing.
     pub fn list_subscriptions_page(
         &self,
         scope: &SnsScope,
@@ -292,6 +321,12 @@ impl SnsService {
         state.list_subscriptions_by_topic(topic_arn)
     }
 
+    /// Returns one page of subscriptions attached to `topic_arn`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnsError`] when the topic ARN is invalid or unknown, or when
+    /// `next_token` is invalid for that topic listing.
     pub fn list_subscriptions_by_topic_page(
         &self,
         topic_arn: &Arn,
@@ -573,7 +608,9 @@ mod tests {
         let transport = Arc::new(RecordingTransport::default());
         let service = SnsService::with_transport(
             Arc::new(move || {
-                UNIX_EPOCH + Duration::from_secs(now_epoch_seconds)
+                UNIX_EPOCH
+                    .checked_add(Duration::from_secs(now_epoch_seconds))
+                    .unwrap_or(UNIX_EPOCH)
             }),
             Arc::new(SequentialSnsIdentifierSource::default()),
             transport.clone(),

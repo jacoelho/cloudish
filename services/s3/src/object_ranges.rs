@@ -29,7 +29,9 @@ pub(crate) struct RangedBody {
 
 impl ResolvedObjectRange {
     pub(crate) fn content_length(&self) -> u64 {
-        self.end - self.start + 1
+        self.end
+            .saturating_sub(self.start)
+            .saturating_add(1)
     }
 
     pub(crate) fn content_range(self) -> String {
@@ -59,7 +61,13 @@ pub(crate) fn apply_object_range(
         })?;
 
     Ok(RangedBody {
-        body: body[start..=end].to_vec(),
+        body: body
+            .get(start..end.saturating_add(1))
+            .ok_or_else(|| S3Error::Internal {
+                message: "Resolved object range exceeded the object body."
+                    .to_owned(),
+            })?
+            .to_vec(),
         content_length: resolved.content_length(),
         content_range: Some(resolved.content_range()),
     })
@@ -76,7 +84,8 @@ pub fn eligible_object_range<'a>(
         return Some(range);
     };
     let object_time = UNIX_EPOCH
-        + std::time::Duration::from_secs(last_modified_epoch_seconds);
+        .checked_add(std::time::Duration::from_secs(last_modified_epoch_seconds))
+        .unwrap_or(UNIX_EPOCH);
     match if_range {
         IfRangeCondition::ETag(if_range_etag)
             if crate::object_read_conditions::strong_etag_condition_matches(
@@ -108,15 +117,20 @@ pub(crate) fn resolve_object_range(
     }
 
     let (start, end) = match range {
-        ObjectRange::Start { start } if *start < size => (*start, size - 1),
+        ObjectRange::Start { start } if *start < size => {
+            (*start, size.saturating_sub(1))
+        }
         ObjectRange::StartEnd { start, end }
             if start <= end && *start < size =>
         {
-            (*start, (*end).min(size - 1))
+            (*start, (*end).min(size.saturating_sub(1)))
         }
         ObjectRange::Suffix { length } if *length > 0 => {
             let content_length = (*length).min(size);
-            (size - content_length, size - 1)
+            (
+                size.saturating_sub(content_length),
+                size.saturating_sub(1),
+            )
         }
         _ => {
             return Err(S3Error::InvalidArgument {

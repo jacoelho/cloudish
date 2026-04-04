@@ -101,6 +101,12 @@ impl SqsService {
             .queue_urls)
     }
 
+    /// Returns one page of queues whose dead-letter policy targets `queue`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqsError::QueueDoesNotExist`] when the target queue is
+    /// unknown, or a validation error when the pagination request is invalid.
     pub fn list_dead_letter_source_queues_page(
         &self,
         queue: &SqsQueueIdentity,
@@ -131,6 +137,12 @@ impl SqsService {
         )
     }
 
+    /// Lists message move tasks for the supplied dead-letter queue source ARN.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqsError`] when the source ARN is invalid or does not resolve
+    /// to an existing queue.
     pub fn list_message_move_tasks(
         &self,
         input: ListMessageMoveTasksInput,
@@ -141,6 +153,12 @@ impl SqsService {
         state.list_message_move_tasks(input)
     }
 
+    /// Cancels a running message move task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqsError`] when the task handle is invalid, unknown, or does
+    /// not refer to a running task.
     pub fn cancel_message_move_task(
         &self,
         input: CancelMessageMoveTaskInput,
@@ -226,10 +244,11 @@ impl SqsWorld {
             };
 
         let staged_moves = {
-            let queue = self
-                .queues
-                .get(&source_identity)
-                .expect("existing source queue should already be resolved");
+            let queue = self.queues.get(&source_identity).ok_or_else(|| {
+                SqsError::ResourceNotFound {
+                    message: "The resource that you specified for the SourceArn parameter doesn't exist.".to_owned(),
+                }
+            })?;
             queue.staged_messages_for_move_task()
         }
         .into_iter()
@@ -255,15 +274,16 @@ impl SqsWorld {
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+        let approximate_number_of_messages_moved =
+            i64::try_from(staged_moves.len()).unwrap_or(i64::MAX);
         let approximate_number_of_messages_to_move =
-            Some(i64::try_from(staged_moves.len()).unwrap_or(i64::MAX));
+            Some(approximate_number_of_messages_moved);
         self.commit_staged_message_moves(staged_moves)?;
         let started_timestamp = i64::try_from(now_seconds).unwrap_or(i64::MAX);
         let task_handle =
             encode_move_task_handle(&input.source_arn, started_timestamp);
         self.message_move_tasks.push(MessageMoveTaskRecord {
-            approximate_number_of_messages_moved:
-                approximate_number_of_messages_to_move.unwrap_or_default(),
+            approximate_number_of_messages_moved,
             approximate_number_of_messages_to_move,
             destination_arn: destination_arn.as_ref().map(ToString::to_string),
             failure_reason: None,

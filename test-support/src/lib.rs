@@ -104,7 +104,7 @@ fn response_complete(response: &[u8]) -> std::io::Result<bool> {
     let Some(header_end) = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4)
+        .and_then(|index| index.checked_add(4))
     else {
         return Ok(false);
     };
@@ -127,7 +127,10 @@ fn response_complete(response: &[u8]) -> std::io::Result<bool> {
         })
         .transpose()?;
     if let Some(content_length) = content_length {
-        return Ok(response.len() >= header_end + content_length);
+        let Some(expected_len) = header_end.checked_add(content_length) else {
+            return Ok(false);
+        };
+        return Ok(response.len() >= expected_len);
     }
 
     let transfer_encoding = headers.split("\r\n").find_map(|line| {
@@ -159,7 +162,10 @@ fn chunked_body_complete(body: &[u8]) -> std::io::Result<bool> {
         else {
             return Ok(false);
         };
-        let Some(size_bytes) = body.get(offset..offset + size_end) else {
+        let Some(size_line_end) = offset.checked_add(size_end) else {
+            return Ok(false);
+        };
+        let Some(size_bytes) = body.get(offset..size_line_end) else {
             return Ok(false);
         };
         let size_line = std::str::from_utf8(size_bytes).map_err(|error| {
@@ -172,13 +178,23 @@ fn chunked_body_complete(body: &[u8]) -> std::io::Result<bool> {
         .map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, error)
         })?;
-        offset += size_end + 2;
+        let Some(next_offset) =
+            size_end.checked_add(2).and_then(|step| offset.checked_add(step))
+        else {
+            return Ok(false);
+        };
+        offset = next_offset;
 
-        if body.len() < offset + size + 2 {
+        let Some(chunk_end) = offset.checked_add(size) else {
+            return Ok(false);
+        };
+        let Some(chunk_suffix_end) = chunk_end.checked_add(2) else {
+            return Ok(false);
+        };
+        if body.len() < chunk_suffix_end {
             return Ok(false);
         }
-        let Some(chunk_suffix) = body.get(offset + size..offset + size + 2)
-        else {
+        let Some(chunk_suffix) = body.get(chunk_end..chunk_suffix_end) else {
             return Ok(false);
         };
         if chunk_suffix != b"\r\n" {
@@ -188,7 +204,12 @@ fn chunked_body_complete(body: &[u8]) -> std::io::Result<bool> {
             ));
         }
 
-        offset += size + 2;
+        let Some(next_offset) =
+            size.checked_add(2).and_then(|step| offset.checked_add(step))
+        else {
+            return Ok(false);
+        };
+        offset = next_offset;
         if size == 0 {
             return Ok(true);
         }

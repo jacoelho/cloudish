@@ -165,7 +165,11 @@ impl S3Service {
 
     pub(crate) fn next_sequence(&self, name: &str) -> Result<u64, S3Error> {
         let key = name.to_owned();
-        let next = self.sequence_store.get(&key).unwrap_or(0) + 1;
+        let next = self
+            .sequence_store
+            .get(&key)
+            .unwrap_or(0)
+            .saturating_add(1);
         self.sequence_store.put(key, next).map_err(S3Error::Sequences)?;
         Ok(next)
     }

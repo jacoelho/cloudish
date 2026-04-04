@@ -1013,12 +1013,18 @@ fn percent_decode_query_component(value: &str) -> Vec<u8> {
             && let Some(decoded_byte) = decode_hex_pair(*high, *low)
         {
             decoded.push(decoded_byte);
-            index += 3;
-            continue;
+            if let Some(next_index) = index.checked_add(3) {
+                index = next_index;
+                continue;
+            }
+            return decoded;
         }
 
         decoded.push(current);
-        index += 1;
+        let Some(next_index) = index.checked_add(1) else {
+            return decoded;
+        };
+        index = next_index;
     }
 
     decoded
@@ -1064,12 +1070,7 @@ fn decode_hex_pair(high: u8, low: u8) -> Option<u8> {
 }
 
 fn decode_hex(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
+    char::from(value).to_digit(16).and_then(|digit| u8::try_from(digit).ok())
 }
 
 fn normalize_header_value(value: &str) -> String {
@@ -1174,7 +1175,8 @@ pub(crate) fn hash_hex(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
+    let mut encoded =
+        String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
         encoded.push_str(&format!("{byte:02x}"));
     }
@@ -1518,7 +1520,11 @@ mod tests {
     fn authenticator(now: u64) -> Authenticator {
         Authenticator::with_time_source(
             defaults(),
-            Arc::new(move || UNIX_EPOCH + Duration::from_secs(now)),
+            Arc::new(move || {
+                UNIX_EPOCH
+                    .checked_add(Duration::from_secs(now))
+                    .unwrap_or(UNIX_EPOCH)
+            }),
         )
     }
 
@@ -1527,7 +1533,11 @@ mod tests {
             defaults().with_bootstrap_signature_verification(
                 BootstrapSignatureVerificationMode::Skip,
             ),
-            Arc::new(move || UNIX_EPOCH + Duration::from_secs(now)),
+            Arc::new(move || {
+                UNIX_EPOCH
+                    .checked_add(Duration::from_secs(now))
+                    .unwrap_or(UNIX_EPOCH)
+            }),
         )
     }
 

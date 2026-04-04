@@ -987,7 +987,7 @@ impl CognitoService {
         scope: &CognitoScope,
         state: &mut StoredCognitoState,
     ) -> Result<CognitoUserPoolId, CognitoError> {
-        let mut next = state.next_user_pool_sequence + 1;
+        let mut next = state.next_user_pool_sequence.saturating_add(1);
         loop {
             let user_pool_id = CognitoUserPoolId::new(format!(
                 "{}_{next:09x}",
@@ -998,7 +998,7 @@ impl CognitoService {
                 return Ok(user_pool_id);
             }
 
-            next += 1;
+            next = next.saturating_add(1);
         }
     }
 
@@ -1066,8 +1066,9 @@ impl CognitoService {
                     StoredAuthSession {
                         challenge: StoredChallengeName::NewPasswordRequired,
                         client_id: client_id.to_owned(),
-                        expires_at: self.now_epoch_seconds()
-                            + SESSION_LIFETIME_SECONDS,
+                        expires_at: self
+                            .now_epoch_seconds()
+                            .saturating_add(SESSION_LIFETIME_SECONDS),
                         user_pool_id,
                         username,
                     },
@@ -1121,7 +1122,7 @@ impl CognitoService {
         user: &StoredUser,
     ) -> Result<CognitoAuthenticationResult, CognitoError> {
         let now = self.now_epoch_seconds();
-        let expires_at = now + ACCESS_TOKEN_LIFETIME_SECONDS;
+        let expires_at = now.saturating_add(ACCESS_TOKEN_LIFETIME_SECONDS);
         let key_id = signing_key_id(user_pool_id);
         let sub = user.attributes.get("sub").cloned().ok_or_else(|| {
             CognitoError::invalid_parameter(format!(
@@ -1765,14 +1766,15 @@ fn build_session_id(
 }
 
 fn next_auth_session_sequence(state: &mut StoredCognitoState) -> u64 {
-    state.next_auth_session_sequence += 1;
+    state.next_auth_session_sequence =
+        state.next_auth_session_sequence.saturating_add(1);
     state.next_auth_session_sequence
 }
 
 fn next_token_jti(
     state: &mut StoredCognitoState,
 ) -> Result<String, CognitoError> {
-    let next = state.next_token_sequence + 1;
+    let next = state.next_token_sequence.saturating_add(1);
     let jti = format!("00000000-0000-0000-0000-{next:012}");
     if state.issued_tokens.contains_key(&jti) {
         return Err(CognitoError::invalid_parameter(format!(
@@ -1929,7 +1931,7 @@ fn signing_public_key_modulus() -> Result<&'static [u8], CognitoError> {
 fn next_user_pool_client_id(
     state: &mut StoredCognitoState,
 ) -> Result<CognitoUserPoolClientId, CognitoError> {
-    let next = state.next_user_pool_client_sequence + 1;
+    let next = state.next_user_pool_client_sequence.saturating_add(1);
     let client_id = CognitoUserPoolClientId::new(format!("{next:026x}"))?;
     if state.user_pool_clients.contains_key(&client_id) {
         return Err(CognitoError::invalid_parameter(format!(
@@ -1945,7 +1947,7 @@ fn next_user_pool_client_id(
 fn next_user_sub(
     state: &mut StoredCognitoState,
 ) -> Result<String, CognitoError> {
-    let next = state.next_user_sub_sequence + 1;
+    let next = state.next_user_sub_sequence.saturating_add(1);
     let sub = format!("00000000-0000-0000-0000-{next:012}");
     let exists = state
         .users
@@ -2008,7 +2010,7 @@ fn paginate<T>(
 
     let page_size =
         usize::try_from(limit).unwrap_or(MAX_LIST_RESULTS as usize);
-    let end = (start + page_size).min(total_items);
+    let end = start.saturating_add(page_size).min(total_items);
     let paged =
         items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
     let next_token = (end < total_items).then(|| end.to_string());
@@ -2054,7 +2056,8 @@ fn hash_password(password: &str) -> String {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
+    let mut encoded =
+        String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
         encoded
             .push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
@@ -2231,7 +2234,11 @@ mod tests {
 
     impl FixedClock {
         fn new(seconds: u64) -> Self {
-            Self { now: UNIX_EPOCH + Duration::from_secs(seconds) }
+            Self {
+                now: UNIX_EPOCH
+                    .checked_add(Duration::from_secs(seconds))
+                    .unwrap_or(UNIX_EPOCH),
+            }
         }
     }
 

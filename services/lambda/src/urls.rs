@@ -514,7 +514,7 @@ fn format_request_context_time(
     epoch_millis: u64,
 ) -> Result<String, LambdaError> {
     let timestamp = OffsetDateTime::from_unix_timestamp_nanos(
-        i128::from(epoch_millis) * 1_000_000,
+        i128::from(epoch_millis).saturating_mul(1_000_000),
     )
     .map_err(|error| LambdaError::Internal { message: error.to_string() })?;
     let format = parse(

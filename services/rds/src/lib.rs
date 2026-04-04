@@ -1348,12 +1348,14 @@ pub(crate) struct StoredRdsState {
 
 impl StoredRdsState {
     pub(crate) fn next_cluster_resource_id(&mut self) -> String {
-        self.next_cluster_resource_id += 1;
+        self.next_cluster_resource_id =
+            self.next_cluster_resource_id.saturating_add(1);
         format!("cluster-cloudish-{:08}", self.next_cluster_resource_id)
     }
 
     pub(crate) fn next_instance_resource_id(&mut self) -> String {
-        self.next_instance_resource_id += 1;
+        self.next_instance_resource_id =
+            self.next_instance_resource_id.saturating_add(1);
         format!("dbi-cloudish-{:08}", self.next_instance_resource_id)
     }
 }
@@ -1412,7 +1414,9 @@ mod tests {
 
     impl Clock for FixedClock {
         fn now(&self) -> std::time::SystemTime {
-            UNIX_EPOCH + std::time::Duration::from_secs(1_711_111_111)
+            UNIX_EPOCH
+                .checked_add(std::time::Duration::from_secs(1_711_111_111))
+                .expect("fixed clock timestamp should be representable")
         }
     }
 
@@ -1457,7 +1461,10 @@ mod tests {
             spec: &super::RdsBackendSpec,
         ) -> Result<Box<dyn RunningRdsBackend>, InfrastructureError> {
             self.starts.lock().expect("starts should lock").push(spec.engine);
-            let port = self.next_port.fetch_add(1, Ordering::Relaxed) + 1;
+            let port = self
+                .next_port
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
             Ok(Box::new(FakeRunningBackend {
                 endpoint: Endpoint::localhost(port),
                 stops: Arc::clone(&self.stops),
@@ -1507,7 +1514,9 @@ mod tests {
             spec: &TcpProxySpec,
         ) -> Result<Box<dyn RunningTcpProxy>, InfrastructureError> {
             let listen_port = if spec.listen().port() == 0 {
-                self.next_port.fetch_add(1, Ordering::Relaxed) + 1
+                self.next_port
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1)
             } else {
                 spec.listen().port()
             };

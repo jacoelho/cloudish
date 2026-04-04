@@ -249,9 +249,14 @@ fn validate_target(
         ));
     }
 
-    let configured_payloads = usize::from(target.input.is_some())
-        + usize::from(target.input_path.is_some())
-        + usize::from(target.input_transformer.is_some());
+    let configured_payloads = [
+        target.input.is_some(),
+        target.input_path.is_some(),
+        target.input_transformer.is_some(),
+    ]
+    .into_iter()
+    .filter(|configured| *configured)
+    .count();
     if configured_payloads > 1 {
         return Err(validation(
             "Input, InputPath, and InputTransformer are mutually exclusive.",

@@ -1,3 +1,4 @@
+#![deny(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 mod attributes;
 mod errors;
 mod fifo;
@@ -10,6 +11,7 @@ pub mod request_runtime;
 mod scope;
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 mod tests;
 
 pub use attributes::{AddPermissionInput, RemovePermissionInput};

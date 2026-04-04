@@ -21,7 +21,8 @@ pub fn evaluate_object_read_preconditions(
     conditions: &ObjectReadConditions,
 ) -> ObjectReadPreconditionOutcome {
     let object_time = UNIX_EPOCH
-        + std::time::Duration::from_secs(last_modified_epoch_seconds);
+        .checked_add(std::time::Duration::from_secs(last_modified_epoch_seconds))
+        .unwrap_or(UNIX_EPOCH);
     if let Some(value) = conditions.if_match.as_deref() {
         if !strong_etag_condition_matches(value, etag) {
             return ObjectReadPreconditionOutcome::PreconditionFailed;

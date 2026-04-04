@@ -210,7 +210,7 @@ fn evaluate_csv_select(
             visible_headers.as_deref(),
             &mut writer,
         )?;
-        matched += 1;
+        matched = matched.saturating_add(1);
         if query.limit.is_some_and(|limit| matched >= limit) {
             break;
         }
@@ -460,8 +460,12 @@ fn parse_select_query(expression: &str) -> Result<SelectQuery, S3Error> {
                 && raw_value.ends_with('\'')
                 && raw_value.len() >= 2
             {
+                let inner_end = raw_value.len().saturating_sub(1);
                 SelectValue::String(
-                    raw_value[1..raw_value.len() - 1].replace("''", "'"),
+                    raw_value
+                        .get(1..inner_end)
+                        .unwrap_or_default()
+                        .replace("''", "'"),
                 )
             } else {
                 SelectValue::Number(raw_value.parse::<f64>().map_err(

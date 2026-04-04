@@ -2775,7 +2775,7 @@ pub(crate) fn paginate<T: Clone>(
 }
 
 pub(crate) fn next_identifier(counter: &mut u64, width: usize) -> String {
-    *counter += 1;
+    *counter = counter.saturating_add(1);
     encode_base36(*counter, width)
 }
 
@@ -2784,8 +2784,8 @@ fn encode_base36(mut value: u64, width: usize) -> String {
     while value > 0 {
         let digit = (value % 36) as u8;
         digits.push(match digit {
-            0..=9 => (b'0' + digit) as char,
-            _ => (b'a' + (digit - 10)) as char,
+            0..=9 => char::from(b'0'.saturating_add(digit)),
+            _ => char::from(b'a'.saturating_add(digit.saturating_sub(10))),
         });
         value /= 36;
     }

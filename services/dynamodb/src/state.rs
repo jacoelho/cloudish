@@ -1725,7 +1725,7 @@ impl DynamoDbService {
                     None,
                 )?;
                 table_changed = true;
-                deleted += 1;
+                deleted = deleted.saturating_add(1);
             }
 
             if table_changed {
@@ -2191,7 +2191,7 @@ impl DynamoDbService {
                     .iter()
                     .position(|stream| &stream.stream_arn == stream_arn)
             })
-            .map(|index| index + 1)
+            .map(|index| index.saturating_add(1))
             .unwrap_or(0);
         let remaining =
             streams.get(start_index.min(streams.len())..).unwrap_or(&[]);
@@ -2330,7 +2330,7 @@ impl DynamoDbService {
             return Err(DynamoDbError::InvalidShardIterator);
         }
 
-        let end = (position + limit).min(records.len());
+        let end = position.saturating_add(limit).min(records.len());
         let next_shard_iterator =
             Some(encode_shard_iterator(&stream_arn, end));
 
@@ -2459,7 +2459,8 @@ impl DynamoDbService {
             .map_err(|source| {
                 storage_error("writing stream record state", source)
             })?;
-        stream.next_sequence_number += 1;
+        stream.next_sequence_number =
+            stream.next_sequence_number.saturating_add(1);
 
         Ok(())
     }
@@ -2593,7 +2594,7 @@ fn transition_ttl_state(
             TimeToLiveStatus::Disabling
         },
         transition_complete_at_epoch_seconds: Some(
-            now + TTL_TRANSITION_SECONDS,
+            now.saturating_add(TTL_TRANSITION_SECONDS),
         ),
     })
 }
@@ -2734,10 +2735,10 @@ fn stream_record_size_bytes(
 ) -> Result<u64, DynamoDbError> {
     let mut size = item_size_bytes(keys)? as u64;
     if let Some(old_image) = old_image {
-        size += item_size_bytes(old_image)? as u64;
+        size = size.saturating_add(item_size_bytes(old_image)? as u64);
     }
     if let Some(new_image) = new_image {
-        size += item_size_bytes(new_image)? as u64;
+        size = size.saturating_add(item_size_bytes(new_image)? as u64);
     }
     Ok(size)
 }
@@ -3222,7 +3223,8 @@ fn key_storage_from_key_item(
     key: &Item,
 ) -> Result<ItemStorageKey, DynamoDbError> {
     let schema = normalized_key_schema(&table.key_schema)?;
-    let expected_len = 1 + usize::from(schema.sort_attribute.is_some());
+    let expected_len =
+        usize::from(schema.sort_attribute.is_some()).saturating_add(1);
     if key.len() != expected_len {
         return Err(validation_error(
             "The provided key element does not match the schema",
@@ -3307,12 +3309,16 @@ fn update_table_statistics(
 ) {
     match new_size {
         Some(new_size) if old_size == 0 => {
-            table.item_count += 1;
-            table.table_size_bytes += new_size as u64;
+            table.item_count = table.item_count.saturating_add(1);
+            table.table_size_bytes = table
+                .table_size_bytes
+                .saturating_add(new_size as u64);
         }
         Some(new_size) => {
-            table.table_size_bytes =
-                table.table_size_bytes + new_size as u64 - old_size as u64;
+            table.table_size_bytes = table
+                .table_size_bytes
+                .saturating_add(new_size as u64)
+                .saturating_sub(old_size as u64);
         }
         None if old_size > 0 => {
             table.item_count = table.item_count.saturating_sub(1);
@@ -3463,13 +3469,13 @@ fn split_expression_clauses(expression: &str) -> Vec<&str> {
     let mut index = 0;
     while let Some(byte) = bytes.get(index) {
         match *byte {
-            b'(' => depth += 1,
+            b'(' => depth = depth.saturating_add(1),
             b')' => depth = depth.saturating_sub(1),
             _ => {}
         }
         if depth == 0 && starts_with_keyword(expression, index, "BETWEEN") {
             between_pending = true;
-            index += "BETWEEN".len();
+            index = index.saturating_add("BETWEEN".len());
             continue;
         }
         if depth == 0 && starts_with_keyword(expression, index, "AND") {
@@ -3477,12 +3483,12 @@ fn split_expression_clauses(expression: &str) -> Vec<&str> {
                 between_pending = false;
             } else {
                 clauses.push(expression[start..index].trim());
-                index += "AND".len();
+                index = index.saturating_add("AND".len());
                 start = index;
                 continue;
             }
         }
-        index += 1;
+        index = index.saturating_add(1);
     }
     clauses.push(expression[start..].trim());
     clauses.into_iter().filter(|clause| !clause.is_empty()).collect()
@@ -3801,7 +3807,7 @@ fn exclusive_start_index(
     entries
         .iter()
         .position(|(key, _)| key == exclusive_start_key)
-        .map(|index| index + 1)
+        .map(|index| index.saturating_add(1))
 }
 
 fn sort_entries(

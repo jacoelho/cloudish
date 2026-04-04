@@ -479,7 +479,7 @@ fn parse_saml_assertion(
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(event)) => {
                 saw_element = true;
-                depth += 1;
+                depth = depth.saturating_add(1);
                 match xml_local_name(event.name().as_ref()) {
                     b"Attribute" => {
                         current_attribute_name =
@@ -513,7 +513,7 @@ fn parse_saml_assertion(
                 if depth == 0 {
                     return Err(invalid_saml_assertion_error());
                 }
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 match xml_local_name(event.name().as_ref()) {
                     b"Attribute" => current_attribute_name = None,
                     b"AttributeValue" => in_attribute_value = false,

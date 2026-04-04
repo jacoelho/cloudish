@@ -290,7 +290,7 @@ pub(crate) fn validate_tags(
                      'tags.{}.member.tagKey' failed to satisfy constraint: \
                      Member must have length less than or equal to {}",
                     tag.tag_key,
-                    index + 1,
+                    index.saturating_add(1),
                     MAX_TAG_KEY_BYTES,
                 ),
             });
@@ -302,7 +302,7 @@ pub(crate) fn validate_tags(
                      'tags.{}.member.tagValue' failed to satisfy constraint: \
                      Member must have length less than or equal to {}",
                     tag.tag_value,
-                    index + 1,
+                    index.saturating_add(1),
                     MAX_TAG_VALUE_BYTES,
                 ),
             });
