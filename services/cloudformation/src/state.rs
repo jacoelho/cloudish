@@ -6141,10 +6141,14 @@ mod tests {
                 .get(&(bucket.to_owned(), key.to_owned()))
                 .cloned()
                 .ok_or_else(|| S3Error::NoSuchKey { key: key.to_owned() })?;
+            let size = body.len() as u64;
 
             Ok(GetObjectOutput {
-                body: body.clone(),
-                head: HeadObjectOutput {
+                body,
+                content_length: size,
+                content_range: None,
+                is_partial: false,
+                metadata: services::ObjectReadMetadata {
                     content_type: "text/yaml".to_owned(),
                     delete_marker: false,
                     etag: "etag".to_owned(),
@@ -6154,7 +6158,6 @@ mod tests {
                     object_lock_legal_hold_status: None,
                     object_lock_mode: None,
                     object_lock_retain_until_epoch_seconds: None,
-                    size: body.len() as u64,
                     version_id: None,
                 },
             })
@@ -6640,7 +6643,7 @@ Outputs:
                     queue_name,
                 )
                 .expect("queue identity should build"),
-                &[],
+                &[] as &[&str],
             )
             .expect("queue should exist downstream");
         assert_eq!(
@@ -6729,7 +6732,7 @@ Resources:
                     queue_name,
                 )
                 .expect("queue identity should build"),
-                &[],
+                &[] as &[&str],
             )
             .expect("queue should exist downstream");
         assert_eq!(
